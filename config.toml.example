@@ -41,3 +41,18 @@ min_history_days = 60
 ema_periods = [21, 89]
 timeframes = [60, 300, 900, 3600, 14400]  # 1m, 5m, 15m, 1h, 4h
 volume_lookback_days = 60
+
+[kafka]
+# Kafka producer settings for technical analysis indicators
+enabled = false  # Set to true to enable Kafka publishing
+bootstrap_servers = ["localhost:9092"]  # Replace with your Kafka broker address
+topic_prefix = "ta_"  # Results in "ta_data" topic
+client_id = "data_feeder_rust"
+acks = "all"  # Ensure message durability
+retries = 3
+max_in_flight_requests_per_connection = 1
+compression_type = "snappy"
+batch_size = 16384
+linger_ms = 10
+request_timeout_ms = 30000
+delivery_timeout_ms = 120000

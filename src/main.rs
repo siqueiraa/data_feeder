@@ -8,6 +8,7 @@ use data_feeder::technical_analysis::{
     TimeFrameAsk, IndicatorAsk
 };
 use data_feeder::postgres::{PostgresActor, PostgresConfig};
+use data_feeder::kafka::{KafkaActor, KafkaConfig};
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
@@ -50,6 +51,7 @@ struct TomlConfig {
     pub database: PostgresConfig,
     pub application: ApplicationConfig,
     pub technical_analysis: TechnicalAnalysisTomlConfig,
+    pub kafka: Option<KafkaConfig>,
 }
 
 /// Production configuration (converted from TOML)
@@ -73,6 +75,8 @@ struct DataFeederConfig {
     pub periodic_gap_check_window_minutes: u32, // How far back to scan for gaps (default: 30)
     // PostgreSQL configuration
     pub postgres_config: PostgresConfig,
+    // Kafka configuration
+    pub kafka_config: KafkaConfig,
 }
 
 impl DataFeederConfig {
@@ -115,6 +119,7 @@ impl DataFeederConfig {
             periodic_gap_check_interval_minutes: toml_config.application.periodic_gap_check_interval_minutes,
             periodic_gap_check_window_minutes: toml_config.application.periodic_gap_check_window_minutes,
             postgres_config: toml_config.database,
+            kafka_config: toml_config.kafka.unwrap_or_default(),
         }
     }
 }
@@ -143,6 +148,7 @@ impl Default for DataFeederConfig {
             periodic_gap_check_interval_minutes: 5, // Check every 5 minutes
             periodic_gap_check_window_minutes: 30, // Scan last 30 minutes
             postgres_config: PostgresConfig::default(),
+            kafka_config: KafkaConfig::default(),
         }
     }
 }
@@ -409,7 +415,7 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     info!("🔧 Initializing data pipeline...");
     
     // Step 1: Launch actors with unified storage
-    let (historical_actor, api_actor, ws_actor, postgres_actor, ta_actors) = launch_actors(&config).await?;
+    let (historical_actor, api_actor, ws_actor, postgres_actor, _kafka_actor, ta_actors) = launch_actors(&config).await?;
     
     // Step 2: Start real-time data streaming FIRST
     info!("📡 Starting real-time data streaming...");
@@ -467,6 +473,7 @@ async fn launch_actors(config: &DataFeederConfig) -> Result<(
     ActorRef<ApiActor>, 
     ActorRef<WebSocketActor>,
     Option<ActorRef<PostgresActor>>,
+    Option<ActorRef<KafkaActor>>,
     Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>
 ), Box<dyn std::error::Error + Send + Sync>> {
     
@@ -480,6 +487,17 @@ async fn launch_actors(config: &DataFeederConfig) -> Result<(
         Some(kameo::spawn(actor))
     } else {
         info!("🚫 PostgreSQL actor disabled");
+        None
+    };
+    
+    // Kafka Actor - for publishing technical analysis data
+    let kafka_actor = if config.kafka_config.enabled {
+        info!("📨 Launching Kafka actor...");
+        let actor = KafkaActor::new(config.kafka_config.clone())
+            .map_err(|e| format!("Failed to create Kafka actor: {}", e))?;
+        Some(kameo::spawn(actor))
+    } else {
+        info!("🚫 Kafka actor disabled");
         None
     };
     
@@ -510,7 +528,22 @@ async fn launch_actors(config: &DataFeederConfig) -> Result<(
         // Create indicator actor first
         let indicator_actor = {
             let actor = IndicatorActor::new(config.ta_config.clone());
-            kameo::spawn(actor)
+            let actor_ref = kameo::spawn(actor);
+            
+            // Set Kafka actor reference if available
+            if let Some(ref kafka_ref) = kafka_actor {
+                use data_feeder::technical_analysis::actors::indicator::IndicatorTell;
+                let set_kafka_msg = IndicatorTell::SetKafkaActor {
+                    kafka_actor: kafka_ref.clone(),
+                };
+                if let Err(e) = actor_ref.tell(set_kafka_msg).send().await {
+                    error!("Failed to set Kafka actor on IndicatorActor: {}", e);
+                } else {
+                    info!("✅ Connected IndicatorActor to KafkaActor");
+                }
+            }
+            
+            actor_ref
         };
         
         // Create timeframe actor and set its indicator and API actor references
@@ -569,7 +602,7 @@ async fn launch_actors(config: &DataFeederConfig) -> Result<(
     sleep(Duration::from_millis(500)).await;
     
     info!("✅ All actors launched successfully");
-    Ok((historical_actor, api_actor, ws_actor, postgres_actor, ta_actors))
+    Ok((historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor, ta_actors))
 }
 
 

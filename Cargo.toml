@@ -28,3 +28,9 @@ serde_json = "1.0"
 tokio-postgres = "0.7"
 deadpool-postgres = "0.10"
 toml = "0.8"
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl-vendored", "gssapi-vendored"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.12"
+tempfile = "3.10"

@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::message::{Context, Message};
+use kameo::request::MessageSend;
 use kameo::{Actor, mailbox::unbounded::UnboundedMailbox};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
@@ -16,9 +17,10 @@ use crate::technical_analysis::utils::{
     extract_close_prices, create_volume_records_from_candles, 
     format_timestamp_iso
 };
+use crate::kafka::{KafkaActor, KafkaTell};
 
 /// Messages for Indicator Actor
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum IndicatorTell {
     /// Initialize with historical aggregated candles
     InitializeWithHistory {
@@ -35,6 +37,10 @@ pub enum IndicatorTell {
     ProcessMultiTimeFrameUpdate {
         symbol: String,
         candles: HashMap<u64, FuturesOHLCVCandle>, // timeframe_seconds -> candle
+    },
+    /// Set Kafka actor reference for publishing indicators
+    SetKafkaActor {
+        kafka_actor: ActorRef<KafkaActor>,
     },
 }
 
@@ -444,6 +450,9 @@ pub struct IndicatorActor {
     
     /// Overall initialization status
     is_ready: bool,
+    
+    /// Optional Kafka actor reference for publishing indicators
+    kafka_actor: Option<ActorRef<KafkaActor>>,
 }
 
 impl IndicatorActor {
@@ -461,7 +470,13 @@ impl IndicatorActor {
             config,
             symbol_states,
             is_ready: false,
+            kafka_actor: None,
         }
+    }
+
+    /// Set Kafka actor reference
+    pub fn set_kafka_actor(&mut self, kafka_actor: ActorRef<KafkaActor>) {
+        self.kafka_actor = Some(kafka_actor);
     }
 
     /// Get initialization status
@@ -610,6 +625,18 @@ impl Message<IndicatorTell> for IndicatorActor {
                           output.trend_1h,
                           output.trend_4h
                     );
+                    
+                    // Publish indicators to Kafka if available
+                    if let Some(ref kafka_actor) = self.kafka_actor {
+                        let publish_msg = KafkaTell::PublishIndicators {
+                            indicators: output.clone(),
+                        };
+                        if let Err(e) = kafka_actor.tell(publish_msg).send().await {
+                            error!("Failed to send indicators to Kafka: {}", e);
+                        } else {
+                            debug!("📤 Published {} indicators to Kafka", symbol);
+                        }
+                    }
                 } else {
                     warn!("Received batched update for unknown symbol: {}", symbol);
                 }
@@ -617,6 +644,11 @@ impl Message<IndicatorTell> for IndicatorActor {
                 let handler_time = handler_start.elapsed();
                 info!("⏱️ IndicatorTell::ProcessMultiTimeFrameUpdate ELAPSED TIMES: total_handler={:?}, batch_processing={:?}, output_generation={:?}", 
                       handler_time, batch_processing_time, output_time);
+            }
+            
+            IndicatorTell::SetKafkaActor { kafka_actor } => {
+                info!("📨 Setting Kafka actor reference for indicator publishing");
+                self.kafka_actor = Some(kafka_actor);
             }
         }
     }

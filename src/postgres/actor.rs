@@ -469,8 +469,8 @@ mod tests {
         let timestamp = actor.millis_to_timestamp(millis).unwrap();
         assert_eq!(timestamp.timestamp_millis(), millis);
         
-        // Test invalid timestamp
-        let invalid_millis = -1;
+        // Test invalid timestamp (extremely large value that would overflow)
+        let invalid_millis = i64::MAX;
         assert!(actor.millis_to_timestamp(invalid_millis).is_err());
     }
 }
