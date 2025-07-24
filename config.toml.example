@@ -1,0 +1,43 @@
+# Data Feeder Configuration File
+
+[database]
+# PostgreSQL connection settings
+host = "localhost"
+port = 5432
+database = "crypto_data"
+username = "postgres"
+password = "your_password"
+max_connections = 10
+connection_timeout_seconds = 30
+
+# Storage settings
+batch_size = 1000
+batch_timeout_seconds = 5
+enabled = false  # Set to true to enable PostgreSQL storage
+
+[application]
+# Application settings
+symbols = ["BTCUSDT"]
+timeframes = [60]  # 1 minute in seconds
+storage_path = "lmdb_data"
+gap_detection_enabled = true
+start_date = "2025-01-01T00:00:00Z"  # Optional start date for historical data
+respect_config_start_date = false
+monthly_threshold_months = 3
+enable_technical_analysis = true
+
+# WebSocket reconnection settings
+reconnection_gap_threshold_minutes = 1
+reconnection_gap_check_delay_seconds = 5
+
+# Periodic gap detection settings (prevents data loss during stable connections)
+periodic_gap_detection_enabled = true
+periodic_gap_check_interval_minutes = 5  # How often to scan for gaps
+periodic_gap_check_window_minutes = 30   # How far back to scan for gaps
+
+[technical_analysis]
+# Technical analysis configuration
+min_history_days = 60
+ema_periods = [21, 89]
+timeframes = [60, 300, 900, 3600, 14400]  # 1m, 5m, 15m, 1h, 4h
+volume_lookback_days = 60
