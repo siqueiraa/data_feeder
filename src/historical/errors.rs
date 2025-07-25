@@ -38,6 +38,12 @@ pub enum HistoricalDataError {
     NoData(String),
     #[error("Storage error: {0}")]
     StorageError(String),
+    #[error("Database initialization error: {0}")]
+    DatabaseInitialization(String),
+    #[error("Directory creation error: {0}")]
+    DirectoryCreation(String),
+    #[error("Semaphore acquisition error: {0}")]
+    SemaphoreAcquisition(String),
 }
 
 impl From<tokio::task::JoinError> for HistoricalDataError {

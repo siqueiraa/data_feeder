@@ -4,8 +4,7 @@ use std::ops::Bound;
 use std::time::Instant;
 
 use futures::future::join_all;
-use heed::types::{SerdeBincode, Str};
-use heed::{Database, Env, EnvOpenOptions};
+// Database types moved to common::database_utils
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::{message::Message, Actor};
@@ -19,79 +18,41 @@ use rayon::prelude::*;
 use super::errors::HistoricalDataError;
 use super::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS, Seconds, FuturesExchangeTrade};
 use crate::postgres::{PostgresActor, PostgresTell};
+use crate::common::{constants::*, error_utils::ErrorContext, database_utils::DatabaseManager, shared_data::{intern_symbol, timeframe_to_string}};
 use super::utils::{
     build_kline_urls_with_path_type, get_dates_in_range, get_months_in_range, should_use_monthly_data,
     is_kline_supported_timeframe, process_klines_pipeline, seconds_to_interval, PathType,
     format_timestamp, aggregate_candles_with_gap_filling, scan_for_candle_gaps, parse_csv_to_trade, download_file, extract_csv_from_zip, compute_sha256
 };
 
-const BATCH_SIZE: usize = 1000;
+// Moved to common::constants
 
 pub struct HistoricalActor {
-    envs: FxHashMap<(String, Seconds), Env>,
-    candle_dbs: FxHashMap<(String, Seconds), Database<Str, SerdeBincode<FuturesOHLCVCandle>>>,
-    certified_range_dbs: FxHashMap<(String, Seconds), Database<Str, SerdeBincode<TimeRange>>>,
+    database_manager: DatabaseManager,
     csv_path: PathBuf,
     postgres_actor: Option<ActorRef<PostgresActor>>,
 }
 
 impl HistoricalActor {
-    pub fn new(symbols: &[String], timeframes: &[Seconds], base_path: &Path, csv_path: &Path) -> Self {
-        let mut envs = FxHashMap::default();
-        let mut candle_dbs = FxHashMap::default();
-        let mut certified_range_dbs = FxHashMap::default();
-
+    pub fn new(symbols: &[String], timeframes: &[Seconds], base_path: &Path, csv_path: &Path) -> Result<Self, HistoricalDataError> {
+        // Create CSV directory
         if !csv_path.exists() {
             info!("📁 Creating CSV directory at: {}", csv_path.display());
-            std::fs::create_dir_all(csv_path).expect("Failed to create CSV directory");
+            std::fs::create_dir_all(csv_path)
+                .with_io_context("Failed to create CSV directory")?;
         }
 
-        for symbol in symbols {
-            for &timeframe in timeframes {
-                let db_name = format!("{}_{}", symbol, timeframe);
-                let symbol_tf_path = base_path.join(db_name);
-                info!("📁 Creating LMDB directory at: {}", symbol_tf_path.display());
-                std::fs::create_dir_all(&symbol_tf_path).expect("Failed to create symbol-timeframe database directory");
-
-                let env = unsafe {
-                    EnvOpenOptions::new()
-                        .map_size(1024 * 1024 * 1024) // 1GB per symbol-timeframe
-                        .max_dbs(10)
-                        .max_readers(256)
-                        .open(&symbol_tf_path)
-                        .unwrap_or_else(|_| panic!("Failed to open LMDB environment for {} {}", symbol, timeframe))
-                };
-
-                let mut wtxn = env.write_txn().expect("Failed to create initial LMDB write transaction");
-
-                let candle_db = env
-                    .create_database::<Str, SerdeBincode<FuturesOHLCVCandle>>(&mut wtxn, Some("candles"))
-                    .expect("Failed to create candle database");
-
-                let certified_range_db = env
-                    .create_database(&mut wtxn, Some("certified_range"))
-                    .expect("Failed to create certified range database");
-
-                wtxn.commit().expect("Failed to commit creation transaction");
-
-                let key = (symbol.clone(), timeframe);
-                envs.insert(key.clone(), env);
-                candle_dbs.insert(key.clone(), candle_db);
-                certified_range_dbs.insert(key, certified_range_db);
-
-                info!("✅ Initialized LMDB for {} timeframe {}s", symbol, timeframe);
-            }
-        }
+        // Initialize database manager
+        let mut database_manager = DatabaseManager::new();
+        database_manager.initialize_all(symbols, timeframes, base_path)?;
 
         info!("Initialized LMDB databases for {} symbols and {} timeframes", symbols.len(), timeframes.len());
 
-        Self { 
-            envs, 
-            candle_dbs, 
-            certified_range_dbs, 
+        Ok(Self { 
+            database_manager,
             csv_path: csv_path.to_path_buf(),
             postgres_actor: None,
-        }
+        })
     }
 
     /// Set the PostgreSQL actor reference for dual storage
@@ -100,20 +61,20 @@ impl HistoricalActor {
     }
 
     fn get_certified_range(&self, symbol: &str, timeframe: Seconds) -> Result<Option<TimeRange>, HistoricalDataError> {
-        let key = (symbol.to_string(), timeframe);
+        let key = (intern_symbol(symbol), timeframe);
         let env = self
-            .envs
+            .database_manager.envs
             .get(&key)
             .ok_or(HistoricalDataError::DatabaseNotFound(format!("Environment not found for {} {}", symbol, timeframe)))?;
         let certified_range_db = self
-            .certified_range_dbs
+            .database_manager.certified_range_dbs
             .get(&key)
             .ok_or(HistoricalDataError::DatabaseNotFound(format!("Certified range DB not found for {} {}", symbol, timeframe)))?;
 
         let rtxn = env
             .read_txn()
             .map_err(|e| HistoricalDataError::StorageError(format!("Failed to create read transaction: {}", e)))?;
-        let range_key = timeframe.to_string();
+        let range_key = timeframe_to_string(timeframe);
         let range = certified_range_db
             .get(&rtxn, &range_key)
             .map_err(|e| HistoricalDataError::StorageError(format!("Failed to get certified range: {}", e)))?;
@@ -122,20 +83,20 @@ impl HistoricalActor {
     }
 
     fn set_certified_range(&self, symbol: &str, timeframe: Seconds, range: TimeRange) -> Result<(), HistoricalDataError> {
-        let key = (symbol.to_string(), timeframe);
+        let key = (intern_symbol(symbol), timeframe);
         let env = self
-            .envs
+            .database_manager.envs
             .get(&key)
             .ok_or_else(|| HistoricalDataError::DatabaseNotFound(format!("Environment not found for {} {}", symbol, timeframe)))?;
         let certified_range_db = self
-            .certified_range_dbs
+            .database_manager.certified_range_dbs
             .get(&key)
             .ok_or_else(|| HistoricalDataError::DatabaseNotFound(format!("Certified range DB not found for {} {}", symbol, timeframe)))?;
 
         let mut wtxn = env
             .write_txn()
             .map_err(|e| HistoricalDataError::StorageError(format!("Failed to create write transaction: {}", e)))?;
-        let range_key = timeframe.to_string();
+        let range_key = timeframe_to_string(timeframe);
         certified_range_db
             .put(&mut wtxn, &range_key, &range)
             .map_err(|e| HistoricalDataError::StorageError(format!("Failed to store certified range: {}", e)))?;
@@ -161,13 +122,13 @@ impl HistoricalActor {
             format_timestamp(start_time),
             format_timestamp(end_time)
         );
-        let key = (symbol.to_string(), timeframe);
+        let key = (intern_symbol(symbol), timeframe);
         let env = self
-            .envs
+            .database_manager.envs
             .get(&key)
             .ok_or(HistoricalDataError::DatabaseNotFound(format!("Environment not found for {} {}", symbol, timeframe)))?;
         let candle_db = self
-            .candle_dbs
+            .database_manager.candle_dbs
             .get(&key)
             .ok_or(HistoricalDataError::DatabaseNotFound(format!("Database not found for {} {}", symbol, timeframe)))?;
 
@@ -194,14 +155,14 @@ impl HistoricalActor {
 
         info!("Stored {} new candles to LMDB for {} timeframe {}s", candles.len(), symbol, timeframe);
 
-        if candles.is_empty() {
-            info!("No candles provided to store for symbol {}, timeframe {}s", symbol, timeframe);
-            info!("NOT updating certified range - no candles to store");
-            return Ok(());
-        }
-
-        let new_candles_start = candles.first().unwrap().open_time();
-        let new_candles_end = candles.last().unwrap().close_time();
+        let (new_candles_start, new_candles_end) = match (candles.first(), candles.last()) {
+            (Some(first), Some(last)) => (first.open_time(), last.close_time()),
+            _ => {
+                info!("No candles provided to store for symbol {}, timeframe {}s", symbol, timeframe);
+                info!("NOT updating certified range - no candles to store");
+                return Ok(());
+            }
+        };
 
         info!("Checking gaps in newly stored candles: {} to {}", format_timestamp(new_candles_start), format_timestamp(new_candles_end));
 
@@ -282,13 +243,13 @@ impl HistoricalActor {
     ) -> Result<Vec<FuturesOHLCVCandle>, HistoricalDataError> {
         let fetch_start = Instant::now();
 
-        let key = (symbol.to_string(), timeframe);
+        let key = (intern_symbol(symbol), timeframe);
         let env = self
-            .envs
+            .database_manager.envs
             .get(&key)
             .ok_or_else(|| HistoricalDataError::DatabaseNotFound(format!("Environment not found for {} {}", symbol, timeframe)))?;
         let db = self
-            .candle_dbs
+            .database_manager.candle_dbs
             .get(&key)
             .ok_or_else(|| HistoricalDataError::DatabaseNotFound(format!("Database not found for {} {}", symbol, timeframe)))?;
 
@@ -472,10 +433,10 @@ impl HistoricalActor {
 
         for (load_start_time, fetch_end) in unique_ranges_to_process {
             let trades = self.fetch_trades_for_range(symbol, load_start_time, fetch_end).await?;
-            if !trades.is_empty() {
+            if let (Some(first_trade), Some(last_trade)) = (trades.first(), trades.last()) {
                 for &tf in &timeframes {
-                    let aligned_start = (trades.first().unwrap().timestamp / (tf as i64 * 1000)) * (tf as i64 * 1000);
-                    let aligned_end = ((trades.last().unwrap().timestamp / (tf as i64 * 1000)) + 1) * (tf as i64 * 1000);
+                    let aligned_start = (first_trade.timestamp / (tf as i64 * 1000)) * (tf as i64 * 1000);
+                    let aligned_end = ((last_trade.timestamp / (tf as i64 * 1000)) + 1) * (tf as i64 * 1000);
                     let candles = aggregate_candles_with_gap_filling(&trades, tf, aligned_start, aligned_end, false);
                     final_candles_by_timeframe.entry(tf).or_default().extend(candles);
                 }
@@ -487,9 +448,9 @@ impl HistoricalActor {
             candles.dedup_by_key(|c| c.open_time());
             info!("Final sort and dedup: {} candles for timeframe {}s", candles.len(), tf);
 
-            if !candles.is_empty() {
-                let candle_start = candles.first().unwrap().open_time();
-                let candle_end = candles.last().unwrap().close_time() + 1;
+            if let (Some(first_candle), Some(last_candle)) = (candles.first(), candles.last()) {
+                let candle_start = first_candle.open_time();
+                let candle_end = last_candle.close_time() + 1;
 
                 info!(
                     "Storing {} candles for timeframe {}s, range: {} to {}",
@@ -524,19 +485,13 @@ impl HistoricalActor {
         Ok(final_candles)
     }
 
-    async fn fetch_trades_for_range(
-        &self,
-        symbol: &str,
-        start_time: TimestampMS,
-        end_time: TimestampMS,
-    ) -> Result<Vec<FuturesExchangeTrade>, HistoricalDataError> {
+    /// Generate URLs for trade data files for a date range
+    fn build_trade_urls(&self, symbol: &str, start_time: TimestampMS, end_time: TimestampMS) -> Vec<(String, String, String)> {
         let dates = get_dates_in_range(start_time, end_time);
-        let mut all_trades = Vec::new();
         let base_url = "https://data.binance.vision/";
         let prefix = format!("data/futures/um/daily/klines/{}/", symbol.to_uppercase());
-        let semaphore = Arc::new(Semaphore::new(3));
 
-        let pairs: Vec<(String, String, String)> = dates
+        dates
             .into_iter()
             .map(|date| {
                 let date_str = date.format("%Y-%m-%d").to_string();
@@ -546,138 +501,219 @@ impl HistoricalActor {
                 let checksum_url = format!("{}/{}{}", base_url, prefix, checksum_file);
                 (zip_url, checksum_url, date_str)
             })
-            .collect();
+            .collect()
+    }
 
-        let trade_futures = pairs.into_iter().map(|(zip_url, checksum_url, date_str)| {
-            let csv_path = self.csv_path.clone();
-            let symbol = symbol.to_string();
-            let semaphore = Arc::clone(&semaphore);
-            async move {
-                let file_name = zip_url.rsplit('/').next().unwrap_or("unknown");
-                let csv_file_name = format!("{}-aggTrades-{}.csv", symbol.to_uppercase(), date_str);
-                let csv_local_path = csv_path.join(csv_file_name);
-                let zip_local_path = csv_path.join(file_name);
-                let checksum_local_path = csv_path.join(checksum_url.rsplit('/').next().unwrap());
+    /// Download and parse a single trade file for a specific date
+    async fn fetch_single_trade_file(
+        &self,
+        zip_url: String,
+        checksum_url: String,
+        date_str: String,
+        symbol: String,
+        semaphore: Arc<Semaphore>,
+    ) -> Result<Vec<FuturesExchangeTrade>, HistoricalDataError> {
+        let file_name = zip_url.rsplit('/').next().unwrap_or("unknown");
+        let csv_file_name = format!("{}-aggTrades-{}.csv", symbol.to_uppercase(), date_str);
+        let csv_local_path = self.csv_path.join(csv_file_name);
+        let zip_local_path = self.csv_path.join(file_name);
+        let checksum_local_path = self.csv_path.join(
+            checksum_url.rsplit('/').next().unwrap_or("unknown_checksum"));
 
-                let file_exists = tokio::fs::try_exists(&csv_local_path).await.unwrap_or(false);
+        let file_exists = tokio::fs::try_exists(&csv_local_path).await.unwrap_or(false);
 
-                let trades = if file_exists {
-                    info!("📂 CSV file exists: {}", csv_local_path.display());
+        if file_exists {
+            self.load_existing_trade_file(&csv_local_path, &semaphore).await
+        } else {
+            self.download_and_parse_trade_file(
+                &zip_url, &checksum_url, &csv_local_path, 
+                &zip_local_path, &checksum_local_path, &semaphore
+            ).await
+        }
+    }
 
-                    let csv_data = {
-                        let _permit = semaphore.acquire().await.unwrap();
-                        Arc::new(
-                            tokio::fs::read(&csv_local_path)
-                                .await
-                                .map_err(HistoricalDataError::Io)?,
-                        )
-                    };
+    /// Load an existing CSV trade file
+    async fn load_existing_trade_file(
+        &self,
+        csv_local_path: &std::path::Path,
+        semaphore: &Arc<Semaphore>,
+    ) -> Result<Vec<FuturesExchangeTrade>, HistoricalDataError> {
+        info!("📂 CSV file exists: {}", csv_local_path.display());
 
-                    tokio::task::spawn_blocking({
-                        let csv_data = Arc::clone(&csv_data);
-                        move || parse_csv_to_trade(&csv_data)
-                    })
+        let csv_data = {
+            let _permit = semaphore.acquire().await
+                .map_err(|e| HistoricalDataError::SemaphoreAcquisition(format!("Failed to acquire semaphore: {}", e)))?;
+            Arc::new(
+                tokio::fs::read(csv_local_path)
                     .await
-                    .map_err(|e| HistoricalDataError::StorageError(format!("Failed to parse CSV: {}", e)))??
-                } else {
-                    info!("📥 Downloading checksum: {}", checksum_url);
-                    if let Err(e) = download_file(&checksum_url, &checksum_local_path).await {
-                        if let HistoricalDataError::NotFound(_) = e {
-                            warn!("Checksum not found for {}, assuming no data for this day.", date_str);
-                            return Ok(Vec::new()); // No data for this day, return empty vec
-                        }
-                        return Err(e);
-                    }
-                    let checksum_content = tokio::fs::read_to_string(&checksum_local_path)
-                        .await
-                        .map_err(HistoricalDataError::Io)?;
-                    let expected_hash = checksum_content
-                        .split_whitespace()
-                        .next()
-                        .ok_or_else(|| HistoricalDataError::Validation("Invalid checksum format".to_string()))?;
+                    .map_err(HistoricalDataError::Io)?,
+            )
+        };
 
-                    info!("📥 Downloading ZIP: {}", zip_url);
-                    let temp_zip_path = zip_local_path.with_extension("zip.tmp");
-                    if let Err(e) = download_file(&zip_url, &temp_zip_path).await {
-                         if let HistoricalDataError::NotFound(_) = e {
-                            warn!("ZIP not found for {}, assuming no data for this day.", date_str);
-                            return Ok(Vec::new()); // No data for this day, return empty vec
-                        }
-                        return Err(e);
-                    }
+        tokio::task::spawn_blocking({
+            let csv_data = Arc::clone(&csv_data);
+            move || parse_csv_to_trade(&csv_data)
+        })
+        .await
+        .map_err(|e| HistoricalDataError::StorageError(format!("Failed to parse CSV: {}", e)))?
+    }
 
-                    let downloaded_hash = compute_sha256(&temp_zip_path)?;
-                    if downloaded_hash != expected_hash {
-                        tokio::fs::remove_file(&temp_zip_path)
-                            .await
-                            .map_err(HistoricalDataError::Io)?;
-                        return Err(HistoricalDataError::ChecksumError(format!(
-                            "Checksum mismatch for {}: expected {}, got {}",
-                            zip_url, expected_hash, downloaded_hash
-                        )));
-                    }
+    /// Download and parse a trade file from remote source
+    async fn download_and_parse_trade_file(
+        &self,
+        zip_url: &str,
+        checksum_url: &str,
+        csv_local_path: &std::path::Path,
+        zip_local_path: &std::path::Path,
+        checksum_local_path: &std::path::Path,
+        semaphore: &Arc<Semaphore>,
+    ) -> Result<Vec<FuturesExchangeTrade>, HistoricalDataError> {
+        // Download checksum
+        info!("📥 Downloading checksum: {}", checksum_url);
+        if let Err(e) = download_file(checksum_url, checksum_local_path).await {
+            if let HistoricalDataError::NotFound(_) = e {
+                warn!("Checksum not found for {}, assuming no data for this day.", 
+                      checksum_local_path.file_name().unwrap_or_default().to_string_lossy());
+                return Ok(Vec::new()); // No data for this day
+            }
+            return Err(e);
+        }
 
-                    let csv_data = {
-                        let _permit = semaphore.acquire().await.unwrap();
+        // Verify checksum
+        let expected_hash = self.read_checksum_file(checksum_local_path).await?;
 
-                        let csv_data = tokio::task::spawn_blocking({
-                            let temp_zip_path = temp_zip_path.clone();
-                            move || extract_csv_from_zip(&temp_zip_path)
-                        })
-                        .await
-                        .map_err(|e| HistoricalDataError::StorageError(format!("Failed to extract ZIP: {}", e)))??;
+        // Download ZIP file
+        info!("📥 Downloading ZIP: {}", zip_url);
+        let temp_zip_path = zip_local_path.with_extension("zip.tmp");
+        if let Err(e) = download_file(zip_url, &temp_zip_path).await {
+            if let HistoricalDataError::NotFound(_) = e {
+                warn!("ZIP not found for {}, assuming no data for this day.", 
+                      zip_local_path.file_name().unwrap_or_default().to_string_lossy());
+                return Ok(Vec::new()); // No data for this day
+            }
+            return Err(e);
+        }
 
-                        tokio::fs::write(&csv_local_path, &csv_data)
-                            .await
-                            .map_err(HistoricalDataError::Io)?;
+        // Verify downloaded file
+        self.verify_and_extract_trade_file(&temp_zip_path, &expected_hash, csv_local_path, semaphore).await
+    }
 
-                        tokio::fs::remove_file(&temp_zip_path)
-                            .await
-                            .map_err(HistoricalDataError::Io)?;
-                        info!("✅ Keeping checksum file: {}", checksum_local_path.display());
+    /// Read and parse checksum file
+    async fn read_checksum_file(&self, checksum_path: &std::path::Path) -> Result<String, HistoricalDataError> {
+        let checksum_content = tokio::fs::read_to_string(checksum_path)
+            .await
+            .map_err(HistoricalDataError::Io)?;
+        
+        checksum_content
+            .split_whitespace()
+            .next()
+            .map(|s| s.to_string())
+            .ok_or_else(|| HistoricalDataError::Validation("Invalid checksum format".to_string()))
+    }
 
-                        csv_data
-                    };
+    /// Verify ZIP file integrity and extract trades
+    async fn verify_and_extract_trade_file(
+        &self,
+        temp_zip_path: &std::path::Path,
+        expected_hash: &str,
+        csv_local_path: &std::path::Path,
+        semaphore: &Arc<Semaphore>,
+    ) -> Result<Vec<FuturesExchangeTrade>, HistoricalDataError> {
+        let downloaded_hash = compute_sha256(temp_zip_path)?;
+        if downloaded_hash != expected_hash {
+            tokio::fs::remove_file(temp_zip_path)
+                .await
+                .map_err(HistoricalDataError::Io)?;
+            return Err(HistoricalDataError::ChecksumError(format!(
+                "Checksum mismatch: expected {}, got {}",
+                expected_hash, downloaded_hash
+            )));
+        }
 
-                    tokio::task::spawn_blocking(move || parse_csv_to_trade(&csv_data))
-                        .await
-                        .map_err(|e| HistoricalDataError::StorageError(format!("Failed to parse CSV: {}", e)))??
-                };
+        let csv_data = {
+            let _permit = semaphore.acquire().await
+                .map_err(|e| HistoricalDataError::SemaphoreAcquisition(format!("Failed to acquire semaphore: {}", e)))?;
 
-                let filtered_trades = trades
-                    .into_iter()
-                    .filter(|t| t.timestamp >= start_time && t.timestamp <= end_time)
-                    .collect::<Vec<FuturesExchangeTrade>>();
+            let csv_data = tokio::task::spawn_blocking({
+                let temp_zip_path = temp_zip_path.to_path_buf();
+                move || extract_csv_from_zip(&temp_zip_path)
+            })
+            .await
+            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to extract ZIP: {}", e)))??;
 
-                Ok(filtered_trades)
+            tokio::fs::write(csv_local_path, &csv_data)
+                .await
+                .map_err(HistoricalDataError::Io)?;
+
+            tokio::fs::remove_file(temp_zip_path)
+                .await
+                .map_err(HistoricalDataError::Io)?;
+
+            Arc::new(csv_data)
+        };
+
+        tokio::task::spawn_blocking({
+            let csv_data = Arc::clone(&csv_data);
+            move || parse_csv_to_trade(&csv_data)
+        })
+        .await
+        .map_err(|e| HistoricalDataError::StorageError(format!("Failed to parse CSV: {}", e)))?
+    }
+
+    /// Main entry point for fetching trades in a date range
+    async fn fetch_trades_for_range(
+        &self,
+        symbol: &str,
+        start_time: TimestampMS,
+        end_time: TimestampMS,
+    ) -> Result<Vec<FuturesExchangeTrade>, HistoricalDataError> {
+        let pairs = self.build_trade_urls(symbol, start_time, end_time);
+        let semaphore = Arc::new(Semaphore::new(3));
+        let symbol_owned = symbol.to_string();
+
+        // Create futures for parallel processing
+        let trade_futures = pairs.into_iter().map(|(zip_url, checksum_url, date_str)| {
+            let semaphore = Arc::clone(&semaphore);
+            let symbol_clone = symbol_owned.clone();
+            let self_ref = self;
+            async move {
+                self_ref.fetch_single_trade_file(zip_url, checksum_url, date_str, symbol_clone, semaphore).await
             }
         });
 
-        let trade_futures: Vec<_> = trade_futures.collect();
+        // Execute all futures concurrently
         let processing_start = Instant::now();
         let futures_count = trade_futures.len();
-        info!("Processing ALL {} futures concurrently...", futures_count);
+        info!("Processing {} trade file futures concurrently...", futures_count);
 
         let all_results = join_all(trade_futures).await;
-
+        
         let elapsed = processing_start.elapsed();
-        info!("ALL futures completed in {:?} - {} futures/sec", elapsed, futures_count as f64 / elapsed.as_secs_f64());
+        info!("All futures completed in {:?} - {} futures/sec", elapsed, futures_count as f64 / elapsed.as_secs_f64());
 
+        // Collect results and filter by time range
+        let mut all_trades = Vec::new();
         for result in all_results {
-            match result {
-                Ok(trades) => {
-                    info!("Fetched {} trades for a sub-range.", trades.len());
-                    all_trades.extend(trades);
-                }
-                Err(e) => return Err(e),
+            let trades = result?;
+            let filtered_trades: Vec<FuturesExchangeTrade> = trades
+                .into_iter()
+                .filter(|t| t.timestamp >= start_time && t.timestamp <= end_time)
+                .collect();
+            
+            if !filtered_trades.is_empty() {
+                info!("Fetched {} trades for a sub-range.", filtered_trades.len());
+                all_trades.extend(filtered_trades);
             }
         }
 
         if all_trades.is_empty() {
-            return Err(HistoricalDataError::NoData(format!("No aggTrades found for {} in range {} to {}", symbol, start_time, end_time)));
+            return Err(HistoricalDataError::NoData(format!(
+                "No aggTrades found for {} in range {} to {}", 
+                symbol, start_time, end_time
+            )));
         }
 
-        all_trades.sort_by_key(|t: &FuturesExchangeTrade| t.timestamp);
+        all_trades.sort_by_key(|t| t.timestamp);
         Ok(all_trades)
     }
 
@@ -768,7 +804,13 @@ impl HistoricalActor {
             let semaphore_clone = semaphore.clone();
 
             tasks.push(tokio::spawn(async move {
-                let _permit = semaphore_clone.acquire().await.expect("Failed to acquire semaphore");
+                let _permit = match semaphore_clone.acquire().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        warn!("Failed to acquire semaphore for klines processing: {}", e);
+                        return Err(HistoricalDataError::SemaphoreAcquisition(format!("Failed to acquire semaphore: {}", e)));
+                    }
+                };
                 process_klines_pipeline(&csv_path_clone, &symbol_clone, &zip_url, &checksum_url, &date_str, &interval_clone).await
             }));
         }
@@ -807,9 +849,9 @@ impl HistoricalActor {
 
         info!("📊 Total {} klines collected: {} for timeframe {}", data_type, all_candles.len(), interval);
 
-        if !all_candles.is_empty() {
-            let candle_start = all_candles.first().unwrap().open_time();
-            let candle_end = all_candles.last().unwrap().close_time() + 1;
+        if let (Some(first_candle), Some(last_candle)) = (all_candles.first(), all_candles.last()) {
+            let candle_start = first_candle.open_time();
+            let candle_end = last_candle.close_time() + 1;
 
             self.store_candles(symbol, timeframe, &all_candles, candle_start, candle_end)?;
 
@@ -850,12 +892,12 @@ impl HistoricalActor {
     }
 
     pub fn invalidate_certified_range(&mut self, symbol: &str, timeframe: Seconds) -> Result<(), HistoricalDataError> {
-        let key = (symbol.to_string(), timeframe);
-        if let Some(db) = self.certified_range_dbs.get(&key) {
-            let mut wtxn = self.envs[&key]
+        let key = (intern_symbol(symbol), timeframe);
+        if let Some(db) = self.database_manager.certified_range_dbs.get(&key) {
+            let mut wtxn = self.database_manager.envs[&key]
                 .write_txn()
                 .map_err(|e| HistoricalDataError::StorageError(e.to_string()))?;
-            let db_key = timeframe.to_string();
+            let db_key = timeframe_to_string(timeframe);
             db.delete(&mut wtxn, &db_key)
                 .map_err(|e| HistoricalDataError::StorageError(e.to_string()))?;
             wtxn.commit().map_err(|e| HistoricalDataError::StorageError(e.to_string()))?;

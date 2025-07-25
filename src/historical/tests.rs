@@ -12,7 +12,8 @@ async fn test_fetch_candles() {
     let csv_tmp_dir = tempdir().unwrap();
     let csv_path = csv_tmp_dir.path();
 
-    let actor = HistoricalActor::new(&symbols, &timeframes, base_path, csv_path);
+    let actor = HistoricalActor::new(&symbols, &timeframes, base_path, csv_path)
+        .expect("Failed to create HistoricalActor");
     let actor_ref: ActorRef<HistoricalActor> = kameo::spawn(actor);
 
     let start_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap().timestamp_millis();

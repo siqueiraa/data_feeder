@@ -504,7 +504,8 @@ async fn launch_actors(config: &DataFeederConfig) -> Result<(
     // Historical Actor - for S3/bulk data (unified storage)
     let historical_actor = {
         let csv_temp_path = config.storage_path.join("temp_csv"); // Temporary staging within main storage
-        let mut actor = HistoricalActor::new(&config.symbols, &config.timeframes, &config.storage_path, &csv_temp_path);
+        let mut actor = HistoricalActor::new(&config.symbols, &config.timeframes, &config.storage_path, &csv_temp_path)
+            .map_err(|e| format!("Failed to create HistoricalActor: {}", e))?;
         if let Some(ref postgres_ref) = postgres_actor {
             actor.set_postgres_actor(postgres_ref.clone());
         }

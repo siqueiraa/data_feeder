@@ -13,6 +13,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use crate::common::shared_data::{SharedCandle, shared_candle};
 use crate::historical::structs::FuturesOHLCVCandle;
 use crate::postgres::{PostgresActor, PostgresTell};
 use crate::websocket::binance::kline::parse_any_kline_message;
@@ -97,7 +98,7 @@ pub struct WebSocketActor {
     /// Base path for LMDB storage
     base_path: PathBuf,
     /// Recent candles cache (symbol -> candles)
-    recent_candles: FxHashMap<String, Vec<FuturesOHLCVCandle>>,
+    recent_candles: FxHashMap<String, Vec<SharedCandle>>,
     /// Maximum recent candles to keep in memory
     max_recent_candles: usize,
     /// Maximum idle time before marking connection as unhealthy (in seconds)
@@ -214,7 +215,7 @@ impl WebSocketActor {
     fn store_candle(&mut self, symbol: &str, candle: &FuturesOHLCVCandle, is_closed: bool) -> Result<(), WebSocketError> {
         // Always update recent cache for both live and closed candles (for real-time access)
         if let Some(recent) = self.recent_candles.get_mut(symbol) {
-            recent.push(candle.clone());
+            recent.push(shared_candle(candle.clone()));
             if recent.len() > self.max_recent_candles {
                 recent.remove(0);
             }
@@ -428,7 +429,7 @@ impl WebSocketActor {
     fn get_recent_candles(&self, symbol: &str, limit: usize) -> Vec<FuturesOHLCVCandle> {
         if let Some(recent) = self.recent_candles.get(symbol) {
             let start_idx = if recent.len() > limit { recent.len() - limit } else { 0 };
-            recent[start_idx..].to_vec()
+            recent[start_idx..].iter().map(|candle| (**candle).clone()).collect()
         } else {
             Vec::new()
         }
