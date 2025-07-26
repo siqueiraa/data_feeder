@@ -417,18 +417,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_actor_creation() {
+        // Create a dummy LmdbActor for testing
         let temp_dir = TempDir::new().unwrap();
-        let actor = ApiActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let lmdb_actor = kameo::spawn(LmdbActor::new(&temp_dir.path().to_path_buf(), 60).unwrap());
         
-        assert_eq!(actor.envs.len(), 0);
-        assert_eq!(actor.candle_dbs.len(), 0);
+        let actor = ApiActor::new(lmdb_actor.clone()).unwrap();
+        
         assert_eq!(actor.stats.requests_made, 0);
     }
 
-    #[test]
-    fn test_interval_to_seconds() {
+    #[tokio::test]
+    async fn test_interval_to_seconds() {
+        // Create a dummy LmdbActor for testing
         let temp_dir = TempDir::new().unwrap();
-        let actor = ApiActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let lmdb_actor = kameo::spawn(LmdbActor::new(&temp_dir.path().to_path_buf(), 60).unwrap());
+        
+        let actor = ApiActor::new(lmdb_actor.clone()).unwrap();
         
         assert_eq!(actor.interval_to_seconds("1m"), 60);
         assert_eq!(actor.interval_to_seconds("5m"), 300);

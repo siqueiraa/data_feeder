@@ -23,7 +23,7 @@ use crate::websocket::types::{
 };
 
 /// WebSocket actor messages for telling (fire-and-forget)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum WebSocketTell {
     /// Subscribe to streams for given symbols
     Subscribe {
@@ -47,6 +47,10 @@ pub enum WebSocketTell {
     HealthCheck,
     /// Check for gap after reconnection and fill if needed
     CheckReconnectionGap,
+    /// Set the TimeFrame actor reference for direct real-time forwarding
+    SetTimeFrameActor {
+        timeframe_actor: ActorRef<crate::technical_analysis::actors::timeframe::TimeFrameActor>,
+    },
 }
 
 /// WebSocket actor messages for asking (request-response)
@@ -664,6 +668,11 @@ impl Message<WebSocketTell> for WebSocketActor {
                 } else {
                     warn!("API actor not available for gap filling");
                 }
+            }
+            WebSocketTell::SetTimeFrameActor { timeframe_actor } => {
+                info!("📨 Setting TimeFrame actor reference for WebSocketActor");
+                self.timeframe_actor = Some(timeframe_actor);
+                info!("✅ TimeFrame actor reference successfully set in WebSocketActor");
             }
         }
     }

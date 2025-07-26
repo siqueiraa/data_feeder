@@ -27,6 +27,7 @@ use super::utils::{
 
 // Moved to common::constants
 
+#[derive(Debug)]
 pub struct HistoricalActor {
     csv_path: PathBuf,
     postgres_actor: Option<ActorRef<PostgresActor>>,

@@ -489,6 +489,19 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     // Step 3.5: Now launch Technical Analysis actors with complete historical data using SAME timestamp
     let ta_actors = launch_ta_actors(&config, &api_actor, &ws_actor, &postgres_actor, &kafka_actor, synchronized_timestamp).await?;
     
+    // Set TimeFrame actor reference on WebSocketActor
+    if let Some((timeframe_actor, _)) = &ta_actors {
+        use data_feeder::websocket::WebSocketTell;
+        let set_timeframe_msg = WebSocketTell::SetTimeFrameActor {
+            timeframe_actor: timeframe_actor.clone(),
+        };
+        if let Err(e) = ws_actor.tell(set_timeframe_msg).send().await {
+            error!("Failed to set TimeFrame actor on WebSocketActor: {}", e);
+        } else {
+            info!("✅ Connected WebSocketActor to TimeFrameActor");
+        }
+    }
+    
     // Step 4: Continuous monitoring mode (WebSocket already running)
     info!("♾️  Entering continuous monitoring mode...");
     run_continuous_monitoring(config, lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, ta_actors).await?;
