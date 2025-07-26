@@ -1,21 +1,18 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
-use heed::{Database, Env, EnvOpenOptions};
-use heed::types::{SerdeBincode, Str};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::message::{Context, Message};
 use kameo::request::MessageSend;
 use kameo::{Actor, mailbox::unbounded::UnboundedMailbox};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::api::binance::BinanceKlinesClient;
 use crate::api::types::{ApiConfig, ApiError, ApiRequest, ApiStats};
-use crate::historical::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS};
+use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
+use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 use crate::postgres::{PostgresActor, PostgresTell};
 
 /// API actor messages for telling (fire-and-forget)
@@ -85,41 +82,27 @@ pub struct ApiActor {
     stats: ApiStats,
     /// Configuration
     config: ApiConfig,
-    /// LMDB environments per symbol-interval
-    envs: FxHashMap<String, Env>,
-    /// Candle databases per symbol-interval
-    candle_dbs: FxHashMap<String, Database<Str, SerdeBincode<FuturesOHLCVCandle>>>,
-    /// Certified range databases per symbol-interval
-    range_dbs: FxHashMap<String, Database<Str, SerdeBincode<TimeRange>>>,
-    /// Base path for LMDB storage
-    base_path: PathBuf,
+    /// LmdbActor reference for storage operations
+    lmdb_actor: ActorRef<LmdbActor>,
     /// PostgreSQL actor reference for dual storage
     postgres_actor: Option<ActorRef<PostgresActor>>,
 }
 
 impl ApiActor {
     /// Create a new API actor
-    pub fn new(base_path: PathBuf) -> Result<Self, ApiError> {
-        Self::new_with_config(base_path, ApiConfig::default())
+    pub fn new(lmdb_actor: ActorRef<LmdbActor>) -> Result<Self, ApiError> {
+        Self::new_with_config(lmdb_actor, ApiConfig::default())
     }
 
     /// Create a new API actor with custom configuration
-    pub fn new_with_config(base_path: PathBuf, config: ApiConfig) -> Result<Self, ApiError> {
+    pub fn new_with_config(lmdb_actor: ActorRef<LmdbActor>, config: ApiConfig) -> Result<Self, ApiError> {
         let klines_client = BinanceKlinesClient::new(config.base_url.clone())?;
-
-        if !base_path.exists() {
-            std::fs::create_dir_all(&base_path)
-                .map_err(|e| ApiError::Unknown(format!("Failed to create base path: {}", e)))?;
-        }
 
         Ok(Self {
             klines_client,
             stats: ApiStats::new(),
             config,
-            envs: FxHashMap::default(),
-            candle_dbs: FxHashMap::default(),
-            range_dbs: FxHashMap::default(),
-            base_path,
+            lmdb_actor,
             postgres_actor: None,
         })
     }
@@ -129,62 +112,43 @@ impl ApiActor {
         self.postgres_actor = Some(postgres_actor);
     }
 
-    /// Initialize LMDB database for a symbol-interval combination
-    fn init_database(&mut self, symbol: &str, interval: &str) -> Result<(), ApiError> {
+    /// Initialize LMDB database for a symbol-interval combination through LmdbActor
+    async fn init_database(&self, symbol: &str, interval: &str) -> Result<(), ApiError> {
         let timeframe_seconds = self.interval_to_seconds(interval);
-        let db_key = format!("{}_{}", symbol, timeframe_seconds);
         
-        if self.envs.contains_key(&db_key) {
-            return Ok(()); // Already initialized
-        }
-
-        let db_path = self.base_path.join(&db_key);
-        std::fs::create_dir_all(&db_path)
-            .map_err(|e| ApiError::Unknown(format!("Failed to create DB path for {}: {}", db_key, e)))?;
-
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(1024 * 1024 * 1024) // 1GB per symbol-interval
-                .max_dbs(10)
-                .max_readers(256)
-                .open(&db_path)
-                .map_err(|e| ApiError::Unknown(format!("Failed to open LMDB for {}: {}", db_key, e)))?
+        let msg = LmdbActorMessage::InitializeDatabase {
+            symbol: symbol.to_string(),
+            timeframe: timeframe_seconds,
         };
-
-        let mut wtxn = env.write_txn()
-            .map_err(|e| ApiError::Unknown(format!("Failed to create write transaction for {}: {}", db_key, e)))?;
-
-        let candle_db = env.create_database::<Str, SerdeBincode<FuturesOHLCVCandle>>(&mut wtxn, Some("candles"))
-            .map_err(|e| ApiError::Unknown(format!("Failed to create candle DB for {}: {}", db_key, e)))?;
-
-        let range_db = env.create_database::<Str, SerdeBincode<TimeRange>>(&mut wtxn, Some("certified_ranges"))
-            .map_err(|e| ApiError::Unknown(format!("Failed to create range DB for {}: {}", db_key, e)))?;
-
-        wtxn.commit()
-            .map_err(|e| ApiError::Unknown(format!("Failed to commit creation transaction for {}: {}", db_key, e)))?;
-
-        self.envs.insert(db_key.clone(), env);
-        self.candle_dbs.insert(db_key.clone(), candle_db);
-        self.range_dbs.insert(db_key.clone(), range_db);
-
-        info!("✅ Initialized LMDB database for: {}", db_key);
-        Ok(())
+        
+        match self.lmdb_actor.ask(msg).send().await {
+            Ok(LmdbActorResponse::Success) => {
+                info!("✅ Initialized LMDB database for: {}_{}", symbol, timeframe_seconds);
+                Ok(())
+            }
+            Ok(LmdbActorResponse::ErrorResponse(err)) => {
+                Err(ApiError::Unknown(format!("Failed to initialize database: {}", err)))
+            }
+            Ok(_) => {
+                Err(ApiError::Unknown("Unexpected response from LmdbActor".to_string()))
+            }
+            Err(e) => {
+                Err(ApiError::Unknown(format!("Failed to communicate with LmdbActor: {}", e)))
+            }
+        }
     }
 
-    /// Store candles in LMDB and update certified ranges
-    async fn store_candles(&mut self, symbol: &str, interval: &str, candles: Vec<FuturesOHLCVCandle>) -> Result<(), ApiError> {
+    /// Store candles through LmdbActor
+    async fn store_candles(&self, symbol: &str, interval: &str, candles: Vec<FuturesOHLCVCandle>) -> Result<(), ApiError> {
         if candles.is_empty() {
             return Ok(());
         }
 
         let timeframe_seconds = self.interval_to_seconds(interval);
-        let db_key = format!("{}_{}", symbol, timeframe_seconds);
-        self.init_database(symbol, interval)?;
-
-        let env = self.envs.get(&db_key).unwrap();
-        let candle_db = self.candle_dbs.get(&db_key).unwrap();
-        let range_db = self.range_dbs.get(&db_key).unwrap();
-
+        
+        // Initialize database if needed
+        self.init_database(symbol, interval).await?;
+        
         // Prepare PostgreSQL data before LMDB operations
         let postgres_data = if self.postgres_actor.is_some() {
             let candles_len = candles.len();
@@ -197,48 +161,32 @@ impl ApiActor {
             None
         };
 
-        // Get range info before LMDB operations
+        // Get range info for logging and PostgreSQL
         let start_time = candles.first().unwrap().open_time;
         let end_time = candles.last().unwrap().close_time;
 
-        // Perform LMDB operations in a scoped block
-        {
-            let mut wtxn = env.write_txn()
-                .map_err(|e| ApiError::Unknown(format!("Failed to create write transaction: {}", e)))?;
-
-            // Store candles
-            for candle in &candles {
-                let key = format!("{}:{}", timeframe_seconds, candle.close_time);
-                candle_db.put(&mut wtxn, &key, candle)
-                    .map_err(|e| ApiError::Unknown(format!("Failed to store candle: {}", e)))?;
+        // Store candles through LmdbActor
+        let msg = LmdbActorMessage::StoreCandles {
+            symbol: symbol.to_string(),
+            timeframe: timeframe_seconds,
+            candles: candles.clone(),
+        };
+        
+        match self.lmdb_actor.ask(msg).send().await {
+            Ok(LmdbActorResponse::Success) => {
+                info!("💾 Stored {} candles for {} {} (range: {} - {})", 
+                      candles.len(), symbol, interval, start_time, end_time);
             }
-
-            // Update certified range
-            let range = TimeRange { start: start_time, end: end_time };
-            let range_key = format!("{}_range", interval);
-            
-            // Get existing range to potentially merge
-            let existing_range = range_db.get(&wtxn, &range_key)
-                .map_err(|e| ApiError::Unknown(format!("Failed to read existing range: {}", e)))?;
-
-            let merged_range = if let Some(existing) = existing_range {
-                TimeRange {
-                    start: std::cmp::min(existing.start, range.start),
-                    end: std::cmp::max(existing.end, range.end),
-                }
-            } else {
-                range
-            };
-
-            range_db.put(&mut wtxn, &range_key, &merged_range)
-                .map_err(|e| ApiError::Unknown(format!("Failed to store range: {}", e)))?;
-
-            wtxn.commit()
-                .map_err(|e| ApiError::Unknown(format!("Failed to commit storage transaction: {}", e)))?;
-        } // wtxn goes out of scope here
-
-        info!("💾 Stored {} candles for {} {} (range: {} - {})", 
-              candles.len(), symbol, interval, start_time, end_time);
+            Ok(LmdbActorResponse::ErrorResponse(err)) => {
+                return Err(ApiError::Unknown(format!("Failed to store candles: {}", err)));
+            }
+            Ok(_) => {
+                return Err(ApiError::Unknown("Unexpected response from LmdbActor".to_string()));
+            }
+            Err(e) => {
+                return Err(ApiError::Unknown(format!("Failed to communicate with LmdbActor: {}", e)));
+            }
+        }
 
         // Store to PostgreSQL for dual storage strategy (after LMDB commit)
         if let Some(postgres_actor) = &self.postgres_actor {
@@ -340,7 +288,7 @@ impl Actor for ApiActor {
     async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         info!("🚀 Starting API Actor");
         info!("🌐 Target API: {}", self.config.base_url);
-        info!("📁 LMDB storage path: {}", self.base_path.display());
+        info!("🎭 LMDB operations delegated to LmdbActor");
         Ok(())
     }
 
@@ -409,36 +357,20 @@ impl Message<ApiAsk> for ApiActor {
             }
             ApiAsk::GetDataRange { symbol, interval } => {
                 let timeframe_seconds = self.interval_to_seconds(&interval);
-                let db_key = format!("{}_{}", symbol, timeframe_seconds);
                 
-                if let Err(e) = self.init_database(&symbol, &interval) {
+                // Initialize database if needed
+                if let Err(e) = self.init_database(&symbol, &interval).await {
                     return Ok(ApiReply::Error(format!("Failed to initialize database: {}", e)));
                 }
 
-                let env = self.envs.get(&db_key).unwrap();
-                let candle_db = self.candle_dbs.get(&db_key).unwrap();
-
-                match env.read_txn() {
-                    Ok(rtxn) => {
-                        let mut earliest = None;
-                        let mut latest = None;
-                        let mut count = 0;
-
-                        let iter = candle_db.iter(&rtxn);
-                        if let Ok(iter) = iter {
-                            for result in iter {
-                                if let Ok((_, candle)) = result {
-                                    count += 1;
-                                    if earliest.is_none() || candle.open_time < earliest.unwrap() {
-                                        earliest = Some(candle.open_time);
-                                    }
-                                    if latest.is_none() || candle.close_time > latest.unwrap() {
-                                        latest = Some(candle.close_time);
-                                    }
-                                }
-                            }
-                        }
-
+                // Get data range from LmdbActor
+                let msg = LmdbActorMessage::GetDataRange {
+                    symbol: symbol.clone(),
+                    timeframe: timeframe_seconds,
+                };
+                
+                match self.lmdb_actor.ask(msg).send().await {
+                    Ok(LmdbActorResponse::DataRange { earliest, latest, count }) => {
                         Ok(ApiReply::DataRange {
                             symbol,
                             interval,
@@ -447,7 +379,15 @@ impl Message<ApiAsk> for ApiActor {
                             count,
                         })
                     }
-                    Err(e) => Ok(ApiReply::Error(format!("Failed to read database: {}", e))),
+                    Ok(LmdbActorResponse::ErrorResponse(err)) => {
+                        Ok(ApiReply::Error(format!("Failed to get data range: {}", err)))
+                    }
+                    Ok(_) => {
+                        Ok(ApiReply::Error("Unexpected response from LmdbActor".to_string()))
+                    }
+                    Err(e) => {
+                        Ok(ApiReply::Error(format!("Failed to communicate with LmdbActor: {}", e)))
+                    }
                 }
             }
             ApiAsk::FetchKlines { symbol, interval, start_time, end_time, limit } => {

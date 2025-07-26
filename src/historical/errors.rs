@@ -40,6 +40,8 @@ pub enum HistoricalDataError {
     StorageError(String),
     #[error("Database initialization error: {0}")]
     DatabaseInitialization(String),
+    #[error("Database error: {0}")]
+    DatabaseError(String),
     #[error("Directory creation error: {0}")]
     DirectoryCreation(String),
     #[error("Semaphore acquisition error: {0}")]

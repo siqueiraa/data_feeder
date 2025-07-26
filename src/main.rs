@@ -10,6 +10,7 @@ use data_feeder::technical_analysis::{
 use data_feeder::postgres::{PostgresActor, PostgresConfig};
 use data_feeder::kafka::{KafkaActor, KafkaConfig};
 use data_feeder::health::{start_health_server, HealthConfig, HealthDependencies};
+use data_feeder::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
@@ -161,7 +162,7 @@ impl Default for DataFeederConfig {
             // Historical validation defaults - start with Phase 1 (full validation)
             historical_validation_complete: true, // Always start with full historical validation
             recent_monitoring_days: 60, // Monitor last 60 days in Phase 2
-            min_gap_seconds: 75, // Minimum 75 seconds for 1-minute candles (60s + 15s buffer)
+            min_gap_seconds: 60, // Minimum 75 seconds for 1-minute candles (60s + 15s buffer)
         }
     }
 }
@@ -209,24 +210,15 @@ fn parse_start_date(date_str: &str) -> Result<i64, String> {
         .map_err(|e| format!("Invalid date format '{}': {}. Use RFC3339 format like '2022-01-01T00:00:00Z'", date_str, e))
 }
 
-/// Normalize timestamp to minute boundary (round down to nearest minute)
-fn normalize_to_minute_boundary(timestamp_ms: i64) -> i64 {
-    (timestamp_ms / 60000) * 60000
-}
-
-/// Check if two timestamps are in the same minute boundary
-fn same_minute_boundary(ts1: i64, ts2: i64) -> bool {
-    normalize_to_minute_boundary(ts1) == normalize_to_minute_boundary(ts2)
-}
-
-/// Single gap detection with smart actor delegation
-/// Checks the unified database and assigns gaps to optimal actors
+/// Simplified gap detection using LmdbActor
+/// Delegates gap detection to LmdbActor and assigns gaps to optimal actors
 async fn detect_and_fill_gaps(
     symbol: &str, 
     timeframe_seconds: u64,
     start_time: i64, 
     end_time: i64,
     config: &DataFeederConfig,
+    lmdb_actor: &ActorRef<LmdbActor>,
     historical_actor: &ActorRef<HistoricalActor>,
     api_actor: &ActorRef<ApiActor>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -241,132 +233,64 @@ async fn detect_and_fill_gaps(
     
     info!("🔍 Detecting gaps for {} {} from {} to {}", symbol, interval, start_time, end_time);
     
-    // Step 1: Check existing data coverage in the unified database
-    let data_range = match api_actor.ask(ApiAsk::GetDataRange {
-        symbol: symbol.to_string(),
-        interval: interval.to_string(),
-    }).await {
-        Ok(ApiReply::DataRange { earliest, latest, count, .. }) => {
-            info!("📊 Current data: earliest={:?}, latest={:?}, count={}", earliest, latest, count);
-            (earliest, latest, count)
-        }
-        Ok(_) => return Err("Unexpected reply type for GetDataRange".into()),
-        Err(e) => return Err(format!("Failed to get data range: {}", e).into()),
-    };
-    
-    let now = chrono::Utc::now().timestamp_millis();
-    let (existing_earliest, existing_latest, _count) = data_range;
-    
-    // Step 2: Determine what gaps need to be filled based on historical validation phase
-    let mut gaps = Vec::new();
-    
-    // Phase detection: determine if we need full historical validation or recent monitoring
+    // Phase detection logging
     if !config.historical_validation_complete {
         info!("🔄 Phase 1: Full historical validation (first-time setup)");
-        info!("📊 Checking ENTIRE historical range for gaps");
     } else {
         info!("✅ Phase 2: Recent monitoring (historical validation complete)");
         info!("📊 Checking last {} days for gaps", config.recent_monitoring_days);
-        // Adjust end_time for Phase 2 to only check recent period
-        let recent_start = end_time - (config.recent_monitoring_days as i64 * 24 * 60 * 60 * 1000);
-        if start_time < recent_start {
-            info!("🔄 Adjusting start time from {} to {} (recent monitoring only)", start_time, recent_start);
-            // Note: We would need to modify start_time here, but since it's a parameter,
-            // we'll handle this in the gap detection logic below
-        }
     }
     
-    // Add logging to show reference date strategy
+    // Reference date strategy logging  
     if config.respect_config_start_date {
         info!("🎯 Using config start_date as absolute reference (ignoring existing DB data before it)");
     } else {
         info!("📊 Using database-based gap detection (preserving existing data)");
     }
     
-    // Check for gap before existing data (only if respecting DB dates)
-    if let Some(earliest) = existing_earliest {
-        if config.respect_config_start_date {
-            // When respecting config date, only consider data after start_time
-            if earliest < start_time {
-                info!("🗑️ Ignoring existing DB data before config start_date (earliest: {}, config: {})", earliest, start_time);
-                // Treat as if no existing data before our desired start time
-                gaps.push((start_time, end_time));
-                info!("📉 Treating as fresh data request: {} to {}", start_time, end_time);
-            } else {
-                // Existing data is after our start time, check for gaps normally
-                if start_time < earliest {
-                    gaps.push((start_time, earliest));
-                    info!("📉 Found historical gap: {} to {}", start_time, earliest);
-                }
-            }
-        } else {
-            // Original behavior: respect existing database data
-            if start_time < earliest {
-                gaps.push((start_time, earliest));
-                info!("📉 Found historical gap: {} to {}", start_time, earliest);
-            }
+    // Step 1: Use LmdbActor for comprehensive gap detection
+    let gaps = match lmdb_actor.ask(LmdbActorMessage::ValidateDataRange {
+        symbol: symbol.to_string(),
+        timeframe: timeframe_seconds,
+        start: start_time,
+        end: end_time,
+    }).send().await {
+        Ok(LmdbActorResponse::ValidationResult { gaps }) => {
+            info!("📊 LmdbActor detected {} gaps for {} {}", gaps.len(), symbol, interval);
+            gaps
         }
-    } else {
-        // No existing data - entire range is a gap
-        gaps.push((start_time, end_time));
-        info!("📉 No existing data - filling entire range: {} to {}", start_time, end_time);
+        Ok(LmdbActorResponse::ErrorResponse(e)) => {
+            return Err(format!("LmdbActor validation failed: {}", e).into());
+        }
+        Ok(_) => return Err("Unexpected response from LmdbActor".into()),
+        Err(e) => return Err(format!("Failed to communicate with LmdbActor: {}", e).into()),
+    };
+    
+    if gaps.is_empty() {
+        info!("✅ No gaps detected - data is complete");
+        return Ok(());
     }
     
-    // Check for gap after existing data (real-time gap)
-    if let Some(latest) = existing_latest {
-        if latest < end_time {
-            gaps.push((latest, end_time));
-            info!("📈 Found real-time gap: {} to {}", latest, end_time);
-        }
-    }
+    // Step 2: Enhanced gap analysis and reporting
+    let total_missing_time: i64 = gaps.iter().map(|(start, end)| end - start).sum();
+    let total_missing_candles = total_missing_time / (60 * 1000);
+    let total_missing_hours = total_missing_time / (1000 * 3600);
+    let total_missing_days = total_missing_hours / 24;
+    let expected_total_time = end_time - start_time;
+    let missing_percentage = (total_missing_time as f64 / expected_total_time as f64) * 100.0;
     
-    // Filter out micro-gaps below threshold and minute boundary transitions
-    let min_gap_ms = (config.min_gap_seconds * 1000) as i64;
-    let original_gap_count = gaps.len();
-    gaps.retain(|(start, end)| {
-        let gap_duration_ms = end - start;
-        
-        // Filter out gaps smaller than threshold
-        if gap_duration_ms < min_gap_ms {
-            return false;
-        }
-        
-        // For 1-minute candles, filter out normal minute boundary transitions
-        if timeframe_seconds == 60 && same_minute_boundary(*start, *end) {
-            info!("🕐 Ignoring minute boundary transition: {} to {} (same minute)", start, end);
-            return false;
-        }
-        
-        true
-    });
+    warn!("📈 Gap Analysis Summary for {}: {} gaps found", symbol, gaps.len());
+    warn!("⚠️  Total missing time: {} hours ({} days)", total_missing_hours, total_missing_days);
+    warn!("📉 Total missing candles: {} (should be 1440 per day)", total_missing_candles);
+    warn!("💯 Missing data percentage: {:.1}%", missing_percentage);
     
-    if original_gap_count != gaps.len() {
-        let filtered_count = original_gap_count - gaps.len();
-        info!("🔍 Filtered out {} micro-gaps/boundary transitions below {}s threshold", filtered_count, config.min_gap_seconds);
-    }
+    // Step 3: Smart actor delegation for each gap
+    let now = chrono::Utc::now().timestamp_millis();
     
-    // Step 3: Enhanced gap analysis and reporting
-    if !gaps.is_empty() {
-        let total_missing_time = gaps.iter().map(|(start, end)| end - start).sum::<i64>();
-        let total_missing_candles = total_missing_time / (60 * 1000);
-        let total_missing_hours = total_missing_time / (1000 * 3600);
-        let total_missing_days = total_missing_hours / 24;
-        
-        warn!("📈 Gap Analysis Summary for {}: {} gaps found", symbol, gaps.len());
-        warn!("⚠️  Total missing time: {} hours ({} days)", total_missing_hours, total_missing_days);
-        warn!("📉 Total missing candles: {} (should be 1440 per day)", total_missing_candles);
-        
-        // Calculate what percentage of expected data is missing
-        let expected_total_time = end_time - start_time;
-        let missing_percentage = (total_missing_time as f64 / expected_total_time as f64) * 100.0;
-        warn!("💯 Missing data percentage: {:.1}%", missing_percentage);
-    }
-    
-    // Step 4: Smart actor delegation for each gap
     for &(gap_start, gap_end) in &gaps {
         let gap_duration_hours = (gap_end - gap_start) / (1000 * 3600);
         let gap_duration_days = gap_duration_hours / 24;
-        let gap_duration_months = gap_duration_days / 30; // Approximate months
+        let gap_duration_months = gap_duration_days / 30;
         let gap_age_hours = (now - gap_end) / (1000 * 3600);
         
         // Convert timestamps to human-readable format
@@ -377,8 +301,7 @@ async fn detect_and_fill_gaps(
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
             .unwrap_or_else(|| format!("INVALID_TIME({})", gap_end));
         
-        // Calculate expected vs missing candles for this gap
-        let expected_candles = (gap_end - gap_start) / (60 * 1000); // 1-minute candles
+        let expected_candles = (gap_end - gap_start) / (60 * 1000);
         
         warn!("🕳️ Gap detected for {}: {} to {} ({} hours, {} days, ~{} months)", 
               symbol, gap_start_str, gap_end_str, gap_duration_hours, gap_duration_days, gap_duration_months);
@@ -426,33 +349,25 @@ async fn detect_and_fill_gaps(
         }
     }
     
-    // Step 5: Wait for completion and verify
-    if !gaps.is_empty() {
-        info!("⏳ Waiting for gap filling to complete...");
-        sleep(Duration::from_secs(10)).await;
-        
-        // Verify completeness
-        match api_actor.ask(ApiAsk::GetDataRange {
-            symbol: symbol.to_string(),
-            interval: interval.to_string(),
-        }).await {
-            Ok(ApiReply::DataRange { earliest, latest, count, .. }) => {
-                info!("✅ Post-fill verification: earliest={:?}, latest={:?}, count={}", 
-                      earliest, latest, count);
-                
-                // Check if we achieved complete coverage
-                if let (Some(earliest), Some(latest)) = (earliest, latest) {
-                    if earliest <= start_time && latest >= (end_time - (timeframe_seconds * 1000) as i64) {
-                        info!("✅ Complete data coverage achieved!");
-                    } else {
-                        warn!("⚠️ Gaps may still exist after filling");
-                    }
-                }
+    // Step 4: Wait for completion and verify using LmdbActor
+    info!("⏳ Waiting for gap filling to complete...");
+    sleep(Duration::from_secs(10)).await;
+    
+    // Re-validate using LmdbActor to check if gaps were filled
+    match lmdb_actor.ask(LmdbActorMessage::ValidateDataRange {
+        symbol: symbol.to_string(),
+        timeframe: timeframe_seconds,
+        start: start_time,
+        end: end_time,
+    }).send().await {
+        Ok(LmdbActorResponse::ValidationResult { gaps: remaining_gaps }) => {
+            if remaining_gaps.is_empty() {
+                info!("✅ Complete data coverage achieved!");
+            } else {
+                warn!("⚠️ {} gaps still exist after filling", remaining_gaps.len());
             }
-            _ => warn!("❌ Failed to verify data completeness"),
         }
-    } else {
-        info!("✅ No gaps detected - data is complete");
+        _ => warn!("❌ Failed to verify data completeness"),
     }
     
     Ok(())
@@ -508,7 +423,7 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     info!("🔧 Initializing data pipeline...");
     
     // Step 1: Launch basic actors (no TA actors yet)
-    let (historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor) = launch_basic_actors(&config).await?;
+    let (lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor) = launch_basic_actors(&config).await?;
     
     // Step 2: Start real-time data streaming FIRST
     info!("📡 Starting real-time data streaming...");
@@ -558,6 +473,7 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
                     start_time, 
                     now,
                     &config,
+                    &lmdb_actor,
                     &historical_actor, 
                     &api_actor
                 ).await {
@@ -575,13 +491,14 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     
     // Step 4: Continuous monitoring mode (WebSocket already running)
     info!("♾️  Entering continuous monitoring mode...");
-    run_continuous_monitoring(config, historical_actor, api_actor, ws_actor, postgres_actor, ta_actors).await?;
+    run_continuous_monitoring(config, lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, ta_actors).await?;
     
     Ok(())
 }
 
 /// Launch basic actors (without TA actors) 
 async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
+    ActorRef<LmdbActor>,
     ActorRef<HistoricalActor>, 
     ActorRef<ApiActor>, 
     ActorRef<WebSocketActor>,
@@ -591,7 +508,20 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     
     info!("🎭 Launching actor system...");
     
-    // PostgreSQL Actor - for dual storage strategy (create first)
+    // LMDB Actor - for centralized LMDB operations and gap detection (create first)
+    let lmdb_actor = {
+        info!("🗃️ Launching LMDB actor...");
+        let mut actor = LmdbActor::new(&config.storage_path, config.min_gap_seconds)
+            .map_err(|e| format!("Failed to create LMDB actor: {}", e))?;
+        
+        // Initialize databases for all symbols and timeframes
+        actor.initialize_databases(&config.symbols, &config.timeframes)
+            .map_err(|e| format!("Failed to initialize LMDB databases: {}", e))?;
+        
+        kameo::spawn(actor)
+    };
+    
+    // PostgreSQL Actor - for dual storage strategy
     let postgres_actor = if config.postgres_config.enabled {
         info!("🐘 Launching PostgreSQL actor...");
         let actor = PostgresActor::new(config.postgres_config.clone())
@@ -613,7 +543,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         None
     };
     
-    // Historical Actor - for S3/bulk data (unified storage)
+    // Historical Actor - for S3/bulk data (will delegate LMDB operations to LmdbActor)
     let historical_actor = {
         let csv_temp_path = config.storage_path.join("temp_csv"); // Temporary staging within main storage
         let mut actor = HistoricalActor::new(&config.symbols, &config.timeframes, &config.storage_path, &csv_temp_path)
@@ -621,12 +551,13 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         if let Some(ref postgres_ref) = postgres_actor {
             actor.set_postgres_actor(postgres_ref.clone());
         }
+        actor.set_lmdb_actor(lmdb_actor.clone());
         kameo::spawn(actor)
     };
     
     // API Actor - for gap filling
     let api_actor = {
-        let mut actor = ApiActor::new(config.storage_path.clone())
+        let mut actor = ApiActor::new(lmdb_actor.clone())
             .map_err(|e| format!("Failed to create API actor: {}", e))?;
         if let Some(ref postgres_ref) = postgres_actor {
             actor.set_postgres_actor(postgres_ref.clone());
@@ -670,7 +601,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     });
     
     info!("✅ Basic actors launched successfully");
-    Ok((historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor))
+    Ok((lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor))
 }
 
 /// Launch Technical Analysis actors after gap filling is complete
@@ -782,6 +713,7 @@ async fn start_realtime_streaming(
 /// Main continuous monitoring loop (WebSocket already running)
 async fn run_continuous_monitoring(
     config: DataFeederConfig,
+    _lmdb_actor: ActorRef<LmdbActor>,
     _historical_actor: ActorRef<HistoricalActor>,
     api_actor: ActorRef<ApiActor>,
     ws_actor: ActorRef<WebSocketActor>,

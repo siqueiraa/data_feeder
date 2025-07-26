@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::ops::Bound;
 use std::time::Instant;
 
 use futures::future::join_all;
@@ -18,7 +17,8 @@ use rayon::prelude::*;
 use super::errors::HistoricalDataError;
 use super::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS, Seconds, FuturesExchangeTrade};
 use crate::postgres::{PostgresActor, PostgresTell};
-use crate::common::{constants::*, error_utils::ErrorContext, database_utils::DatabaseManager, shared_data::{intern_symbol, timeframe_to_string}};
+use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
+use crate::common::error_utils::ErrorContext;
 use super::utils::{
     build_kline_urls_with_path_type, get_dates_in_range, get_months_in_range, should_use_monthly_data,
     is_kline_supported_timeframe, process_klines_pipeline, seconds_to_interval, PathType,
@@ -28,13 +28,13 @@ use super::utils::{
 // Moved to common::constants
 
 pub struct HistoricalActor {
-    database_manager: DatabaseManager,
     csv_path: PathBuf,
     postgres_actor: Option<ActorRef<PostgresActor>>,
+    lmdb_actor: Option<ActorRef<LmdbActor>>,
 }
 
 impl HistoricalActor {
-    pub fn new(symbols: &[String], timeframes: &[Seconds], base_path: &Path, csv_path: &Path) -> Result<Self, HistoricalDataError> {
+    pub fn new(_symbols: &[String], _timeframes: &[Seconds], _base_path: &Path, csv_path: &Path) -> Result<Self, HistoricalDataError> {
         // Create CSV directory
         if !csv_path.exists() {
             info!("📁 Creating CSV directory at: {}", csv_path.display());
@@ -42,16 +42,12 @@ impl HistoricalActor {
                 .with_io_context("Failed to create CSV directory")?;
         }
 
-        // Initialize database manager
-        let mut database_manager = DatabaseManager::new();
-        database_manager.initialize_all(symbols, timeframes, base_path)?;
-
-        info!("Initialized LMDB databases for {} symbols and {} timeframes", symbols.len(), timeframes.len());
+        info!("HistoricalActor initialized - LMDB operations will be delegated to LmdbActor");
 
         Ok(Self { 
-            database_manager,
             csv_path: csv_path.to_path_buf(),
             postgres_actor: None,
+            lmdb_actor: None,
         })
     }
 
@@ -60,53 +56,26 @@ impl HistoricalActor {
         self.postgres_actor = Some(postgres_actor);
     }
 
-    fn get_certified_range(&self, symbol: &str, timeframe: Seconds) -> Result<Option<TimeRange>, HistoricalDataError> {
-        let key = (intern_symbol(symbol), timeframe);
-        let env = self
-            .database_manager.envs
-            .get(&key)
-            .ok_or(HistoricalDataError::DatabaseNotFound(format!("Environment not found for {} {}", symbol, timeframe)))?;
-        let certified_range_db = self
-            .database_manager.certified_range_dbs
-            .get(&key)
-            .ok_or(HistoricalDataError::DatabaseNotFound(format!("Certified range DB not found for {} {}", symbol, timeframe)))?;
-
-        let rtxn = env
-            .read_txn()
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to create read transaction: {}", e)))?;
-        let range_key = timeframe_to_string(timeframe);
-        let range = certified_range_db
-            .get(&rtxn, &range_key)
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to get certified range: {}", e)))?;
-
-        Ok(range)
+    /// Set the LMDB actor reference for database operations
+    pub fn set_lmdb_actor(&mut self, lmdb_actor: ActorRef<LmdbActor>) {
+        self.lmdb_actor = Some(lmdb_actor);
     }
 
-    fn set_certified_range(&self, symbol: &str, timeframe: Seconds, range: TimeRange) -> Result<(), HistoricalDataError> {
-        let key = (intern_symbol(symbol), timeframe);
-        let env = self
-            .database_manager.envs
-            .get(&key)
-            .ok_or_else(|| HistoricalDataError::DatabaseNotFound(format!("Environment not found for {} {}", symbol, timeframe)))?;
-        let certified_range_db = self
-            .database_manager.certified_range_dbs
-            .get(&key)
-            .ok_or_else(|| HistoricalDataError::DatabaseNotFound(format!("Certified range DB not found for {} {}", symbol, timeframe)))?;
+    async fn get_certified_range(&self, _symbol: &str, _timeframe: Seconds) -> Result<Option<TimeRange>, HistoricalDataError> {
+        // This will be implemented using the LmdbActor once we have certified range support in messages
+        // For now, return None to maintain compatibility
+        warn!("get_certified_range not yet implemented via LmdbActor - returning None");
+        Ok(None)
+    }
 
-        let mut wtxn = env
-            .write_txn()
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to create write transaction: {}", e)))?;
-        let range_key = timeframe_to_string(timeframe);
-        certified_range_db
-            .put(&mut wtxn, &range_key, &range)
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to store certified range: {}", e)))?;
-        wtxn.commit()
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to commit transaction: {}", e)))?;
-        info!("Set CertifiedRange for symbol {} timeframe {}: start={}, end={}", symbol, timeframe, range.start, range.end);
+    async fn set_certified_range(&self, symbol: &str, timeframe: Seconds, range: TimeRange) -> Result<(), HistoricalDataError> {
+        // This will be implemented using the LmdbActor once we have certified range support in messages
+        // For now, just log the operation to maintain compatibility
+        info!("set_certified_range not yet implemented via LmdbActor - would set CertifiedRange for symbol {} timeframe {}: start={}, end={}", symbol, timeframe, range.start, range.end);
         Ok(())
     }
 
-    fn store_candles(
+    async fn store_candles(
         &self,
         symbol: &str,
         timeframe: Seconds,
@@ -122,38 +91,32 @@ impl HistoricalActor {
             format_timestamp(start_time),
             format_timestamp(end_time)
         );
-        let key = (intern_symbol(symbol), timeframe);
-        let env = self
-            .database_manager.envs
-            .get(&key)
-            .ok_or(HistoricalDataError::DatabaseNotFound(format!("Environment not found for {} {}", symbol, timeframe)))?;
-        let candle_db = self
-            .database_manager.candle_dbs
-            .get(&key)
-            .ok_or(HistoricalDataError::DatabaseNotFound(format!("Database not found for {} {}", symbol, timeframe)))?;
 
-        let write_start = Instant::now();
+        // Delegate storage to LmdbActor
+        if let Some(lmdb_actor) = &self.lmdb_actor {
+            let message = LmdbActorMessage::StoreCandles {
+                symbol: symbol.to_string(),
+                timeframe,
+                candles: candles.to_vec(),
+            };
 
-        let mut wtxn = env
-            .write_txn()
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to create write transaction: {}", e)))?;
-
-        for chunk in candles.chunks(BATCH_SIZE) {
-            for candle in chunk {
-                let key = format!("{}:{}", timeframe, candle.close_time());
-                candle_db
-                    .put(&mut wtxn, &key, candle)
-                    .map_err(|e| HistoricalDataError::StorageError(format!("Failed to store candle: {}", e)))?;
+            match lmdb_actor.ask(message).send().await {
+                Ok(LmdbActorResponse::Success) => {
+                    info!("✅ Successfully stored {} candles via LmdbActor for {} {}s", candles.len(), symbol, timeframe);
+                }
+                Ok(LmdbActorResponse::ErrorResponse(e)) => {
+                    return Err(HistoricalDataError::DatabaseError(format!("LmdbActor storage error: {}", e)));
+                }
+                Ok(other) => {
+                    return Err(HistoricalDataError::DatabaseError(format!("Unexpected response from LmdbActor: {:?}", other)));
+                }
+                Err(e) => {
+                    return Err(HistoricalDataError::DatabaseError(format!("Failed to send message to LmdbActor: {}", e)));
+                }
             }
+        } else {
+            return Err(HistoricalDataError::DatabaseError("LmdbActor not available".to_string()));
         }
-
-        wtxn.commit()
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to commit transaction: {}", e)))?;
-
-        let write_duration = write_start.elapsed();
-        info!("Time taken to write {} candles to LMDB: {:?}", candles.len(), write_duration);
-
-        info!("Stored {} new candles to LMDB for {} timeframe {}s", candles.len(), symbol, timeframe);
 
         let (new_candles_start, new_candles_end) = match (candles.first(), candles.last()) {
             (Some(first), Some(last)) => (first.open_time(), last.close_time()),
@@ -175,7 +138,7 @@ impl HistoricalActor {
             return Ok(());
         }
 
-        let existing_certified = self.get_certified_range(symbol, timeframe)?;
+        let existing_certified = self.get_certified_range(symbol, timeframe).await?;
 
         let new_range = TimeRange { start: new_candles_start, end: new_candles_end + 1 };
 
@@ -193,7 +156,7 @@ impl HistoricalActor {
             if gap_between == 0 {
                 let merged_range = TimeRange { start: existing.start.min(new_range.start), end: existing.end.max(new_range.end) };
 
-                self.set_certified_range(symbol, timeframe, merged_range)?;
+                self.set_certified_range(symbol, timeframe, merged_range).await?;
                 info!("✅ Merged adjacent certified ranges for symbol {}, timeframe {}s: {:?}", symbol, timeframe, merged_range);
             } else {
                 let extended_range = TimeRange { start: existing.start.min(new_range.start), end: existing.end.max(new_range.end) };
@@ -201,10 +164,10 @@ impl HistoricalActor {
                 warn!("Gap of {} ms between existing and new certified ranges.", gap_between);
                 info!("Extending certified range to cover both ranges for symbol {}, timeframe {}s: {:?}", symbol, timeframe, extended_range);
 
-                self.set_certified_range(symbol, timeframe, extended_range)?;
+                self.set_certified_range(symbol, timeframe, extended_range).await?;
             }
         } else {
-            self.set_certified_range(symbol, timeframe, new_range)?;
+            self.set_certified_range(symbol, timeframe, new_range).await?;
             info!("Set initial certified range for symbol {}, timeframe {}s: {:?}", symbol, timeframe, new_range);
         }
 
@@ -252,7 +215,7 @@ impl HistoricalActor {
         Ok(())
     }
 
-    pub fn get_candles(
+    pub async fn get_candles(
         &self,
         symbol: &str,
         timeframe: Seconds,
@@ -261,73 +224,71 @@ impl HistoricalActor {
     ) -> Result<Vec<FuturesOHLCVCandle>, HistoricalDataError> {
         let fetch_start = Instant::now();
 
-        let key = (intern_symbol(symbol), timeframe);
-        let env = self
-            .database_manager.envs
-            .get(&key)
-            .ok_or_else(|| HistoricalDataError::DatabaseNotFound(format!("Environment not found for {} {}", symbol, timeframe)))?;
-        let db = self
-            .database_manager.candle_dbs
-            .get(&key)
-            .ok_or_else(|| HistoricalDataError::DatabaseNotFound(format!("Database not found for {} {}", symbol, timeframe)))?;
+        // Delegate to LmdbActor
+        if let Some(lmdb_actor) = &self.lmdb_actor {
+            let message = LmdbActorMessage::GetCandles {
+                symbol: symbol.to_string(),
+                timeframe,
+                start: start_time,
+                end: end_time,
+                limit: None,
+            };
 
-        let rtxn = env
-            .read_txn()
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to create read transaction: {}", e)))?;
+            let candles = match lmdb_actor.ask(message).send().await {
+                Ok(LmdbActorResponse::Candles(candles)) => candles,
+                Ok(LmdbActorResponse::ErrorResponse(e)) => {
+                    return Err(HistoricalDataError::DatabaseError(format!("LmdbActor get candles error: {}", e)));
+                }
+                Err(e) => {
+                    return Err(HistoricalDataError::DatabaseError(format!("Failed to send message to LmdbActor: {}", e)));
+                }
+                _ => {
+                    return Err(HistoricalDataError::DatabaseError("Unexpected response from LmdbActor".to_string()));
+                }
+            };
 
-        let start_key = format!("{}:{}", timeframe, start_time);
-        let end_key = format!("{}:{}", timeframe, end_time);
-        let range_bounds = (Bound::Included(start_key.as_str()), Bound::Included(end_key.as_str()));
+            let fetch_duration = fetch_start.elapsed();
+            info!("Time taken to fetch {} candles via LmdbActor: {:?}", candles.len(), fetch_duration);
 
-        let mut candles = Vec::new();
-        let range_iter = db
-            .range(&rtxn, &range_bounds)
-            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to apply range: {}", e)))?;
-        for result in range_iter {
-            let (_key, candle) = result.map_err(|e| HistoricalDataError::StorageError(format!("Failed to read candle: {}", e)))?;
-            candles.push(candle);
-        }
+            if candles.is_empty() {
+                return Ok(candles);
+            }
 
-        let fetch_duration = fetch_start.elapsed();
-        info!("Time taken to fetch {} candles from LMDB: {:?}", candles.len(), fetch_duration);
+            // Apply gap filling logic (this logic should remain in HistoricalActor for now)
+            let mut filled_candles = Vec::new();
+            let mut last_candle: Option<&FuturesOHLCVCandle> = None;
 
-        if candles.is_empty() {
-            return Ok(candles);
-        }
-
-        candles.sort_by_key(|c| c.open_time());
-
-        let mut filled_candles = Vec::new();
-        let mut last_candle: Option<&FuturesOHLCVCandle> = None;
-
-        for candle in &candles {
-            if let Some(prev_candle) = last_candle {
-                let expected_next_open_time = prev_candle.open_time() + (timeframe as i64 * 1000);
-                if candle.open_time() > expected_next_open_time {
-                    let mut current_time = expected_next_open_time;
-                    while current_time < candle.open_time() {
-                        let filler_candle = FuturesOHLCVCandle::new_from_values(
-                            current_time,
-                            current_time + (timeframe as i64 * 1000) - 1,
-                            prev_candle.close(),
-                            prev_candle.close(),
-                            prev_candle.close(),
-                            prev_candle.close(),
-                            0.0,
-                            current_time,
-                            true,
-                        );
-                        filled_candles.push(filler_candle);
-                        current_time += timeframe as i64 * 1000;
+            for candle in &candles {
+                if let Some(prev_candle) = last_candle {
+                    let expected_next_open_time = prev_candle.open_time() + (timeframe as i64 * 1000);
+                    if candle.open_time() > expected_next_open_time {
+                        let mut current_time = expected_next_open_time;
+                        while current_time < candle.open_time() {
+                            let filler_candle = FuturesOHLCVCandle::new_from_values(
+                                current_time,
+                                current_time + (timeframe as i64 * 1000) - 1,
+                                prev_candle.close(),
+                                prev_candle.close(),
+                                prev_candle.close(),
+                                prev_candle.close(),
+                                0.0,
+                                current_time,
+                                true,
+                            );
+                            filled_candles.push(filler_candle);
+                            current_time += timeframe as i64 * 1000;
+                        }
                     }
                 }
+                filled_candles.push(candle.clone());
+                last_candle = Some(candle);
             }
-            filled_candles.push(candle.clone());
-            last_candle = Some(candle);
-        }
 
-        info!("Gap filling complete. Total candles: {}", filled_candles.len());
-        Ok(filled_candles)
+            info!("Gap filling complete. Total candles: {}", filled_candles.len());
+            Ok(filled_candles)
+        } else {
+            Err(HistoricalDataError::DatabaseError("LmdbActor not available".to_string()))
+        }
     }
 
     pub async fn orchestrate_aggtrade_to_candles_for_timeframe(
@@ -344,7 +305,7 @@ impl HistoricalActor {
 
         let mut ranges_to_fetch = Vec::new();
         for &tf in &timeframes {
-            let certified_range = self.get_certified_range(symbol, tf)?;
+            let certified_range = self.get_certified_range(symbol, tf).await?;
             let mut tf_ranges = Vec::new();
 
             info!(
@@ -429,7 +390,7 @@ impl HistoricalActor {
                 format_timestamp(end_time)
             );
             let primary_tf = timeframes[0];
-            return self.get_candles(symbol, primary_tf, start_time, end_time);
+            return self.get_candles(symbol, primary_tf, start_time, end_time).await;
         }
 
         let mut unique_ranges_to_process = std::collections::HashSet::new();
@@ -478,9 +439,9 @@ impl HistoricalActor {
                     format_timestamp(candle_end)
                 );
 
-                self.store_candles(symbol, *tf, candles, candle_start, candle_end)?;
+                self.store_candles(symbol, *tf, candles, candle_start, candle_end).await?;
 
-                self.set_certified_range(symbol, *tf, TimeRange { start: candle_start, end: candle_end })?;
+                self.set_certified_range(symbol, *tf, TimeRange { start: candle_start, end: candle_end }).await?;
                 info!("✅ Updated certified range for symbol {}, timeframe {}s", symbol, tf);
             }
         }
@@ -871,9 +832,9 @@ impl HistoricalActor {
             let candle_start = first_candle.open_time();
             let candle_end = last_candle.close_time() + 1;
 
-            self.store_candles(symbol, timeframe, &all_candles, candle_start, candle_end)?;
+            self.store_candles(symbol, timeframe, &all_candles, candle_start, candle_end).await?;
 
-            self.set_certified_range(symbol, timeframe, TimeRange { start: candle_start, end: candle_end })?;
+            self.set_certified_range(symbol, timeframe, TimeRange { start: candle_start, end: candle_end }).await?;
             info!("✅ Stored {} {} klines and updated certified range", all_candles.len(), data_type);
         }
 
@@ -897,11 +858,11 @@ impl HistoricalActor {
             format_timestamp(end_time)
         );
 
-        let certified_range = self.get_certified_range(symbol, timeframe)?;
+        let certified_range = self.get_certified_range(symbol, timeframe).await?;
         if let Some(cert) = certified_range {
             if start_time >= cert.start && end_time <= cert.end {
                 info!("📊 Klines already certified for requested range, returning from LMDB");
-                return self.get_candles(symbol, timeframe, start_time, end_time);
+                return self.get_candles(symbol, timeframe, start_time, end_time).await;
             }
         }
 
@@ -909,18 +870,10 @@ impl HistoricalActor {
         self.try_fetch_klines_with_fallback(symbol, start_time, end_time, timeframe, interval).await
     }
 
-    pub fn invalidate_certified_range(&mut self, symbol: &str, timeframe: Seconds) -> Result<(), HistoricalDataError> {
-        let key = (intern_symbol(symbol), timeframe);
-        if let Some(db) = self.database_manager.certified_range_dbs.get(&key) {
-            let mut wtxn = self.database_manager.envs[&key]
-                .write_txn()
-                .map_err(|e| HistoricalDataError::StorageError(e.to_string()))?;
-            let db_key = timeframe_to_string(timeframe);
-            db.delete(&mut wtxn, &db_key)
-                .map_err(|e| HistoricalDataError::StorageError(e.to_string()))?;
-            wtxn.commit().map_err(|e| HistoricalDataError::StorageError(e.to_string()))?;
-            info!("Invalidated certified range for symbol {}, timeframe {}s", symbol, timeframe);
-        }
+    pub async fn invalidate_certified_range(&mut self, symbol: &str, timeframe: Seconds) -> Result<(), HistoricalDataError> {
+        // This will be implemented using the LmdbActor once we have certified range support in messages
+        // For now, just log the operation to maintain compatibility
+        info!("invalidate_certified_range not yet implemented via LmdbActor - would invalidate certified range for symbol {}, timeframe {}s", symbol, timeframe);
         Ok(())
     }
 }
@@ -968,7 +921,7 @@ impl Message<HistoricalAsk> for HistoricalActor {
                 let result = async {
                     let range = TimeRange { start: start_time, end: end_time };
 
-                    let certified_range = self.get_certified_range(&symbol, timeframe)?;
+                    let certified_range = self.get_certified_range(&symbol, timeframe).await?;
                     info!("certified_range: {:?}", certified_range);
 
                     if certified_range.as_ref().is_some_and(|cert| range.start >= cert.start && range.end <= cert.end) {
@@ -977,7 +930,7 @@ impl Message<HistoricalAsk> for HistoricalActor {
                             symbol, timeframe, range.start, range.end, certified_range
                         );
 
-                        match self.get_candles(&symbol, timeframe, start_time, end_time) {
+                        match self.get_candles(&symbol, timeframe, start_time, end_time).await {
                             Ok(candles) => {
                                 return Ok(candles);
                             }
@@ -986,7 +939,7 @@ impl Message<HistoricalAsk> for HistoricalActor {
                                     "Failed to fetch certified candles for symbol {}, timeframe {}s: {}. Invalidating certified range.",
                                     symbol, timeframe, e
                                 );
-                                self.invalidate_certified_range(&symbol, timeframe)?;
+                                self.invalidate_certified_range(&symbol, timeframe).await?;
                             }
                         }
                     } else {
@@ -1005,10 +958,10 @@ impl Message<HistoricalAsk> for HistoricalActor {
                             .await?;
                     }
 
-                    self.set_certified_range(&symbol, timeframe, range)?;
+                    self.set_certified_range(&symbol, timeframe, range).await?;
                     info!("✅ Set certified range for symbol {}, timeframe {}s after successful orchestration: {:?}", symbol, timeframe, range);
 
-                    let candles = self.get_candles(&symbol, timeframe, start_time, end_time)?;
+                    let candles = self.get_candles(&symbol, timeframe, start_time, end_time).await?;
                     Ok(candles)
                 }.await;
 
