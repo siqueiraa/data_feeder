@@ -221,7 +221,7 @@ async fn detect_and_fill_gaps(
     lmdb_actor: &ActorRef<LmdbActor>,
     historical_actor: &ActorRef<HistoricalActor>,
     api_actor: &ActorRef<ApiActor>
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     
     let interval = match timeframe_seconds {
         60 => "1m",
@@ -268,7 +268,7 @@ async fn detect_and_fill_gaps(
     
     if gaps.is_empty() {
         info!("✅ No gaps detected - data is complete");
-        return Ok(());
+        return Ok(false);
     }
     
     // Step 2: Enhanced gap analysis and reporting
@@ -363,14 +363,17 @@ async fn detect_and_fill_gaps(
         Ok(LmdbActorResponse::ValidationResult { gaps: remaining_gaps }) => {
             if remaining_gaps.is_empty() {
                 info!("✅ Complete data coverage achieved!");
+                Ok(false)
             } else {
                 warn!("⚠️ {} gaps still exist after filling", remaining_gaps.len());
+                Ok(true)
             }
         }
-        _ => warn!("❌ Failed to verify data completeness"),
+        _ => {
+            warn!("❌ Failed to verify data completeness");
+            Ok(true) // Treat as if gaps still exist to retry
+        }
     }
-    
-    Ok(())
 }
 
 #[tokio::main]
@@ -466,20 +469,37 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
                     .unwrap_or_else(|| format!("INVALID_TIME({})", now));
                 info!("🕐 Human-readable gap detection: {} to {}", start_str, now_str);
 
-                // Use single gap detection that delegates to optimal actors
-                if let Err(e) = detect_and_fill_gaps(
-                    symbol, 
-                    timeframe_seconds, 
-                    start_time, 
-                    now,
-                    &config,
-                    &lmdb_actor,
-                    &historical_actor, 
-                    &api_actor
-                ).await {
-                    warn!("⚠️ Gap detection failed for {} {}s: {}", symbol, timeframe_seconds, e);
-                } else {
-                    info!("✅ Gap detection completed for {} {}s", symbol, timeframe_seconds);
+                let mut gaps_found = true;
+                let mut retry_count = 0;
+                let max_retries = 5; // Limit retries to prevent infinite loops
+
+                while gaps_found && retry_count < max_retries {
+                    info!("🔄 Attempting to fill gaps for {} {}s (Retry: {}/{})", symbol, timeframe_seconds, retry_count + 1, max_retries);
+                    match detect_and_fill_gaps(
+                        symbol, 
+                        timeframe_seconds, 
+                        start_time, 
+                        now,
+                        &config,
+                        &lmdb_actor,
+                        &historical_actor, 
+                        &api_actor
+                    ).await {
+                        Ok(found) => {
+                            gaps_found = found;
+                            if gaps_found {
+                                info!("⏳ Gaps still exist, retrying...");
+                                sleep(Duration::from_secs(5)).await; // Wait before retrying
+                            } else {
+                                info!("✅ All gaps filled for {} {}s", symbol, timeframe_seconds);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("⚠️ Gap detection failed for {} {}s: {}", symbol, timeframe_seconds, e);
+                            gaps_found = false; // Stop retrying on error
+                        }
+                    }
+                    retry_count += 1;
                 }
             }
         }
