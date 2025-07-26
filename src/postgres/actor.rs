@@ -50,10 +50,12 @@ pub enum PostgresTell {
     StoreCandle {
         symbol: String,
         candle: FuturesOHLCVCandle,
+        source: String, // Track which actor sent this candle
     },
     /// Store multiple candles in batch
     StoreBatch {
         candles: Vec<(String, FuturesOHLCVCandle)>,
+        source: String, // Track which actor sent this batch
     },
     /// Health check message
     HealthCheck,
@@ -263,7 +265,7 @@ impl PostgresActor {
 
 
     /// Store multiple candles in batch
-    async fn store_batch(&mut self, candles: Vec<(String, FuturesOHLCVCandle)>) -> Result<(), PostgresError> {
+    async fn store_batch(&mut self, candles: Vec<(String, FuturesOHLCVCandle)>, source: &str) -> Result<(), PostgresError> {
         if candles.is_empty() {
             return Ok(());
         }
@@ -277,6 +279,7 @@ impl PostgresActor {
                 return Ok(());
             }
         };
+        
 
         let mut client = pool.get().await?;
         let transaction = client.transaction().await?;
@@ -306,12 +309,25 @@ impl PostgresActor {
         }
 
         transaction.commit().await?;
-        info!("Batch stored {} candles (rows affected: {})", candles_len, rows_affected);
+        info!("📊 [{}] Batch stored {} candles (rows affected: {})", source, candles_len, rows_affected);
+        
+        // Log warning if rows_affected doesn't match expected count
+        if rows_affected as usize != candles_len {
+            warn!("⚠️  Expected {} rows but affected {} rows - potential duplicates or UPSERT conflicts", 
+                  candles_len, rows_affected);
+        }
+        
         Ok(())
     }
 
     /// Add candle to batch and flush if needed
-    async fn add_to_batch(&mut self, symbol: String, candle: FuturesOHLCVCandle) -> Result<(), PostgresError> {
+    async fn add_to_batch(&mut self, symbol: String, candle: FuturesOHLCVCandle, source: &str) -> Result<(), PostgresError> {
+        // Log individual candle addition
+        let timestamp = chrono::DateTime::from_timestamp_millis(candle.close_time)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| format!("INVALID_TIME({})", candle.close_time));
+        info!("➕ [{}] Adding candle to batch: {} - {} (close: {})", source, symbol, timestamp, candle.close);
+        
         self.candle_batch.push((symbol, candle));
         
         if self.last_batch_time.is_none() {
@@ -325,14 +341,14 @@ impl PostgresActor {
                 .unwrap_or(false);
 
         if should_flush {
-            self.flush_batch().await?;
+            self.flush_batch(source).await?;
         }
 
         Ok(())
     }
 
     /// Flush the current batch to database
-    async fn flush_batch(&mut self) -> Result<(), PostgresError> {
+    async fn flush_batch(&mut self, source: &str) -> Result<(), PostgresError> {
         if self.candle_batch.is_empty() {
             return Ok(());
         }
@@ -340,7 +356,7 @@ impl PostgresActor {
         let batch = std::mem::take(&mut self.candle_batch);
         self.last_batch_time = None;
 
-        match self.store_batch(batch).await {
+        match self.store_batch(batch, source).await {
             Ok(()) => {
                 self.last_error = None;
                 Ok(())
@@ -397,7 +413,7 @@ impl Actor for PostgresActor {
         info!("PostgresActor stopping: {:?}", reason);
         
         // Flush any remaining batch
-        if let Err(e) = self.flush_batch().await {
+        if let Err(e) = self.flush_batch("Shutdown").await {
             error!("Failed to flush final batch: {}", e);
         }
         
@@ -410,19 +426,19 @@ impl Message<PostgresTell> for PostgresActor {
 
     async fn handle(&mut self, msg: PostgresTell, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
         match msg {
-            PostgresTell::StoreCandle { symbol, candle } => {
-                if let Err(e) = self.add_to_batch(symbol, candle).await {
+            PostgresTell::StoreCandle { symbol, candle, source } => {
+                if let Err(e) = self.add_to_batch(symbol, candle, &source).await {
                     error!("Failed to add candle to batch: {}", e);
                 }
             }
-            PostgresTell::StoreBatch { candles } => {
-                if let Err(e) = self.store_batch(candles).await {
+            PostgresTell::StoreBatch { candles, source } => {
+                if let Err(e) = self.store_batch(candles, &source).await {
                     error!("Failed to store batch: {}", e);
                 }
             }
             PostgresTell::HealthCheck => {
                 // Periodic health check - flush batch if needed
-                if let Err(e) = self.flush_batch().await {
+                if let Err(e) = self.flush_batch("HealthCheck").await {
                     error!("Health check batch flush failed: {}", e);
                 }
             }

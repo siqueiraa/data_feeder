@@ -29,6 +29,10 @@ pub enum TimeFrameTell {
         candle: FuturesOHLCVCandle,
         is_closed: bool,
     },
+    /// Set the reference timestamp for synchronized loading
+    SetReferenceTimestamp {
+        timestamp: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +191,8 @@ pub struct TimeFrameActor {
     api_actor: Option<ActorRef<crate::api::ApiActor>>,
     /// Overall initialization status
     is_ready: bool,
+    /// Reference timestamp for synchronized loading
+    reference_timestamp: Option<i64>,
 }
 
 impl TimeFrameActor {
@@ -207,6 +213,7 @@ impl TimeFrameActor {
             indicator_actor: None,
             api_actor: None,
             is_ready: false,
+            reference_timestamp: None,
         }
     }
 
@@ -235,12 +242,13 @@ impl TimeFrameActor {
         for symbol in &self.config.symbols.clone() {
             info!("Loading historical data for {}", symbol);
 
-            // Load 1-minute candles from database
+            // Load 1-minute candles from database using synchronized timestamp
             let historical_candles = load_recent_candles_from_db(
                 symbol,
                 60, // 1-minute timeframe
                 self.config.min_history_days,
                 &self.base_path,
+                self.reference_timestamp,
             ).await?;
 
             // Validate we have sufficient data and get detected gaps
@@ -268,7 +276,8 @@ impl TimeFrameActor {
                 }
                 Err(e) => {
                     warn!("⚠️ {}", e);
-                    // Continue with available data but mark as not fully initialized
+                    warn!("📋 Centralized gap detection should have handled this - proceeding with available data");
+                    // Continue with available data - centralized gap detection should handle insufficient data
                 }
             }
 
@@ -450,6 +459,10 @@ impl Message<TimeFrameTell> for TimeFrameActor {
             TimeFrameTell::ProcessCandle { symbol, candle, is_closed } => {
                 // Process candles with closed status information for proper EMA handling
                 self.process_new_candle(&symbol, &candle, is_closed).await;
+            }
+            TimeFrameTell::SetReferenceTimestamp { timestamp } => {
+                info!("🕐 TimeFrameActor received synchronized timestamp: {}", timestamp);
+                self.reference_timestamp = Some(timestamp);
             }
         }
     }

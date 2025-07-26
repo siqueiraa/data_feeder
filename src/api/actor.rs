@@ -243,16 +243,30 @@ impl ApiActor {
         // Store to PostgreSQL for dual storage strategy (after LMDB commit)
         if let Some(postgres_actor) = &self.postgres_actor {
             if let Some((candles_len, candles_vec)) = postgres_data {
+                let start_timestamp = chrono::DateTime::from_timestamp_millis(start_time)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| format!("INVALID_TIME({})", start_time));
+                let end_timestamp = chrono::DateTime::from_timestamp_millis(end_time)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| format!("INVALID_TIME({})", end_time));
+                    
+                info!("🔄 [ApiActor] Sending batch of {} candles to PostgreSQL for {} {} (range: {} - {})", 
+                      candles_len, symbol, interval, start_timestamp, end_timestamp);
+                
                 let postgres_msg = PostgresTell::StoreBatch {
                     candles: candles_vec,
+                    source: "ApiActor".to_string(),
                 };
                 
                 if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
-                    warn!("Failed to store API batch to PostgreSQL for {}: {}", symbol, e);
+                    warn!("❌ [ApiActor] Failed to store API batch to PostgreSQL for {}: {}", symbol, e);
                 } else {
-                    info!("🐘 Stored {} API candles to PostgreSQL for {}", candles_len, symbol);
+                    info!("✅ [ApiActor] Successfully sent {} API candles to PostgreSQL for {} (range: {} - {})", 
+                          candles_len, symbol, start_timestamp, end_timestamp);
                 }
             }
+        } else {
+            warn!("⚠️  [ApiActor] PostgreSQL actor not available for storing {} candles", candles.len());
         }
 
         Ok(())

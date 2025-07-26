@@ -3,7 +3,7 @@ use crate::technical_analysis::structs::{VolumeRecord, TrendDirection};
 use heed::{Database};
 use heed::types::{SerdeBincode, Str};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Load recent candles from LMDB for initialization
 /// Returns candles sorted by close_time (oldest first)
@@ -12,6 +12,7 @@ pub async fn load_recent_candles_from_db(
     timeframe_seconds: u64,
     lookback_days: u32,
     base_path: &PathBuf,
+    reference_timestamp: Option<i64>,
 ) -> Result<Vec<FuturesOHLCVCandle>, Box<dyn std::error::Error + Send + Sync>> {
     let db_name = format!("{}_{}", symbol, timeframe_seconds);
     let db_path = base_path.join(db_name);
@@ -33,9 +34,24 @@ pub async fn load_recent_candles_from_db(
     let candle_db: Database<Str, SerdeBincode<FuturesOHLCVCandle>> = 
         env.open_database(&rtxn, Some("candles"))?.ok_or("Candles database not found")?;
     
-    // Calculate cutoff time for lookback period
-    let now = chrono::Utc::now().timestamp_millis();
+    // Calculate cutoff time for lookback period using provided reference timestamp or current time
+    let now = reference_timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
     let cutoff_time = now - (lookback_days as i64 * 24 * 3600 * 1000);
+    
+    if reference_timestamp.is_some() {
+        info!("🕐 TA loading using SYNCHRONIZED timestamp: {} (cutoff: {})", now, cutoff_time);
+    } else {
+        info!("🕐 TA loading using current timestamp: {} (cutoff: {})", now, cutoff_time);
+    }
+    
+    // Add human-readable timestamp debugging for TA loading
+    let now_str = chrono::DateTime::from_timestamp_millis(now)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("INVALID_TIME({})", now));
+    let cutoff_str = chrono::DateTime::from_timestamp_millis(cutoff_time)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("INVALID_TIME({})", cutoff_time));
+    info!("🕐 Human-readable TA loading: {} back to {} ({} days)", now_str, cutoff_str, lookback_days);
 
     let mut candles = Vec::new();
     let iter = candle_db.iter(&rtxn)?;
@@ -59,12 +75,12 @@ pub async fn load_recent_candles_from_db(
     if !candles.is_empty() {
         let first_time = candles[0].open_time;
         let last_time = candles[candles.len()-1].close_time;
-        info!("Loaded {} recent candles for {} {}s (last {} days): {} to {}", 
+        debug!("Loaded {} recent candles for {} {}s (last {} days): {} to {}", 
               candles.len(), symbol, timeframe_seconds, lookback_days, first_time, last_time);
               
         // Debug the time range to understand boundary issues
         let time_span_hours = (last_time - first_time) / (1000 * 3600);
-        info!("📊 Historical data spans {} hours ({:.1} days)", time_span_hours, time_span_hours as f64 / 24.0);
+        debug!("📊 Historical data spans {} hours ({:.1} days)", time_span_hours, time_span_hours as f64 / 24.0);
     } else {
         info!("Loaded 0 candles for {} {}s (last {} days)", symbol, timeframe_seconds, lookback_days);
     }
@@ -81,9 +97,9 @@ pub fn calculate_min_candles_needed(
     let max_ema_period = ema_periods.iter().max().unwrap_or(&89);
     let _max_timeframe = timeframes.iter().max().unwrap_or(&14400); // 4h in seconds
     
-    // Calculate candles needed for each requirement (more reasonable)
+    // Calculate candles needed for each requirement
     let candles_for_ema = *max_ema_period as usize; // Just the EMA period, not multiplied by timeframe
-    let candles_for_volume = (volume_lookback_days * 24 * 60) as usize;
+    let candles_for_volume = (volume_lookback_days * 24 * 60) as usize; // 1-minute candles for volume analysis
     let candles_for_trends = 300; // Just need a few hundred candles for trends
     
     // Take the maximum requirement - volume is usually the limiting factor
@@ -91,11 +107,19 @@ pub fn calculate_min_candles_needed(
         .max(candles_for_volume)
         .max(candles_for_trends);
     
-    // Reasonable minimum - don't be too aggressive
-    let with_buffer = min_needed.min(50000); // Cap at ~35 days worth
+    // BUG FIX: Don't cap artificially low - let volume requirement drive the actual need
+    // For 60 days: 60 * 24 * 60 = 86,400 candles is reasonable and expected
+    let max_reasonable = (90 * 24 * 60) as usize; // Cap at 90 days max (129,600 candles)
+    let with_buffer = min_needed.min(max_reasonable);
     
-    info!("Minimum candles needed: EMA={}, Volume={}, Trends={}, Final={}",
-          candles_for_ema, candles_for_volume, candles_for_trends, with_buffer);
+    info!("Minimum candles needed: EMA={}, Volume={}, Trends={}, Calculated={}, Final={}",
+          candles_for_ema, candles_for_volume, candles_for_trends, min_needed, with_buffer);
+    
+    // Add detailed explanation when volume drives the requirement
+    if candles_for_volume == min_needed {
+        info!("📊 Volume analysis drives candle requirement: {} days = {} candles", 
+              volume_lookback_days, candles_for_volume);
+    }
     
     with_buffer
 }
@@ -179,7 +203,7 @@ fn aggregate_candles_to_timeframe(
     // DEBUG: Show the final aggregated candle to detect boundary issues
     if !aggregated.is_empty() {
         let last_agg = &aggregated[aggregated.len()-1];
-        info!("🔍 FINAL {}s candle: close={:.2} @ open_time={} close_time={}", 
+        debug!("🔍 FINAL {}s candle: close={:.2} @ open_time={} close_time={}", 
               timeframe_seconds, last_agg.close, last_agg.open_time, last_agg.close_time);
     }
     
@@ -187,16 +211,16 @@ fn aggregate_candles_to_timeframe(
     if aggregated.len() > 1 {
         let first_few = aggregated.iter().take(3);
         let last_few = aggregated.iter().rev().take(3).rev();
-        
-        info!("🔍 First 3 {}s candles timing:", timeframe_seconds);
+
+        debug!("🔍 First 3 {}s candles timing:", timeframe_seconds);
         for (i, candle) in first_few.enumerate() {
-            info!("  [{}]: open_time={}, close_time={}, close={:.2}", 
+            debug!("  [{}]: open_time={}, close_time={}, close={:.2}", 
                   i, candle.open_time, candle.close_time, candle.close);
         }
-        
-        info!("🔍 Last 3 {}s candles timing:", timeframe_seconds);
+
+        debug!("🔍 Last 3 {}s candles timing:", timeframe_seconds);
         for (i, candle) in last_few.enumerate() {
-            info!("  [{}]: open_time={}, close_time={}, close={:.2}", 
+            debug!("  [{}]: open_time={}, close_time={}, close={:.2}", 
                   i, candle.open_time, candle.close_time, candle.close);
         }
         
@@ -237,7 +261,7 @@ fn create_aggregated_candle(
     period_start: TimestampMS,
     timeframe_ms: i64,
 ) -> Option<FuturesOHLCVCandle> {
-    use tracing::{debug, info};
+    use tracing::debug;
     let start_time = std::time::Instant::now();
     
     if candles.is_empty() {
@@ -268,12 +292,12 @@ fn create_aggregated_candle(
     
     // Special debug for the last few periods to see what's causing identical closes
     if period_number > 0 && (period_number % 50 == 0 || candles.len() < 5) {
-        info!("🔍 {}s period #{}: {} candles, first_1m_close={:.2}, last_1m_close={:.2}, final_agg_close={:.2}", 
+        debug!("🔍 {}s period #{}: {} candles, first_1m_close={:.2}, last_1m_close={:.2}, final_agg_close={:.2}", 
               timeframe_ms / 1000, period_number, candles.len(), first.close, last.close, last.close);
               
         if candles.len() >= 2 {
             let second_last = candles[candles.len()-2];
-            info!("   → Last two 1m candles: [{:.2} @ {}] → [{:.2} @ {}]", 
+            debug!("   → Last two 1m candles: [{:.2} @ {}] → [{:.2} @ {}]", 
                   second_last.close, second_last.close_time, last.close, last.close_time);
         }
     }
@@ -296,7 +320,6 @@ fn create_aggregated_candle(
 
 /// Extract price series from candles for EMA initialization
 pub fn extract_close_prices(candles: &[FuturesOHLCVCandle]) -> Vec<f64> {
-    use tracing::info;
     
     let prices: Vec<f64> = candles.iter().map(|c| c.close).collect();
     
@@ -305,16 +328,16 @@ pub fn extract_close_prices(candles: &[FuturesOHLCVCandle]) -> Vec<f64> {
         let total = prices.len();
         let first_few = prices.iter().take(5).map(|p| format!("{:.2}", p)).collect::<Vec<_>>().join(", ");
         let last_few = prices.iter().rev().take(5).rev().map(|p| format!("{:.2}", p)).collect::<Vec<_>>().join(", ");
-        
-        info!("🔍 Extracted {} close prices: first=[{}] last=[{}]", 
+
+        debug!("🔍 Extracted {} close prices: first=[{}] last=[{}]", 
               total, first_few, last_few);
         
         // Calculate basic stats for validation
         let min_price = prices.iter().fold(f64::INFINITY, |a, &b| a.min(b));
         let max_price = prices.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
         let avg_price = prices.iter().sum::<f64>() / prices.len() as f64;
-        
-        info!("🔍 Price range: min={:.2}, max={:.2}, avg={:.2}", min_price, max_price, avg_price);
+
+        debug!("🔍 Price range: min={:.2}, max={:.2}, avg={:.2}", min_price, max_price, avg_price);
     }
     
     prices

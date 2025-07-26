@@ -5,3 +5,4 @@ pub mod technical_analysis;
 pub mod postgres;
 pub mod kafka;
 pub mod common;
+pub mod health;

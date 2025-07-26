@@ -217,18 +217,36 @@ impl HistoricalActor {
                 .map(|candle| (symbol_owned.clone(), candle.clone()))
                 .collect();
             
+            // Log time range of historical data being stored
+            let start_time = candles.first().map(|c| c.open_time).unwrap_or(0);
+            let end_time = candles.last().map(|c| c.close_time).unwrap_or(0);
+            let start_timestamp = chrono::DateTime::from_timestamp_millis(start_time)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| format!("INVALID_TIME({})", start_time));
+            let end_timestamp = chrono::DateTime::from_timestamp_millis(end_time)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| format!("INVALID_TIME({})", end_time));
+                
+            info!("🔄 [HistoricalActor] Sending batch of {} historical candles to PostgreSQL for {} (range: {} - {})", 
+                  candles_len, symbol_owned, start_timestamp, end_timestamp);
+            
             let postgres_msg = PostgresTell::StoreBatch {
                 candles: candles_vec,
+                source: "HistoricalActor".to_string(),
             };
             
             let postgres_ref = postgres_actor.clone();
+            let symbol_for_log = symbol_owned.clone();
             tokio::spawn(async move {
                 if let Err(e) = postgres_ref.tell(postgres_msg).send().await {
-                    warn!("Failed to store historical batch to PostgreSQL for {}: {}", symbol_owned, e);
+                    warn!("❌ [HistoricalActor] Failed to store historical batch to PostgreSQL for {}: {}", symbol_owned, e);
                 } else {
-                    info!("🐘 Stored {} historical candles to PostgreSQL for {}", candles_len, symbol_owned);
+                    info!("✅ [HistoricalActor] Successfully sent {} historical candles to PostgreSQL for {} (range: {} - {})", 
+                          candles_len, symbol_for_log, start_timestamp, end_timestamp);
                 }
             });
+        } else {
+            warn!("⚠️  [HistoricalActor] PostgreSQL actor not available for storing {} historical candles", candles.len());
         }
 
         Ok(())

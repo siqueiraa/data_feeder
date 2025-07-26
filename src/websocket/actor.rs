@@ -533,18 +533,35 @@ impl Message<WebSocketTell> for WebSocketActor {
                 
                 // Store closed candles to PostgreSQL for dual storage strategy
                 if is_closed {
+                    let timestamp = chrono::DateTime::from_timestamp_millis(candle.close_time)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| format!("INVALID_TIME({})", candle.close_time));
+                    
+                    info!("🔄 [WebSocketActor] Sending closed candle to PostgreSQL: {} - {} (close: {})", 
+                          symbol, timestamp, candle.close);
+                    
                     if let Some(postgres_actor) = &self.postgres_actor {
                         let postgres_msg = PostgresTell::StoreCandle {
                             symbol: symbol.clone(),
                             candle: candle.clone(),
+                            source: "WebSocketActor".to_string(),
                         };
                         
                         if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
-                            warn!("Failed to store candle to PostgreSQL for {}: {}", symbol, e);
+                            warn!("❌ [WebSocketActor] Failed to store candle to PostgreSQL for {}: {}", symbol, e);
                         } else {
-                            debug!("🐘 Stored candle to PostgreSQL: {} @ {}", symbol, candle.close_time);
+                            info!("✅ [WebSocketActor] Successfully sent candle to PostgreSQL: {} @ {}", symbol, timestamp);
                         }
+                    } else {
+                        warn!("⚠️  [WebSocketActor] PostgreSQL actor not available for storing candle: {} @ {}", symbol, timestamp);
                     }
+                } else {
+                    // Log live candle updates for debugging timing
+                    let timestamp = chrono::DateTime::from_timestamp_millis(candle.close_time)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| format!("INVALID_TIME({})", candle.close_time));
+                    debug!("📊 [WebSocketActor] Processing live candle update: {} - {} (close: {})", 
+                           symbol, timestamp, candle.close);
                 }
                 
                 // Direct real-time forwarding to TimeFrame actor for immediate TA updates
@@ -612,7 +629,15 @@ impl Message<WebSocketTell> for WebSocketActor {
                                 
                                 // Check if gap is significant (using configured threshold)
                                 if gap_minutes > self.gap_threshold_minutes as i64 {
-                                    info!("🕳️ Found {} minute gap for {} after reconnection", gap_minutes, symbol);
+                                    let gap_start = chrono::DateTime::from_timestamp_millis(last_candle_time + 60000)
+                                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                                        .unwrap_or_else(|| format!("INVALID_TIME({})", last_candle_time + 60000));
+                                    let gap_end = chrono::DateTime::from_timestamp_millis(now - 60000)
+                                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                                        .unwrap_or_else(|| format!("INVALID_TIME({})", now - 60000));
+                                    
+                                    warn!("🕳️ [WebSocketActor] Found {} minute gap for {} after reconnection", gap_minutes, symbol);
+                                    info!("🔧 [WebSocketActor] Requesting gap fill: {} from {} to {}", symbol, gap_start, gap_end);
                                     
                                     // Request gap filling via API actor
                                     let gap_fill_msg = crate::api::ApiTell::FillGap {
@@ -623,13 +648,13 @@ impl Message<WebSocketTell> for WebSocketActor {
                                     };
                                     
                                     if let Err(e) = api_actor.tell(gap_fill_msg).send().await {
-                                        error!("Failed to request gap filling for {}: {}", symbol, e);
+                                        error!("❌ [WebSocketActor] Failed to request gap filling for {}: {}", symbol, e);
                                     } else {
-                                        info!("✅ Requested gap filling for {} from {} to {}", 
-                                              symbol, last_candle_time + 60000, now - 60000);
+                                        info!("✅ [WebSocketActor] Successfully requested gap filling for {} from {} to {}", 
+                                              symbol, gap_start, gap_end);
                                     }
                                 } else {
-                                    debug!("No significant gap found for {} ({} minutes)", symbol, gap_minutes);
+                                    debug!("✨ [WebSocketActor] No significant gap found for {} ({} minutes)", symbol, gap_minutes);
                                 }
                             } else {
                                 warn!("No last processed candle time available for gap detection");

@@ -628,14 +628,17 @@ impl Message<IndicatorTell> for IndicatorActor {
                     
                     // Publish indicators to Kafka if available
                     if let Some(ref kafka_actor) = self.kafka_actor {
+                        info!("📤 Attempting to publish {} indicators to Kafka", symbol);
                         let publish_msg = KafkaTell::PublishIndicators {
                             indicators: output.clone(),
                         };
                         if let Err(e) = kafka_actor.tell(publish_msg).send().await {
-                            error!("Failed to send indicators to Kafka: {}", e);
+                            error!("❌ Failed to send indicators to Kafka: {}", e);
                         } else {
-                            debug!("📤 Published {} indicators to Kafka", symbol);
+                            info!("✅ Successfully published {} indicators to Kafka", symbol);
                         }
+                    } else {
+                        warn!("⚠️ No Kafka actor reference available for publishing {} indicators", symbol);
                     }
                 } else {
                     warn!("Received batched update for unknown symbol: {}", symbol);
@@ -649,6 +652,7 @@ impl Message<IndicatorTell> for IndicatorActor {
             IndicatorTell::SetKafkaActor { kafka_actor } => {
                 info!("📨 Setting Kafka actor reference for indicator publishing");
                 self.kafka_actor = Some(kafka_actor);
+                info!("✅ Kafka actor reference successfully set in IndicatorActor");
             }
         }
     }

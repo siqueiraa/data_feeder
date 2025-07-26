@@ -9,6 +9,7 @@ use data_feeder::technical_analysis::{
 };
 use data_feeder::postgres::{PostgresActor, PostgresConfig};
 use data_feeder::kafka::{KafkaActor, KafkaConfig};
+use data_feeder::health::{start_health_server, HealthConfig, HealthDependencies};
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
@@ -77,6 +78,10 @@ struct DataFeederConfig {
     pub postgres_config: PostgresConfig,
     // Kafka configuration
     pub kafka_config: KafkaConfig,
+    // Historical validation tracking
+    pub historical_validation_complete: bool, // Tracks completion of Phase 1 (full historical validation)
+    pub recent_monitoring_days: u32, // Days to monitor in Phase 2 (default: 60)
+    pub min_gap_seconds: u64, // Minimum gap duration to detect (default: 90 seconds for 1-minute candles)
 }
 
 impl DataFeederConfig {
@@ -120,6 +125,10 @@ impl DataFeederConfig {
             periodic_gap_check_window_minutes: toml_config.application.periodic_gap_check_window_minutes,
             postgres_config: toml_config.database,
             kafka_config: toml_config.kafka.unwrap_or_default(),
+            // Historical validation defaults - start with Phase 1 (full validation)
+            historical_validation_complete: false, // Always start with full historical validation
+            recent_monitoring_days: 60, // Monitor last 60 days in Phase 2
+            min_gap_seconds: 75, // Minimum 75 seconds for 1-minute candles (60s + 15s buffer)
         }
     }
 }
@@ -133,7 +142,7 @@ impl Default for DataFeederConfig {
             gap_detection_enabled: true,
             start_date: None, // Start from existing data or real-time
             respect_config_start_date: false, // Default: use existing DB-based gap detection
-            monthly_threshold_months: 3, // Use monthly data for gaps > 3 months
+            monthly_threshold_months: 2, // Use monthly data for gaps > 2 months
             enable_technical_analysis: true, // Enable TA by default
             ta_config: TechnicalAnalysisConfig {
                 symbols: vec!["BTCUSDT".to_string()], // Will be synced with main symbols
@@ -149,6 +158,10 @@ impl Default for DataFeederConfig {
             periodic_gap_check_window_minutes: 30, // Scan last 30 minutes
             postgres_config: PostgresConfig::default(),
             kafka_config: KafkaConfig::default(),
+            // Historical validation defaults - start with Phase 1 (full validation)
+            historical_validation_complete: true, // Always start with full historical validation
+            recent_monitoring_days: 60, // Monitor last 60 days in Phase 2
+            min_gap_seconds: 75, // Minimum 75 seconds for 1-minute candles (60s + 15s buffer)
         }
     }
 }
@@ -196,6 +209,16 @@ fn parse_start_date(date_str: &str) -> Result<i64, String> {
         .map_err(|e| format!("Invalid date format '{}': {}. Use RFC3339 format like '2022-01-01T00:00:00Z'", date_str, e))
 }
 
+/// Normalize timestamp to minute boundary (round down to nearest minute)
+fn normalize_to_minute_boundary(timestamp_ms: i64) -> i64 {
+    (timestamp_ms / 60000) * 60000
+}
+
+/// Check if two timestamps are in the same minute boundary
+fn same_minute_boundary(ts1: i64, ts2: i64) -> bool {
+    normalize_to_minute_boundary(ts1) == normalize_to_minute_boundary(ts2)
+}
+
 /// Single gap detection with smart actor delegation
 /// Checks the unified database and assigns gaps to optimal actors
 async fn detect_and_fill_gaps(
@@ -234,8 +257,24 @@ async fn detect_and_fill_gaps(
     let now = chrono::Utc::now().timestamp_millis();
     let (existing_earliest, existing_latest, _count) = data_range;
     
-    // Step 2: Determine what gaps need to be filled
+    // Step 2: Determine what gaps need to be filled based on historical validation phase
     let mut gaps = Vec::new();
+    
+    // Phase detection: determine if we need full historical validation or recent monitoring
+    if !config.historical_validation_complete {
+        info!("🔄 Phase 1: Full historical validation (first-time setup)");
+        info!("📊 Checking ENTIRE historical range for gaps");
+    } else {
+        info!("✅ Phase 2: Recent monitoring (historical validation complete)");
+        info!("📊 Checking last {} days for gaps", config.recent_monitoring_days);
+        // Adjust end_time for Phase 2 to only check recent period
+        let recent_start = end_time - (config.recent_monitoring_days as i64 * 24 * 60 * 60 * 1000);
+        if start_time < recent_start {
+            info!("🔄 Adjusting start time from {} to {} (recent monitoring only)", start_time, recent_start);
+            // Note: We would need to modify start_time here, but since it's a parameter,
+            // we'll handle this in the gap detection logic below
+        }
+    }
     
     // Add logging to show reference date strategy
     if config.respect_config_start_date {
@@ -281,21 +320,75 @@ async fn detect_and_fill_gaps(
         }
     }
     
-    // Step 3: Smart actor delegation for each gap
+    // Filter out micro-gaps below threshold and minute boundary transitions
+    let min_gap_ms = (config.min_gap_seconds * 1000) as i64;
+    let original_gap_count = gaps.len();
+    gaps.retain(|(start, end)| {
+        let gap_duration_ms = end - start;
+        
+        // Filter out gaps smaller than threshold
+        if gap_duration_ms < min_gap_ms {
+            return false;
+        }
+        
+        // For 1-minute candles, filter out normal minute boundary transitions
+        if timeframe_seconds == 60 && same_minute_boundary(*start, *end) {
+            info!("🕐 Ignoring minute boundary transition: {} to {} (same minute)", start, end);
+            return false;
+        }
+        
+        true
+    });
+    
+    if original_gap_count != gaps.len() {
+        let filtered_count = original_gap_count - gaps.len();
+        info!("🔍 Filtered out {} micro-gaps/boundary transitions below {}s threshold", filtered_count, config.min_gap_seconds);
+    }
+    
+    // Step 3: Enhanced gap analysis and reporting
+    if !gaps.is_empty() {
+        let total_missing_time = gaps.iter().map(|(start, end)| end - start).sum::<i64>();
+        let total_missing_candles = total_missing_time / (60 * 1000);
+        let total_missing_hours = total_missing_time / (1000 * 3600);
+        let total_missing_days = total_missing_hours / 24;
+        
+        warn!("📈 Gap Analysis Summary for {}: {} gaps found", symbol, gaps.len());
+        warn!("⚠️  Total missing time: {} hours ({} days)", total_missing_hours, total_missing_days);
+        warn!("📉 Total missing candles: {} (should be 1440 per day)", total_missing_candles);
+        
+        // Calculate what percentage of expected data is missing
+        let expected_total_time = end_time - start_time;
+        let missing_percentage = (total_missing_time as f64 / expected_total_time as f64) * 100.0;
+        warn!("💯 Missing data percentage: {:.1}%", missing_percentage);
+    }
+    
+    // Step 4: Smart actor delegation for each gap
     for &(gap_start, gap_end) in &gaps {
         let gap_duration_hours = (gap_end - gap_start) / (1000 * 3600);
         let gap_duration_days = gap_duration_hours / 24;
         let gap_duration_months = gap_duration_days / 30; // Approximate months
         let gap_age_hours = (now - gap_end) / (1000 * 3600);
         
-        info!("🔧 Processing gap: start={}, end={}, duration={}h ({}d, ~{}mo), age={}h", 
-              gap_start, gap_end, gap_duration_hours, gap_duration_days, gap_duration_months, gap_age_hours);
+        // Convert timestamps to human-readable format
+        let gap_start_str = chrono::DateTime::from_timestamp_millis(gap_start)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| format!("INVALID_TIME({})", gap_start));
+        let gap_end_str = chrono::DateTime::from_timestamp_millis(gap_end)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| format!("INVALID_TIME({})", gap_end));
+        
+        // Calculate expected vs missing candles for this gap
+        let expected_candles = (gap_end - gap_start) / (60 * 1000); // 1-minute candles
+        
+        warn!("🕳️ Gap detected for {}: {} to {} ({} hours, {} days, ~{} months)", 
+              symbol, gap_start_str, gap_end_str, gap_duration_hours, gap_duration_days, gap_duration_months);
+        info!("📊 Gap details: {} expected candles, gap age: {} hours", expected_candles, gap_age_hours);
         
         // Enhanced classification: Monthly vs Daily vs Intraday
         let use_monthly_data = gap_duration_months >= config.monthly_threshold_months as i64;
         
-        if gap_age_hours > 48 && gap_duration_hours > 24 {
-            // Historical gap → HistoricalActor (S3 bulk download)
+        if gap_duration_hours > 24 {
+            // Large gap → HistoricalActor (S3 bulk download)
             if use_monthly_data {
                 info!("🏛️📅 Assigning large historical gap to HistoricalActor (S3 MONTHLY bulk) - {}+ months", config.monthly_threshold_months);
             } else {
@@ -318,8 +411,8 @@ async fn detect_and_fill_gaps(
                 Err(e) => warn!("⚠️ HistoricalActor failed: {}. Falling back to ApiActor", e),
             }
         } else {
-            // Intraday/Recent gap → ApiActor (targeted API calls)
-            info!("⚡ Assigning intraday gap to ApiActor (targeted API)");
+            // Small gap (≤24h) → ApiActor (targeted API calls)
+            info!("⚡ Assigning small gap to ApiActor (targeted API)");
             if let Err(e) = api_actor.tell(ApiTell::FillGap {
                 symbol: symbol.to_string(),
                 interval: interval.to_string(),
@@ -333,7 +426,7 @@ async fn detect_and_fill_gaps(
         }
     }
     
-    // Step 4: Wait for completion and verify
+    // Step 5: Wait for completion and verify
     if !gaps.is_empty() {
         info!("⏳ Waiting for gap filling to complete...");
         sleep(Duration::from_secs(10)).await;
@@ -414,32 +507,49 @@ async fn main() {
 async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("🔧 Initializing data pipeline...");
     
-    // Step 1: Launch actors with unified storage
-    let (historical_actor, api_actor, ws_actor, postgres_actor, _kafka_actor, ta_actors) = launch_actors(&config).await?;
+    // Step 1: Launch basic actors (no TA actors yet)
+    let (historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor) = launch_basic_actors(&config).await?;
     
     // Step 2: Start real-time data streaming FIRST
     info!("📡 Starting real-time data streaming...");
     start_realtime_streaming(&config, &ws_actor).await?;
     
-    // Step 2.5: Direct WebSocket → TimeFrame forwarding (no bridge needed)
-    if ta_actors.is_some() {
-        info!("⚡ Direct WebSocket → TimeFrame forwarding active (no bridge delays)");
-    }
+    // Step 2.5: WebSocket is running, but TA actors will be added after gap filling
     
-    // Step 3: Single gap detection with smart actor delegation
+    // Step 3: Single gap detection with smart actor delegation - SYNCHRONIZED TIMESTAMP
+    let synchronized_timestamp = chrono::Utc::now().timestamp_millis();
+    info!("🕐 SYNCHRONIZED TIMESTAMP for gap detection and TA: {}", synchronized_timestamp);
+    
     if config.gap_detection_enabled {
         info!("🔍 Starting unified gap detection and filling...");
         for symbol in &config.symbols {
             for &timeframe_seconds in &config.timeframes {
-                let now = chrono::Utc::now().timestamp_millis();
+                // Use synchronized timestamp for consistent time ranges
+                let now = synchronized_timestamp;
+                // Align with TA requirements: use TA's min_history_days for proper initialization
+                let ta_history_days = config.ta_config.min_history_days as i64;
+                
                 let start_time = if let Some(ref date_str) = config.start_date {
                     parse_start_date(date_str).unwrap_or_else(|e| {
-                        warn!("❌ Failed to parse start_date: {}. Using 24h ago", e);
-                        now - (24 * 3600 * 1000)
+                        warn!("❌ Failed to parse start_date: {}. Using {}d ago for TA alignment", e, ta_history_days);
+                        now - (ta_history_days * 24 * 3600 * 1000)
                     })
                 } else {
-                    now - (24 * 3600 * 1000) // Default 24h ago
+                    // Use TA's min_history_days to ensure sufficient data for technical analysis
+                    now - (ta_history_days * 24 * 3600 * 1000)
                 };
+                
+                info!("📊 Gap detection range: {} days back (aligned with TA requirements)", ta_history_days);
+                info!("🕐 Gap detection time range: {} to {} (start to synchronized_now)", start_time, now);
+                
+                // Add human-readable timestamps for debugging
+                let start_str = chrono::DateTime::from_timestamp_millis(start_time)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| format!("INVALID_TIME({})", start_time));
+                let now_str = chrono::DateTime::from_timestamp_millis(now)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| format!("INVALID_TIME({})", now));
+                info!("🕐 Human-readable gap detection: {} to {}", start_str, now_str);
 
                 // Use single gap detection that delegates to optimal actors
                 if let Err(e) = detect_and_fill_gaps(
@@ -460,6 +570,9 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
         info!("✅ Unified gap detection and filling completed");
     }
     
+    // Step 3.5: Now launch Technical Analysis actors with complete historical data using SAME timestamp
+    let ta_actors = launch_ta_actors(&config, &api_actor, &ws_actor, &postgres_actor, &kafka_actor, synchronized_timestamp).await?;
+    
     // Step 4: Continuous monitoring mode (WebSocket already running)
     info!("♾️  Entering continuous monitoring mode...");
     run_continuous_monitoring(config, historical_actor, api_actor, ws_actor, postgres_actor, ta_actors).await?;
@@ -467,14 +580,13 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// Launch all actors with unified configuration
-async fn launch_actors(config: &DataFeederConfig) -> Result<(
+/// Launch basic actors (without TA actors) 
+async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     ActorRef<HistoricalActor>, 
     ActorRef<ApiActor>, 
     ActorRef<WebSocketActor>,
     Option<ActorRef<PostgresActor>>,
-    Option<ActorRef<KafkaActor>>,
-    Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>
+    Option<ActorRef<KafkaActor>>
 ), Box<dyn std::error::Error + Send + Sync>> {
     
     info!("🎭 Launching actor system...");
@@ -522,90 +634,111 @@ async fn launch_actors(config: &DataFeederConfig) -> Result<(
         kameo::spawn(actor)
     };
     
-    // Technical Analysis Actors - if enabled
-    let (ws_actor, ta_actors) = if config.enable_technical_analysis {
-        info!("🧮 Launching Technical Analysis actors...");
+    // WebSocket Actor without TA integration (TA actors will be added later)
+    let ws_actor = {
+        let mut actor = WebSocketActor::new_with_config(
+            config.storage_path.clone(), 
+            300, // 5min health check timeout
+            config.reconnection_gap_threshold_minutes,
+            config.reconnection_gap_check_delay_seconds
+        ).map_err(|e| format!("Failed to create WebSocket actor: {}", e))?;
         
-        // Create indicator actor first
-        let indicator_actor = {
-            let actor = IndicatorActor::new(config.ta_config.clone());
-            let actor_ref = kameo::spawn(actor);
-            
-            // Set Kafka actor reference if available
-            if let Some(ref kafka_ref) = kafka_actor {
-                use data_feeder::technical_analysis::actors::indicator::IndicatorTell;
-                let set_kafka_msg = IndicatorTell::SetKafkaActor {
-                    kafka_actor: kafka_ref.clone(),
-                };
-                if let Err(e) = actor_ref.tell(set_kafka_msg).send().await {
-                    error!("Failed to set Kafka actor on IndicatorActor: {}", e);
-                } else {
-                    info!("✅ Connected IndicatorActor to KafkaActor");
-                }
-            }
-            
-            actor_ref
-        };
-        
-        // Create timeframe actor and set its indicator and API actor references
-        let timeframe_actor = {
-            let mut actor = TimeFrameActor::new(config.ta_config.clone(), config.storage_path.clone());
-            actor.set_indicator_actor(indicator_actor.clone());
-            actor.set_api_actor(api_actor.clone());
-            kameo::spawn(actor)
-        };
-        
-        // WebSocket Actor with direct TimeFrame actor reference
-        let ws_actor = {
-            let mut actor = WebSocketActor::new_with_config(
-                config.storage_path.clone(), 
-                300, // 5min health check timeout
-                config.reconnection_gap_threshold_minutes,
-                config.reconnection_gap_check_delay_seconds
-            ).map_err(|e| format!("Failed to create WebSocket actor: {}", e))?;
-            
-            // Set API, PostgreSQL, and TimeFrame actor references
-            actor.set_api_actor(api_actor.clone());
-            if let Some(ref postgres_ref) = postgres_actor {
-                actor.set_postgres_actor(postgres_ref.clone());
-            }
-            actor.set_timeframe_actor(timeframe_actor.clone());
-            
-            kameo::spawn(actor)
-        };
-        
-        info!("✅ Connected WebSocket → TimeFrame direct forwarding");
-        (ws_actor, Some((timeframe_actor, indicator_actor)))
-    } else {
-        info!("🚫 Technical Analysis disabled");
-        
-        // WebSocket Actor without TA integration
-        let ws_actor = {
-            let mut actor = WebSocketActor::new_with_config(
-                config.storage_path.clone(), 
-                300, // 5min health check timeout
-                config.reconnection_gap_threshold_minutes,
-                config.reconnection_gap_check_delay_seconds
-            ).map_err(|e| format!("Failed to create WebSocket actor: {}", e))?;
-            
-            // Set API and PostgreSQL actor references
-            actor.set_api_actor(api_actor.clone());
-            if let Some(ref postgres_ref) = postgres_actor {
-                actor.set_postgres_actor(postgres_ref.clone());
-            }
-            kameo::spawn(actor)
-        };
-        
-        (ws_actor, None)
+        // Set API and PostgreSQL actor references
+        actor.set_api_actor(api_actor.clone());
+        if let Some(ref postgres_ref) = postgres_actor {
+            actor.set_postgres_actor(postgres_ref.clone());
+        }
+        kameo::spawn(actor)
     };
     
     // Allow actors to initialize
     sleep(Duration::from_millis(500)).await;
     
-    info!("✅ All actors launched successfully");
-    Ok((historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor, ta_actors))
+    // Start health check server
+    info!("🏥 Starting health check server...");
+    let health_config = HealthConfig::default();
+    let health_dependencies = HealthDependencies {
+        kafka_actor: kafka_actor.clone(),
+        postgres_actor: postgres_actor.clone(),
+    };
+    
+    // Start health server as background task
+    tokio::spawn(async move {
+        if let Err(e) = start_health_server(health_config, health_dependencies).await {
+            error!("💥 Health server failed: {}", e);
+        }
+    });
+    
+    info!("✅ Basic actors launched successfully");
+    Ok((historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor))
 }
 
+/// Launch Technical Analysis actors after gap filling is complete
+async fn launch_ta_actors(
+    config: &DataFeederConfig,
+    api_actor: &ActorRef<ApiActor>,
+    _ws_actor: &ActorRef<WebSocketActor>,
+    _postgres_actor: &Option<ActorRef<PostgresActor>>,
+    kafka_actor: &Option<ActorRef<KafkaActor>>,
+    synchronized_timestamp: i64
+) -> Result<Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>, Box<dyn std::error::Error + Send + Sync>> {
+    
+    if !config.enable_technical_analysis {
+        info!("🚫 Technical Analysis disabled");
+        return Ok(None);
+    }
+    
+    info!("🧮 Launching Technical Analysis actors after gap filling...");
+    
+    // Create indicator actor first
+    let indicator_actor = {
+        let actor = IndicatorActor::new(config.ta_config.clone());
+        let actor_ref = kameo::spawn(actor);
+        
+        // Set Kafka actor reference if available
+        if let Some(ref kafka_ref) = kafka_actor {
+            use data_feeder::technical_analysis::actors::indicator::IndicatorTell;
+            let set_kafka_msg = IndicatorTell::SetKafkaActor {
+                kafka_actor: kafka_ref.clone(),
+            };
+            if let Err(e) = actor_ref.tell(set_kafka_msg).send().await {
+                error!("Failed to set Kafka actor on IndicatorActor: {}", e);
+            } else {
+                info!("✅ Connected IndicatorActor to KafkaActor");
+            }
+        }
+        
+        actor_ref
+    };
+    
+    // Create timeframe actor and set its indicator and API actor references
+    let timeframe_actor = {
+        let mut actor = TimeFrameActor::new(config.ta_config.clone(), config.storage_path.clone());
+        actor.set_indicator_actor(indicator_actor.clone());
+        actor.set_api_actor(api_actor.clone());
+        let actor_ref = kameo::spawn(actor);
+        
+        // Send synchronized timestamp before initialization
+        use data_feeder::technical_analysis::actors::timeframe::TimeFrameTell;
+        let set_timestamp_msg = TimeFrameTell::SetReferenceTimestamp {
+            timestamp: synchronized_timestamp,
+        };
+        if let Err(e) = actor_ref.tell(set_timestamp_msg).send().await {
+            error!("Failed to set synchronized timestamp on TimeFrameActor: {}", e);
+        } else {
+            info!("✅ Synchronized timestamp sent to TimeFrameActor: {}", synchronized_timestamp);
+        }
+        
+        actor_ref
+    };
+    
+    // Note: WebSocket → TimeFrame forwarding will be enabled when we restart WebSocket
+    // or add a message to update the timeframe actor reference
+    info!("✅ TimeFrame actor ready for WebSocket forwarding");
+    
+    info!("✅ Technical Analysis actors launched successfully");
+    Ok(Some((timeframe_actor, indicator_actor)))
+}
 
 /// Start real-time WebSocket streaming
 async fn start_realtime_streaming(
