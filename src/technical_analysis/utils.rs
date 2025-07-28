@@ -4,6 +4,10 @@ use heed::{Database};
 use heed::types::{SerdeBincode, Str};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
+use kameo::actor::ActorRef;
+use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
+use crate::common::lmdb_config::open_lmdb_environment;
+use crate::common::constants::CANDLES_DB_NAME;
 
 /// Load recent candles from LMDB for initialization
 /// Returns candles sorted by close_time (oldest first)
@@ -22,17 +26,13 @@ pub async fn load_recent_candles_from_db(
         return Ok(Vec::new());
     }
 
-    let env = unsafe {
-        heed::EnvOpenOptions::new()
-            .map_size(1024 * 1024 * 1024) // 1GB
-            .max_dbs(10)
-            .max_readers(256)
-            .open(&db_path)?
-    };
+    // Use shared LMDB configuration to prevent "environment already opened with different options" errors
+    let env = open_lmdb_environment(&db_path)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     let rtxn = env.read_txn()?;
     let candle_db: Database<Str, SerdeBincode<FuturesOHLCVCandle>> = 
-        env.open_database(&rtxn, Some("candles"))?.ok_or("Candles database not found")?;
+        env.open_database(&rtxn, Some(CANDLES_DB_NAME))?.ok_or("Candles database not found")?;
     
     // Calculate cutoff time for lookback period using provided reference timestamp or current time
     let now = reference_timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
@@ -86,6 +86,70 @@ pub async fn load_recent_candles_from_db(
     }
 
     Ok(candles)
+}
+
+/// Load recent candles from LMDB using LmdbActor (prevents environment conflicts)
+/// Returns candles sorted by close_time (oldest first)
+pub async fn load_recent_candles_via_actor(
+    symbol: &str,
+    timeframe_seconds: u64,
+    lookback_days: u32,
+    lmdb_actor: &ActorRef<LmdbActor>,
+    reference_timestamp: Option<i64>,
+) -> Result<Vec<FuturesOHLCVCandle>, Box<dyn std::error::Error + Send + Sync>> {
+    info!("🔧 Loading recent candles via LmdbActor for {} {}s (last {} days)", 
+          symbol, timeframe_seconds, lookback_days);
+    
+    // Calculate cutoff time for lookback period using provided reference timestamp or current time
+    let now = reference_timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let cutoff_time = now - (lookback_days as i64 * 24 * 3600 * 1000);
+    
+    if reference_timestamp.is_some() {
+        info!("🕐 TA loading using SYNCHRONIZED timestamp: {} (cutoff: {})", now, cutoff_time);
+    } else {
+        info!("🕐 TA loading using current timestamp: {} (cutoff: {})", now, cutoff_time);
+    }
+    
+    // Get all candles from the database using LmdbActor
+    let response = lmdb_actor
+        .ask(LmdbActorMessage::GetCandles {
+            symbol: symbol.to_string(),
+            timeframe: timeframe_seconds,
+            start: cutoff_time,
+            end: now,
+            limit: None,
+        })
+        .await
+        .map_err(|e| format!("Failed to get candles from LmdbActor: {}", e))?;
+
+    let candles = match response {
+        LmdbActorResponse::Candles(candles) => candles,
+        LmdbActorResponse::ErrorResponse(err) => {
+            return Err(format!("LmdbActor returned error: {}", err).into());
+        }
+        _ => {
+            return Err("Unexpected response from LmdbActor".into());
+        }
+    };
+
+    // Sort by close_time (oldest first) - should already be sorted but ensure it
+    let mut sorted_candles = candles;
+    sorted_candles.sort_by_key(|c| c.close_time);
+
+    if !sorted_candles.is_empty() {
+        let first_time = sorted_candles[0].open_time;
+        let last_time = sorted_candles[sorted_candles.len()-1].close_time;
+        debug!("✅ Loaded {} recent candles via actor for {} {}s (last {} days): {} to {}", 
+              sorted_candles.len(), symbol, timeframe_seconds, lookback_days, first_time, last_time);
+              
+        // Debug the time range to understand boundary issues
+        let time_span_hours = (last_time - first_time) / (1000 * 3600);
+        debug!("📊 Historical data spans {} hours ({:.1} days)", time_span_hours, time_span_hours as f64 / 24.0);
+    } else {
+        info!("✅ Loaded 0 candles via actor for {} {}s (last {} days)", symbol, timeframe_seconds, lookback_days);
+    }
+
+    Ok(sorted_candles)
 }
 
 /// Calculate the minimum number of 1-minute candles needed for initialization

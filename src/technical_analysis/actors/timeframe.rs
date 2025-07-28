@@ -15,7 +15,7 @@ use crate::technical_analysis::structs::{
     TechnicalAnalysisConfig, CandleRingBuffer, MultiTimeFrameCandles
 };
 use crate::technical_analysis::utils::{
-    load_recent_candles_from_db, calculate_min_candles_needed, pre_aggregate_historical_candles,
+    load_recent_candles_from_db, load_recent_candles_via_actor, calculate_min_candles_needed, pre_aggregate_historical_candles,
     validate_initialization_data, timeframe_to_string
 };
 use super::indicator::{IndicatorActor, IndicatorTell};
@@ -189,6 +189,8 @@ pub struct TimeFrameActor {
     indicator_actor: Option<ActorRef<IndicatorActor>>,
     /// Reference to API actor for gap filling
     api_actor: Option<ActorRef<crate::api::ApiActor>>,
+    /// Reference to LMDB actor for database operations
+    lmdb_actor: Option<ActorRef<crate::lmdb::LmdbActor>>,
     /// Overall initialization status
     is_ready: bool,
     /// Reference timestamp for synchronized loading
@@ -212,6 +214,7 @@ impl TimeFrameActor {
             symbol_states,
             indicator_actor: None,
             api_actor: None,
+            lmdb_actor: None,
             is_ready: false,
             reference_timestamp: None,
         }
@@ -227,8 +230,14 @@ impl TimeFrameActor {
         self.api_actor = Some(api_actor);
     }
 
+    /// Set the LMDB actor reference for database operations
+    pub fn set_lmdb_actor(&mut self, lmdb_actor: ActorRef<crate::lmdb::LmdbActor>) {
+        self.lmdb_actor = Some(lmdb_actor);
+    }
+
     /// Initialize with historical data from database
     async fn initialize_with_historical_data(&mut self) -> Result<(), BoxError> {
+        let init_start = std::time::Instant::now();
         info!("🔄 Starting TimeFrame actor initialization with historical data...");
 
         let min_candles = calculate_min_candles_needed(
@@ -236,24 +245,87 @@ impl TimeFrameActor {
             &self.config.ema_periods,
             self.config.volume_lookback_days,
         );
+        info!("📊 Minimum candles needed for initialization: {}", min_candles);
 
-        // Removed unused initialization_tasks vector
+        // Track initialization progress
+        let mut successful_symbols = 0;
+        let mut failed_symbols = Vec::new();
 
         for symbol in &self.config.symbols.clone() {
-            info!("Loading historical data for {}", symbol);
+            let symbol_start = std::time::Instant::now();
+            info!("📈 Loading historical data for {} (actor dependencies: LmdbActor={}, ApiActor={}, IndicatorActor={})", 
+                  symbol, 
+                  self.lmdb_actor.is_some(), 
+                  self.api_actor.is_some(), 
+                  self.indicator_actor.is_some());
 
-            // Load 1-minute candles from database using synchronized timestamp
-            let historical_candles = load_recent_candles_from_db(
-                symbol,
-                60, // 1-minute timeframe
-                self.config.min_history_days,
-                &self.base_path,
-                self.reference_timestamp,
-            ).await?;
+            // Load 1-minute candles from database using LmdbActor (prevents environment conflicts)
+            let data_load_start = std::time::Instant::now();
+            let historical_candles = if let Some(lmdb_actor) = &self.lmdb_actor {
+                info!("🔧 Loading {} historical data via LmdbActor...", symbol);
+                match load_recent_candles_via_actor(
+                    symbol,
+                    60, // 1-minute timeframe
+                    self.config.min_history_days,
+                    lmdb_actor,
+                    self.reference_timestamp,
+                ).await {
+                    Ok(candles) => {
+                        info!("✅ Loaded {} candles via LmdbActor for {} in {:?}", 
+                              candles.len(), symbol, data_load_start.elapsed());
+                        candles
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to load {} data via LmdbActor: {}", symbol, e);
+                        warn!("🔄 Falling back to direct LMDB access for {}", symbol);
+                        match load_recent_candles_from_db(
+                            symbol,
+                            60,
+                            self.config.min_history_days,
+                            &self.base_path,
+                            self.reference_timestamp,
+                        ).await {
+                            Ok(candles) => {
+                                info!("✅ Fallback loaded {} candles via direct LMDB for {}", candles.len(), symbol);
+                                candles
+                            }
+                            Err(fallback_err) => {
+                                error!("❌ Both LmdbActor and direct LMDB failed for {}: actor_err={}, direct_err={}", 
+                                       symbol, e, fallback_err);
+                                failed_symbols.push(symbol.clone());
+                                continue; // Skip this symbol but continue with others
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fallback to direct LMDB access if actor not available (should not happen in production)
+                warn!("🚨 No LmdbActor available, falling back to direct LMDB access for {}", symbol);
+                match load_recent_candles_from_db(
+                    symbol,
+                    60, // 1-minute timeframe
+                    self.config.min_history_days,
+                    &self.base_path,
+                    self.reference_timestamp,
+                ).await {
+                    Ok(candles) => {
+                        info!("✅ Direct LMDB loaded {} candles for {}", candles.len(), symbol);
+                        candles
+                    }
+                    Err(e) => {
+                        error!("❌ Direct LMDB access failed for {}: {}", symbol, e);
+                        failed_symbols.push(symbol.clone());
+                        continue; // Skip this symbol but continue with others
+                    }
+                }
+            };
 
             // Validate we have sufficient data and get detected gaps
+            let validation_start = std::time::Instant::now();
             match validate_initialization_data(symbol, &historical_candles, min_candles) {
                 Ok(detected_gaps) => {
+                    info!("✅ Data validation passed for {} in {:?}: {} candles, {} gaps detected", 
+                          symbol, validation_start.elapsed(), historical_candles.len(), detected_gaps.len());
                     if !detected_gaps.is_empty() && self.api_actor.is_some() {
                         info!("🔧 Requesting gap filling for {} gaps in {}", detected_gaps.len(), symbol);
                         
@@ -275,50 +347,81 @@ impl TimeFrameActor {
                     }
                 }
                 Err(e) => {
-                    warn!("⚠️ {}", e);
+                    warn!("⚠️ Data validation warning for {}: {}", symbol, e);
                     warn!("📋 Centralized gap detection should have handled this - proceeding with available data");
                     // Continue with available data - centralized gap detection should handle insufficient data
                 }
             }
 
             // Initialize symbol state
+            let state_init_start = std::time::Instant::now();
             if let Some(state) = self.symbol_states.get_mut(symbol) {
                 state.initialize_with_history(symbol, &historical_candles).await;
+                info!("📊 Symbol state initialized for {} in {:?}", symbol, state_init_start.elapsed());
+            } else {
+                error!("❌ Symbol state not found for {}", symbol);
+                failed_symbols.push(symbol.clone());
+                continue;
             }
 
             // Pre-aggregate historical data for indicator initialization
+            let aggregation_start = std::time::Instant::now();
             let aggregated_data = pre_aggregate_historical_candles(
                 &historical_candles,
                 &self.config.timeframes,
             );
+            info!("⚡ Pre-aggregated historical data for {} in {:?}", symbol, aggregation_start.elapsed());
 
             // Send historical data to indicator actor for initialization
             if let Some(indicator_actor) = &self.indicator_actor {
+                let indicator_send_start = std::time::Instant::now();
                 let init_msg = IndicatorTell::InitializeWithHistory {
                     symbol: symbol.clone(),
                     aggregated_candles: aggregated_data,
                 };
 
                 if let Err(e) = indicator_actor.tell(init_msg).send().await {
-                    error!("Failed to send historical data to indicator actor: {}", e);
+                    error!("❌ Failed to send historical data to indicator actor for {}: {}", symbol, e);
+                    // Don't fail the entire initialization for indicator errors
+                } else {
+                    info!("✅ Sent historical data to IndicatorActor for {} in {:?}", 
+                          symbol, indicator_send_start.elapsed());
                 }
+            } else {
+                warn!("⚠️ No IndicatorActor available for {}", symbol);
             }
 
-            info!("✅ Completed initialization for {}", symbol);
+            successful_symbols += 1;
+            let symbol_time = symbol_start.elapsed();
+            info!("✅ Completed initialization for {} in {:?}", symbol, symbol_time);
         }
 
-        // Check if all symbols are initialized
+        // Final initialization summary
+        let total_init_time = init_start.elapsed();
         let initialized_count = self.symbol_states.values()
             .filter(|state| state.is_initialized)
             .count();
 
-        self.is_ready = initialized_count == self.config.symbols.len();
+        // Set ready status based on whether we have at least some symbols initialized
+        self.is_ready = initialized_count > 0;
+
+        info!("📊 TimeFrame initialization summary: {} successful, {} failed, total time: {:?}", 
+              successful_symbols, failed_symbols.len(), total_init_time);
+
+        if !failed_symbols.is_empty() {
+            warn!("⚠️ Failed to initialize symbols: {:?}", failed_symbols);
+        }
 
         if self.is_ready {
-            info!("🎉 TimeFrame actor fully initialized for all {} symbols", self.config.symbols.len());
+            if successful_symbols == self.config.symbols.len() {
+                info!("🎉 TimeFrame actor fully initialized for all {} symbols", self.config.symbols.len());
+            } else {
+                warn!("⚠️ TimeFrame actor partially initialized: {}/{} symbols ready", 
+                      initialized_count, self.config.symbols.len());
+            }
         } else {
-            warn!("⚠️ TimeFrame actor partially initialized: {}/{} symbols ready", 
-                  initialized_count, self.config.symbols.len());
+            error!("❌ TimeFrame actor initialization failed: no symbols successfully initialized");
+            return Err("No symbols could be initialized".into());
         }
 
         Ok(())

@@ -423,20 +423,29 @@ async fn main() {
 
 /// Main production data pipeline
 async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let pipeline_start = std::time::Instant::now();
     info!("🔧 Initializing data pipeline...");
     
     // Step 1: Launch basic actors (no TA actors yet)
+    let actors_start = std::time::Instant::now();
+    info!("🎭 Step 1: Launching basic actors...");
     let (lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor) = launch_basic_actors(&config).await?;
+    let actors_elapsed = actors_start.elapsed();
+    info!("✅ Step 1 completed in {:?} - All basic actors launched", actors_elapsed);
     
     // Step 2: Start real-time data streaming FIRST
-    info!("📡 Starting real-time data streaming...");
+    let streaming_start = std::time::Instant::now();
+    info!("📡 Step 2: Starting real-time data streaming...");
     start_realtime_streaming(&config, &ws_actor).await?;
+    let streaming_elapsed = streaming_start.elapsed();
+    info!("✅ Step 2 completed in {:?} - WebSocket streaming active", streaming_elapsed);
     
     // Step 2.5: WebSocket is running, but TA actors will be added after gap filling
     
     // Step 3: Single gap detection with smart actor delegation - SYNCHRONIZED TIMESTAMP
+    let gap_detection_start = std::time::Instant::now();
     let synchronized_timestamp = chrono::Utc::now().timestamp_millis();
-    info!("🕐 SYNCHRONIZED TIMESTAMP for gap detection and TA: {}", synchronized_timestamp);
+    info!("🕐 Step 3: Gap detection preparation - synchronized timestamp: {}", synchronized_timestamp);
     
     if config.gap_detection_enabled {
         info!("🔍 Starting unified gap detection and filling...");
@@ -503,11 +512,18 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
                 }
             }
         }
-        info!("✅ Unified gap detection and filling completed");
+        let gap_detection_elapsed = gap_detection_start.elapsed();
+        info!("✅ Step 3 completed in {:?} - Gap detection and filling finished", gap_detection_elapsed);
+    } else {
+        info!("🚫 Gap detection disabled - skipping Step 3");
     }
     
     // Step 3.5: Now launch Technical Analysis actors with complete historical data using SAME timestamp
-    let ta_actors = launch_ta_actors(&config, &api_actor, &ws_actor, &postgres_actor, &kafka_actor, synchronized_timestamp).await?;
+    let ta_start = std::time::Instant::now();
+    info!("🧮 Step 3.5: Launching Technical Analysis actors...");
+    let ta_actors = launch_ta_actors(&config, &lmdb_actor, &api_actor, &ws_actor, &postgres_actor, &kafka_actor, synchronized_timestamp).await?;
+    let ta_elapsed = ta_start.elapsed();
+    info!("✅ Step 3.5 completed in {:?} - TA actors launched", ta_elapsed);
     
     // Set TimeFrame actor reference on WebSocketActor
     if let Some((timeframe_actor, _)) = &ta_actors {
@@ -523,7 +539,10 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     }
     
     // Step 4: Continuous monitoring mode (WebSocket already running)
-    info!("♾️  Entering continuous monitoring mode...");
+    let pipeline_elapsed = pipeline_start.elapsed();
+    info!("♾️  Step 4: Entering continuous monitoring mode...");
+    info!("🎉 Pipeline initialization completed in {:?} total", pipeline_elapsed);
+    
     run_continuous_monitoring(config, lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, ta_actors).await?;
     
     Ok(())
@@ -539,44 +558,91 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     Option<ActorRef<KafkaActor>>
 ), Box<dyn std::error::Error + Send + Sync>> {
     
-    info!("🎭 Launching actor system...");
+    info!("🎭 Launching actor system with phased startup...");
+    info!("📋 STARTUP PHASES: 1️⃣ WebSocket (Real-time) → 2️⃣ LMDB (Storage) → 3️⃣ Parallel (PostgreSQL/Kafka) → 4️⃣ Dependent (Historical/API)");
     
-    // LMDB Actor - for centralized LMDB operations and gap detection (create first)
+    // 🚀 PHASE 1: WebSocket Actor - START IMMEDIATELY for real-time data
+    let phase1_start = std::time::Instant::now();
+    info!("📡 PHASE 1: Creating WebSocket actor (real-time streaming priority)...");
+    let ws_actor = {
+        let actor = WebSocketActor::new_with_config(
+            config.storage_path.clone(), 
+            300, // 5min health check timeout
+            config.reconnection_gap_threshold_minutes,
+            config.reconnection_gap_check_delay_seconds
+        ).map_err(|e| format!("Failed to create WebSocket actor: {}", e))?;
+        
+        // Note: We'll set other actor references later
+        kameo::spawn(actor)
+    };
+    let phase1_elapsed = phase1_start.elapsed();
+    info!("✅ PHASE 1 COMPLETE: WebSocket actor ready in {:?} - STREAMING ENABLED", phase1_elapsed);
+    
+    // 🗃️ PHASE 2: LMDB Actor - for centralized LMDB operations (lazy initialization)
+    let phase2_start = std::time::Instant::now();
+    info!("🗃️ PHASE 2: Creating LMDB actor (lazy initialization)...");
     let lmdb_actor = {
-        info!("🗃️ Launching LMDB actor...");
-        let mut actor = LmdbActor::new(&config.storage_path, config.min_gap_seconds)
+        let actor = LmdbActor::new(&config.storage_path, config.min_gap_seconds)
             .map_err(|e| format!("Failed to create LMDB actor: {}", e))?;
         
-        // Initialize databases for all symbols and timeframes
-        actor.initialize_databases(&config.symbols, &config.timeframes)
-            .map_err(|e| format!("Failed to initialize LMDB databases: {}", e))?;
+        // Note: Databases will be initialized on-demand, not here!
+        info!("📊 LMDB actor created - databases will initialize on-demand");
         
         kameo::spawn(actor)
     };
+    let phase2_elapsed = phase2_start.elapsed();
+    info!("✅ PHASE 2 COMPLETE: LMDB actor ready in {:?} - lazy initialization enabled", phase2_elapsed);
     
-    // PostgreSQL Actor - for dual storage strategy
-    let postgres_actor = if config.postgres_config.enabled {
-        info!("🐘 Launching PostgreSQL actor...");
-        let actor = PostgresActor::new(config.postgres_config.clone())
-            .map_err(|e| format!("Failed to create PostgreSQL actor: {}", e))?;
-        Some(kameo::spawn(actor))
-    } else {
-        info!("🚫 PostgreSQL actor disabled");
-        None
+    // ⚡ PHASE 3: PARALLEL - Create independent actors concurrently
+    let phase3_start = std::time::Instant::now();
+    info!("🔄 PHASE 3: Creating PostgreSQL and Kafka actors in parallel...");
+    
+    // Create futures for independent actors
+    let postgres_future = async {
+        let postgres_start = std::time::Instant::now();
+        let postgres_actor = if config.postgres_config.enabled {
+            info!("🐘 Creating PostgreSQL actor...");
+            let actor = PostgresActor::new(config.postgres_config.clone())
+                .map_err(|e| format!("Failed to create PostgreSQL actor: {}", e))?;
+            Some(kameo::spawn(actor))
+        } else {
+            info!("🚫 PostgreSQL actor disabled");
+            None
+        };
+        let postgres_elapsed = postgres_start.elapsed();
+        info!("✅ PostgreSQL actor setup in {:?}", postgres_elapsed);
+        Ok::<_, String>(postgres_actor)
     };
     
-    // Kafka Actor - for publishing technical analysis data
-    let kafka_actor = if config.kafka_config.enabled {
-        info!("📨 Launching Kafka actor...");
-        let actor = KafkaActor::new(config.kafka_config.clone())
-            .map_err(|e| format!("Failed to create Kafka actor: {}", e))?;
-        Some(kameo::spawn(actor))
-    } else {
-        info!("🚫 Kafka actor disabled");
-        None
+    let kafka_future = async {
+        let kafka_start = std::time::Instant::now();
+        let kafka_actor = if config.kafka_config.enabled {
+            info!("📨 Creating Kafka actor...");
+            let actor = KafkaActor::new(config.kafka_config.clone())
+                .map_err(|e| format!("Failed to create Kafka actor: {}", e))?;
+            Some(kameo::spawn(actor))
+        } else {
+            info!("🚫 Kafka actor disabled");
+            None
+        };
+        let kafka_elapsed = kafka_start.elapsed();
+        info!("✅ Kafka actor setup in {:?}", kafka_elapsed);
+        Ok::<_, String>(kafka_actor)
     };
     
-    // Historical Actor - for S3/bulk data (will delegate LMDB operations to LmdbActor)
+    // Execute in parallel and await results
+    let (postgres_result, kafka_result) = tokio::join!(postgres_future, kafka_future);
+    let postgres_actor = postgres_result?;
+    let kafka_actor = kafka_result?;
+    
+    let phase3_elapsed = phase3_start.elapsed();
+    info!("✅ PHASE 3 COMPLETE: Parallel actor creation in {:?}", phase3_elapsed);
+    
+    // 🏗️ PHASE 4: DEPENDENT ACTORS - Actors with dependencies (Historical/API)
+    let phase4_start = std::time::Instant::now();
+    info!("🏛️ PHASE 4: Creating dependent actors (Historical, API)...");
+    
+    let historical_start = std::time::Instant::now();
     let historical_actor = {
         let csv_temp_path = config.storage_path.join("temp_csv"); // Temporary staging within main storage
         let mut actor = HistoricalActor::new(&config.symbols, &config.timeframes, &config.storage_path, &csv_temp_path)
@@ -587,8 +653,12 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         actor.set_lmdb_actor(lmdb_actor.clone());
         kameo::spawn(actor)
     };
+    let historical_elapsed = historical_start.elapsed();
+    info!("✅ Historical actor created in {:?}", historical_elapsed);
     
     // API Actor - for gap filling
+    let api_start = std::time::Instant::now();
+    info!("⚡ Creating API actor...");
     let api_actor = {
         let mut actor = ApiActor::new(lmdb_actor.clone())
             .map_err(|e| format!("Failed to create API actor: {}", e))?;
@@ -597,23 +667,28 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         }
         kameo::spawn(actor)
     };
+    let api_elapsed = api_start.elapsed();
+    info!("✅ API actor created in {:?}", api_elapsed);
     
-    // WebSocket Actor without TA integration (TA actors will be added later)
-    let ws_actor = {
-        let mut actor = WebSocketActor::new_with_config(
-            config.storage_path.clone(), 
-            300, // 5min health check timeout
-            config.reconnection_gap_threshold_minutes,
-            config.reconnection_gap_check_delay_seconds
-        ).map_err(|e| format!("Failed to create WebSocket actor: {}", e))?;
-        
-        // Set API and PostgreSQL actor references
-        actor.set_api_actor(api_actor.clone());
-        if let Some(ref postgres_ref) = postgres_actor {
-            actor.set_postgres_actor(postgres_ref.clone());
-        }
-        kameo::spawn(actor)
+    let phase4_elapsed = phase4_start.elapsed();
+    info!("✅ PHASE 4 COMPLETE: Dependent actors ready in {:?}", phase4_elapsed);
+    
+    // Calculate total startup time and efficiency metrics
+    let total_startup_time = phase1_elapsed + phase2_elapsed + phase3_elapsed + phase4_elapsed;
+    info!("🎯 PHASED STARTUP COMPLETE: Total time {:?} (Phase 1: {:?}, Phase 2: {:?}, Phase 3: {:?}, Phase 4: {:?})", 
+          total_startup_time, phase1_elapsed, phase2_elapsed, phase3_elapsed, phase4_elapsed);
+    info!("📡 WebSocket is IMMEDIATELY READY for streaming - no blocking on heavy initialization!");
+    
+    // Connect WebSocketActor to LmdbActor for centralized storage
+    info!("🔗 Connecting WebSocketActor to LmdbActor for centralized storage...");
+    let set_lmdb_msg = WebSocketTell::SetLmdbActor {
+        lmdb_actor: lmdb_actor.clone(),
     };
+    if let Err(e) = ws_actor.tell(set_lmdb_msg).send().await {
+        error!("Failed to set LMDB actor on WebSocketActor: {}", e);
+    } else {
+        info!("✅ Connected WebSocketActor to LmdbActor");
+    }
     
     // Allow actors to initialize
     sleep(Duration::from_millis(500)).await;
@@ -640,6 +715,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
 /// Launch Technical Analysis actors after gap filling is complete
 async fn launch_ta_actors(
     config: &DataFeederConfig,
+    lmdb_actor: &ActorRef<LmdbActor>,
     api_actor: &ActorRef<ApiActor>,
     _ws_actor: &ActorRef<WebSocketActor>,
     _postgres_actor: &Option<ActorRef<PostgresActor>>,
@@ -675,11 +751,12 @@ async fn launch_ta_actors(
         actor_ref
     };
     
-    // Create timeframe actor and set its indicator and API actor references
+    // Create timeframe actor and set its dependencies
     let timeframe_actor = {
         let mut actor = TimeFrameActor::new(config.ta_config.clone(), config.storage_path.clone());
         actor.set_indicator_actor(indicator_actor.clone());
         actor.set_api_actor(api_actor.clone());
+        actor.set_lmdb_actor(lmdb_actor.clone());
         let actor_ref = kameo::spawn(actor);
         
         // Send synchronized timestamp before initialization
@@ -709,10 +786,11 @@ async fn start_realtime_streaming(
     config: &DataFeederConfig,
     ws_actor: &ActorRef<WebSocketActor>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    
+    let streaming_setup_start = std::time::Instant::now();
     info!("📡 Initializing real-time streaming for {} symbols...", config.symbols.len());
     
     // Subscribe to 1-minute klines for all symbols
+    let subscribe_start = std::time::Instant::now();
     let subscribe_msg = WebSocketTell::Subscribe {
         stream_type: StreamType::Kline1m,
         symbols: config.symbols.clone(),
@@ -721,25 +799,45 @@ async fn start_realtime_streaming(
     if let Err(e) = ws_actor.tell(subscribe_msg).send().await {
         return Err(format!("Failed to subscribe to WebSocket: {}", e).into());
     }
+    let subscribe_elapsed = subscribe_start.elapsed();
+    info!("✅ WebSocket subscription completed in {:?}", subscribe_elapsed);
     
     // Start the connection
+    let connection_start = std::time::Instant::now();
+    info!("🔗 Starting WebSocket connection...");
     if let Err(e) = ws_actor.tell(WebSocketTell::Reconnect).send().await {
         return Err(format!("Failed to start WebSocket connection: {}", e).into());
     }
     
     // Wait for connection to establish
+    let connection_wait_start = std::time::Instant::now();
+    info!("⏳ Waiting for WebSocket connection to establish...");
     sleep(Duration::from_secs(3)).await;
+    let connection_wait_elapsed = connection_wait_start.elapsed();
+    info!("✅ Connection wait completed in {:?}", connection_wait_elapsed);
     
     // Verify connection status
+    let status_check_start = std::time::Instant::now();
+    info!("🔍 Checking WebSocket connection status...");
     match ws_actor.ask(WebSocketAsk::GetConnectionStatus).await {
         Ok(WebSocketReply::ConnectionStatus { status, stats: _ }) => {
-            info!("🔗 WebSocket connection status: {}", status);
+            let status_check_elapsed = status_check_start.elapsed();
+            info!("✅ WebSocket connection status checked in {:?}: {}", status_check_elapsed, status);
         }
-        Ok(_) => warn!("❌ Unexpected reply type for GetConnectionStatus"),
-        Err(e) => warn!("❌ Failed to get connection status: {}", e),
+        Ok(_) => {
+            let status_check_elapsed = status_check_start.elapsed();
+            warn!("❌ Unexpected reply type for GetConnectionStatus in {:?}", status_check_elapsed);
+        }
+        Err(e) => {
+            let status_check_elapsed = status_check_start.elapsed();
+            warn!("❌ Failed to get connection status in {:?}: {}", status_check_elapsed, e);
+        }
     }
+    let connection_elapsed = connection_start.elapsed();
+    info!("✅ WebSocket connection completed in {:?}", connection_elapsed);
     
-    info!("✅ Real-time streaming started");
+    let streaming_total_elapsed = streaming_setup_start.elapsed();
+    info!("🎯 Real-time streaming initialization completed in {:?}", streaming_total_elapsed);
     Ok(())
 }
 
@@ -753,8 +851,10 @@ async fn run_continuous_monitoring(
     _postgres_actor: Option<ActorRef<PostgresActor>>,
     ta_actors: Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    
+    let monitoring_start = std::time::Instant::now();
     info!("♾️  Starting continuous monitoring...");
+    
+    let setup_start = std::time::Instant::now();
     info!("📝 Real-time data is streaming and being stored automatically");
     if ta_actors.is_some() {
         info!("🧮 Technical analysis is running and processing indicators");
@@ -772,12 +872,20 @@ async fn run_continuous_monitoring(
     info!("⏹️  Press Ctrl+C to stop");
     
     let mut health_check_interval = tokio::time::interval(Duration::from_secs(health_check_interval_secs as u64));
+    let setup_elapsed = setup_start.elapsed();
+    info!("✅ Monitoring setup completed in {:?}", setup_elapsed);
+    
+    let monitoring_ready_elapsed = monitoring_start.elapsed();
+    info!("🎯 MONITORING READY - Total startup time: {:?}", monitoring_ready_elapsed);
     
     loop {
         tokio::select! {
             _ = health_check_interval.tick() => {
+                let health_check_start = std::time::Instant::now();
                 info!("💓 Performing health check...");
                 perform_health_check(&config, &api_actor, &ws_actor, &ta_actors).await;
+                let health_check_elapsed = health_check_start.elapsed();
+                info!("✅ Health check completed in {:?}", health_check_elapsed);
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("🛑 Shutdown signal received");
@@ -797,83 +905,122 @@ async fn perform_health_check(
     ws_actor: &ActorRef<WebSocketActor>,
     ta_actors: &Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>
 ) {
+    let health_check_start = std::time::Instant::now();
     info!("🔍 Health check for {} symbols...", config.symbols.len());
     
     // Check API actor health
+    let api_check_start = std::time::Instant::now();
     match api_actor.ask(ApiAsk::GetStats).await {
         Ok(ApiReply::Stats(stats)) => {
-            info!("📊 API: {} requests, {:.1}% success, {} candles",
-                  stats.requests_made, stats.success_rate() * 100.0, stats.total_candles_fetched);
+            let api_check_elapsed = api_check_start.elapsed();
+            info!("📊 API: {} requests, {:.1}% success, {} candles (check: {:?})",
+                  stats.requests_made, stats.success_rate() * 100.0, stats.total_candles_fetched, api_check_elapsed);
         }
-        _ => warn!("⚠️ API actor health check failed"),
+        _ => {
+            let api_check_elapsed = api_check_start.elapsed();
+            warn!("⚠️ API actor health check failed in {:?}", api_check_elapsed);
+        }
     }
     
     // Check WebSocket health
+    let ws_check_start = std::time::Instant::now();
     match ws_actor.ask(WebSocketAsk::GetConnectionStatus).await {
         Ok(WebSocketReply::ConnectionStatus { status, stats }) => {
-            info!("📡 WebSocket: {}, {} messages, {:.1}% parsed",
-                  status, stats.messages_received, stats.parse_success_rate() * 100.0);
+            let ws_check_elapsed = ws_check_start.elapsed();
+            info!("📡 WebSocket: {}, {} messages, {:.1}% parsed (check: {:?})",
+                  status, stats.messages_received, stats.parse_success_rate() * 100.0, ws_check_elapsed);
         }
-        _ => warn!("⚠️ WebSocket actor health check failed"),
+        _ => {
+            let ws_check_elapsed = ws_check_start.elapsed();
+            warn!("⚠️ WebSocket actor health check failed in {:?}", ws_check_elapsed);
+        }
     }
     
     // Check recent data for each symbol
+    let symbol_check_start = std::time::Instant::now();
     for symbol in &config.symbols {
+        let symbol_start = std::time::Instant::now();
         match ws_actor.ask(WebSocketAsk::GetRecentCandles {
             symbol: symbol.clone(),
             limit: 1,
         }).await {
             Ok(WebSocketReply::RecentCandles(candles)) => {
+                let symbol_elapsed = symbol_start.elapsed();
                 if let Some(latest) = candles.first() {
                     let age_minutes = (chrono::Utc::now().timestamp_millis() - latest.close_time) / (1000 * 60);
                     if age_minutes > 5 {
-                        warn!("⚠️ {} latest data is {} minutes old", symbol, age_minutes);
+                        warn!("⚠️ {} latest data is {} minutes old (check: {:?})", symbol, age_minutes, symbol_elapsed);
                     } else {
-                        info!("✅ {} data is current ({}min old)", symbol, age_minutes);
+                        info!("✅ {} data is current ({}min old, check: {:?})", symbol, age_minutes, symbol_elapsed);
                     }
                 } else {
-                    warn!("⚠️ No recent data for {}", symbol);
+                    warn!("⚠️ No recent data for {} (check: {:?})", symbol, symbol_elapsed);
                 }
             }
-            _ => warn!("⚠️ Failed to check recent data for {}", symbol),
+            _ => {
+                let symbol_elapsed = symbol_start.elapsed();
+                warn!("⚠️ Failed to check recent data for {} in {:?}", symbol, symbol_elapsed);
+            }
         }
     }
+    let symbol_check_elapsed = symbol_check_start.elapsed();
+    info!("✅ Symbol data checks completed in {:?}", symbol_check_elapsed);
     
     // Check technical analysis actors if enabled
     if let Some((timeframe_actor, indicator_actor)) = ta_actors {
+        let ta_check_start = std::time::Instant::now();
         info!("🧮 Checking Technical Analysis health...");
         
         // Check TimeFrame actor initialization status
+        let tf_status_start = std::time::Instant::now();
         match timeframe_actor.ask(TimeFrameAsk::GetInitializationStatus).await {
             Ok(timeframe_reply) => {
-                debug!("TimeFrame actor status: {:?}", timeframe_reply);
+                let tf_status_elapsed = tf_status_start.elapsed();
+                debug!("TimeFrame actor status: {:?} (check: {:?})", timeframe_reply, tf_status_elapsed);
             }
-            Err(e) => warn!("⚠️ Failed to get TimeFrame actor status: {}", e),
+            Err(e) => {
+                let tf_status_elapsed = tf_status_start.elapsed();
+                warn!("⚠️ Failed to get TimeFrame actor status in {:?}: {}", tf_status_elapsed, e);
+            }
         }
         
         // Check Indicator actor initialization status
+        let ind_status_start = std::time::Instant::now();
         match indicator_actor.ask(IndicatorAsk::GetInitializationStatus).await {
             Ok(indicator_reply) => {
-                debug!("Indicator actor status: {:?}", indicator_reply);
+                let ind_status_elapsed = ind_status_start.elapsed();
+                debug!("Indicator actor status: {:?} (check: {:?})", indicator_reply, ind_status_elapsed);
             }
-            Err(e) => warn!("⚠️ Failed to get Indicator actor status: {}", e),
+            Err(e) => {
+                let ind_status_elapsed = ind_status_start.elapsed();
+                warn!("⚠️ Failed to get Indicator actor status in {:?}: {}", ind_status_elapsed, e);
+            }
         }
         
         // Get sample indicators for the first symbol
         if let Some(first_symbol) = config.symbols.first() {
+            let indicators_start = std::time::Instant::now();
             match indicator_actor.ask(IndicatorAsk::GetIndicators { 
                 symbol: first_symbol.clone() 
             }).await {
                 Ok(indicator_reply) => {
-                    info!("📈 Sample indicators for {}: {:?}", first_symbol, indicator_reply);
+                    let indicators_elapsed = indicators_start.elapsed();
+                    info!("📈 Sample indicators for {} retrieved in {:?}: {:?}", first_symbol, indicators_elapsed, indicator_reply);
                 }
-                Err(e) => warn!("⚠️ Failed to get indicators for {}: {}", first_symbol, e),
+                Err(e) => {
+                    let indicators_elapsed = indicators_start.elapsed();
+                    warn!("⚠️ Failed to get indicators for {} in {:?}: {}", first_symbol, indicators_elapsed, e);
+                }
             }
         }
+        
+        let ta_check_elapsed = ta_check_start.elapsed();
+        info!("✅ Technical Analysis health check completed in {:?}", ta_check_elapsed);
     }
     
     // Periodic gap detection (if enabled)
     if config.periodic_gap_detection_enabled {
+        let gap_detection_start = std::time::Instant::now();
         info!("🕳️ Performing periodic gap detection...");
         
         let now = chrono::Utc::now().timestamp_millis();
@@ -881,18 +1028,39 @@ async fn perform_health_check(
         
         for symbol in &config.symbols {
             for &timeframe_seconds in &config.timeframes {
-                if let Err(e) = check_for_recent_gaps(
+                let gap_check_start = std::time::Instant::now();
+                // Add timeout protection to prevent hangs
+                let gap_check = check_for_recent_gaps(
                     symbol,
                     timeframe_seconds,
                     window_start,
                     now,
                     api_actor
-                ).await {
-                    warn!("⚠️ Periodic gap detection failed for {} {}s: {}", symbol, timeframe_seconds, e);
+                );
+                
+                match tokio::time::timeout(Duration::from_secs(30), gap_check).await {
+                    Ok(Ok(())) => {
+                        let gap_check_elapsed = gap_check_start.elapsed();
+                        debug!("✅ Gap detection completed for {} {}s in {:?}", symbol, timeframe_seconds, gap_check_elapsed);
+                    }
+                    Ok(Err(e)) => {
+                        let gap_check_elapsed = gap_check_start.elapsed();
+                        warn!("⚠️ Periodic gap detection failed for {} {}s in {:?}: {}", symbol, timeframe_seconds, gap_check_elapsed, e);
+                    }
+                    Err(_) => {
+                        let gap_check_elapsed = gap_check_start.elapsed();
+                        warn!("⏰ Periodic gap detection timed out for {} {}s after {:?} (30s limit)", symbol, timeframe_seconds, gap_check_elapsed);
+                    }
                 }
             }
         }
+        
+        let gap_detection_elapsed = gap_detection_start.elapsed();
+        info!("✅ Periodic gap detection completed in {:?}", gap_detection_elapsed);
     }
+    
+    let health_check_total_elapsed = health_check_start.elapsed();
+    info!("🎯 Health check completed in {:?}", health_check_total_elapsed);
 }
 
 /// Check for gaps in recent data and trigger filling if needed
@@ -912,13 +1080,17 @@ async fn check_for_recent_gaps(
     };
     
     // Get current data range to check for gaps
+    debug!("🔍 Starting gap check for {} {} (window: {} minutes)", symbol, interval, (end_time - _start_time) / (60 * 1000));
+    let range_start = std::time::Instant::now();
+    
     match api_actor.ask(ApiAsk::GetDataRange {
         symbol: symbol.to_string(),
         interval: interval.to_string(),
     }).await {
         Ok(ApiReply::DataRange { earliest, latest, count, .. }) => {
-            debug!("📊 {} {} data check: earliest={:?}, latest={:?}, count={}", 
-                   symbol, interval, earliest, latest, count);
+            let range_elapsed = range_start.elapsed();
+            debug!("📊 {} {} data check completed in {:?}: earliest={:?}, latest={:?}, count={}", 
+                   symbol, interval, range_elapsed, earliest, latest, count);
             
             // Check if we have recent data
             if let Some(latest_data) = latest {

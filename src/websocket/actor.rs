@@ -1,19 +1,20 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use heed::{Database, Env, EnvOpenOptions};
-use heed::types::{SerdeBincode, Str};
+use dashmap::DashMap;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::message::{Context, Message};
 use kameo::request::MessageSend;
 use kameo::{Actor, mailbox::unbounded::UnboundedMailbox};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-use crate::common::shared_data::{SharedCandle, shared_candle};
+use crate::common::shared_data::{
+    SharedCandle, SharedSymbol, shared_candle, intern_symbol
+};
 use crate::historical::structs::FuturesOHLCVCandle;
 use crate::postgres::{PostgresActor, PostgresTell};
 use crate::websocket::binance::kline::parse_any_kline_message;
@@ -21,6 +22,7 @@ use crate::websocket::connection::{ConnectionManager, normalize_symbols};
 use crate::websocket::types::{
     ConnectionStats, ConnectionStatus, StreamSubscription, StreamType, WebSocketError,
 };
+use crate::lmdb::messages::LmdbActorTell;
 
 /// WebSocket actor messages for telling (fire-and-forget)
 #[derive(Debug, Clone)]
@@ -37,8 +39,8 @@ pub enum WebSocketTell {
     },
     /// Process a received candle (internal use)
     ProcessCandle {
-        symbol: String,
-        candle: FuturesOHLCVCandle,
+        symbol: SharedSymbol,
+        candle: SharedCandle,
         is_closed: bool,
     },
     /// Force reconnection
@@ -51,6 +53,12 @@ pub enum WebSocketTell {
     SetTimeFrameActor {
         timeframe_actor: ActorRef<crate::technical_analysis::actors::timeframe::TimeFrameActor>,
     },
+    /// Set the LMDB actor reference for centralized storage
+    SetLmdbActor {
+        lmdb_actor: ActorRef<crate::lmdb::LmdbActor>,
+    },
+    /// Flush pending batches to prevent candles from getting stuck
+    FlushBatches,
 }
 
 /// WebSocket actor messages for asking (request-response)
@@ -95,18 +103,20 @@ pub struct WebSocketActor {
     connection_manager: ConnectionManager,
     /// Active subscriptions
     subscriptions: Arc<RwLock<Vec<StreamSubscription>>>,
-    /// LMDB environments per symbol-timeframe
-    envs: FxHashMap<String, Env>,
-    /// Candle databases per symbol
-    candle_dbs: FxHashMap<String, Database<Str, SerdeBincode<FuturesOHLCVCandle>>>,
-    /// Base path for LMDB storage
+    /// LMDB actor reference for centralized storage
+    lmdb_actor: Option<ActorRef<crate::lmdb::LmdbActor>>,
+    /// Base path for LMDB storage (for reference only)
     base_path: PathBuf,
-    /// Recent candles cache (symbol -> candles)
-    recent_candles: FxHashMap<String, Vec<SharedCandle>>,
+    /// Recent candles cache (symbol -> candles) - using DashMap + VecDeque for concurrent O(1) operations
+    recent_candles: DashMap<String, VecDeque<SharedCandle>>,
     /// Maximum recent candles to keep in memory
     max_recent_candles: usize,
     /// Maximum idle time before marking connection as unhealthy (in seconds)
     max_idle_time: u64,
+    /// Pending candles for batch processing (symbol -> pending candles)
+    pending_batch_candles: DashMap<String, Vec<(SharedCandle, bool)>>,
+    /// Last batch process time for rate limiting
+    pub last_batch_time: Option<std::time::Instant>,
     /// Handle to the current connection task (for proper termination)
     connection_task: Option<tokio::task::JoinHandle<()>>,
     /// Last activity timestamp (when we last processed a message) - for health checks
@@ -162,12 +172,13 @@ impl WebSocketActor {
         Ok(Self {
             connection_manager,
             subscriptions: Arc::new(RwLock::new(Vec::new())),
-            envs: FxHashMap::default(),
-            candle_dbs: FxHashMap::default(),
+            lmdb_actor: None,
             base_path,
-            recent_candles: FxHashMap::default(),
+            recent_candles: DashMap::new(),
             max_recent_candles: 1000,
             max_idle_time: max_idle_secs,
+            pending_batch_candles: DashMap::new(),
+            last_batch_time: None,
             connection_task: None,
             last_activity_time: None,
             last_processed_candle_time: None,
@@ -179,49 +190,55 @@ impl WebSocketActor {
         })
     }
 
-    /// Initialize LMDB database for a symbol
+    /// Set the LMDB actor reference for centralized storage
+    pub fn set_lmdb_actor(&mut self, lmdb_actor: ActorRef<crate::lmdb::LmdbActor>) {
+        self.lmdb_actor = Some(lmdb_actor);
+    }
+
+    /// Initialize database for a symbol via LmdbActor (non-blocking)
     fn init_symbol_db(&mut self, symbol: &str) -> Result<(), WebSocketError> {
-        if self.envs.contains_key(symbol) {
-            return Ok(()); // Already initialized
+        // Initialize recent candles cache immediately
+        self.recent_candles.insert(symbol.to_string(), VecDeque::with_capacity(self.max_recent_candles));
+        
+        // Send database initialization to background (non-blocking)
+        if let Some(lmdb_actor) = &self.lmdb_actor {
+            let lmdb_actor_clone = lmdb_actor.clone();
+            let symbol_owned = symbol.to_string();
+            
+            tokio::spawn(async move {
+                let msg = crate::lmdb::LmdbActorMessage::InitializeDatabase {
+                    symbol: symbol_owned.clone(),
+                    timeframe: 60,
+                };
+                
+                match lmdb_actor_clone.ask(msg).await {
+                    Ok(crate::lmdb::LmdbActorResponse::Success) => {
+                        info!("✅ Background database initialization completed for: {}", symbol_owned);
+                    }
+                    Ok(crate::lmdb::LmdbActorResponse::ErrorResponse(err)) => {
+                        error!("❌ Background database initialization failed for {}: {}", symbol_owned, err);
+                    }
+                    Ok(_) => {
+                        error!("❌ Unexpected response from LmdbActor for {}", symbol_owned);
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to communicate with LmdbActor for {}: {}", symbol_owned, e);
+                    }
+                }
+            });
         }
-
-        let db_path = self.base_path.join(format!("{}_60", symbol)); // WebSocket stores 1-minute data only
-        std::fs::create_dir_all(&db_path)
-            .map_err(|e| WebSocketError::Unknown(format!("Failed to create DB path for {}: {}", symbol, e)))?;
-
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(1024 * 1024 * 1024) // 1GB per symbol
-                .max_dbs(10)
-                .max_readers(256)
-                .open(&db_path)
-                .map_err(|e| WebSocketError::Unknown(format!("Failed to open LMDB for {}: {}", symbol, e)))?
-        };
-
-        let mut wtxn = env.write_txn()
-            .map_err(|e| WebSocketError::Unknown(format!("Failed to create write transaction for {}: {}", symbol, e)))?;
-
-        let candle_db = env.create_database::<Str, SerdeBincode<FuturesOHLCVCandle>>(&mut wtxn, Some("candles"))
-            .map_err(|e| WebSocketError::Unknown(format!("Failed to create candle DB for {}: {}", symbol, e)))?;
-
-        wtxn.commit()
-            .map_err(|e| WebSocketError::Unknown(format!("Failed to commit creation transaction for {}: {}", symbol, e)))?;
-
-        self.envs.insert(symbol.to_string(), env);
-        self.candle_dbs.insert(symbol.to_string(), candle_db);
-        self.recent_candles.insert(symbol.to_string(), Vec::new());
-
-        info!("✅ Initialized LMDB database for symbol: {}", symbol);
+        
+        info!("⚡ Database initialization started in background for: {}", symbol);
         Ok(())
     }
 
     /// Store a candle in LMDB and update recent cache - handles both live and closed candles
-    fn store_candle(&mut self, symbol: &str, candle: &FuturesOHLCVCandle, is_closed: bool) -> Result<(), WebSocketError> {
+    pub async fn store_candle(&mut self, symbol: &str, candle: &SharedCandle, is_closed: bool) -> Result<(), WebSocketError> {
         // Always update recent cache for both live and closed candles (for real-time access)
-        if let Some(recent) = self.recent_candles.get_mut(symbol) {
-            recent.push(shared_candle(candle.clone()));
+        if let Some(mut recent) = self.recent_candles.get_mut(symbol) {
+            recent.push_back(Arc::clone(candle));
             if recent.len() > self.max_recent_candles {
-                recent.remove(0);
+                recent.pop_front(); // O(1) operation with VecDeque
             }
         }
         
@@ -231,28 +248,87 @@ impl WebSocketActor {
             return Ok(());
         }
         
-        info!("💾 Storing completed 1-minute candle for {} at {}", symbol, candle.close_time);
-
-        // Ensure database is initialized
-        if !self.envs.contains_key(symbol) {
-            self.init_symbol_db(symbol)?;
+        // For closed candles, add to batch for efficient processing
+        self.add_to_batch(symbol, candle, is_closed).await
+    }
+    
+    /// Add a candle to the batch processing queue
+    async fn add_to_batch(&mut self, symbol: &str, candle: &SharedCandle, is_closed: bool) -> Result<(), WebSocketError> {
+        // Add to batch queue and determine if we should process
+        let (should_process, batch_len, total_pending) = {
+            let mut batch = self.pending_batch_candles.entry(symbol.to_string()).or_insert_with(Vec::new);
+            batch.push((Arc::clone(candle), is_closed));
+            
+            let total_pending: usize = self.pending_batch_candles.iter().map(|entry| entry.value().len()).sum();
+            
+            let should_process = match self.last_batch_time {
+                Some(last_time) => last_time.elapsed() > Duration::from_millis(100),
+                None => true, // Always process immediately if this is the first candle
+            } || batch.len() >= 5 // Reduced threshold for faster processing
+            || total_pending >= 10; // Process if total pending gets large
+            
+            (should_process, batch.len(), total_pending)
+        }; // Release the borrow here
+        
+        debug!("📊 Batch status for {}: {} candles, {} total pending, should_process: {}", 
+               symbol, batch_len, total_pending, should_process);
+        
+        if should_process {
+            info!("🔄 Processing batches: {} total pending candles", total_pending);
+            self.process_batches().await?;
+            self.last_batch_time = Some(std::time::Instant::now());
         }
-
-        // Store in LMDB
-        if let (Some(env), Some(candle_db)) = (self.envs.get(symbol), self.candle_dbs.get(symbol)) {
-            let mut wtxn = env.write_txn()
-                .map_err(|e| WebSocketError::Unknown(format!("Failed to create write transaction: {}", e)))?;
-
-            let key = format!("60:{}", candle.close_time); // 1-minute timeframe:close_time
-            candle_db.put(&mut wtxn, &key, candle)
-                .map_err(|e| WebSocketError::Unknown(format!("Failed to store candle: {}", e)))?;
-
-            wtxn.commit()
-                .map_err(|e| WebSocketError::Unknown(format!("Failed to commit candle storage: {}", e)))?;
-
-            debug!("Stored candle for {} at {}", symbol, candle.close_time);
+        
+        Ok(())
+    }
+    
+    /// Process all pending batch candles
+    async fn process_batches(&mut self) -> Result<(), WebSocketError> {
+        // Collect all symbols that have pending candles
+        let symbols_to_process: Vec<String> = self.pending_batch_candles.iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        
+        for symbol in symbols_to_process {
+            if let Some((_, mut candles)) = self.pending_batch_candles.remove(&symbol) {
+                // Sort by close_time to ensure proper ordering
+                candles.sort_by_key(|(candle, _)| candle.close_time);
+                
+                // Process the batch for this symbol
+                self.process_candle_batch(&symbol, candles).await?;
+            }
         }
+        
+        Ok(())
+    }
+    
+    /// Process a batch of candles for a specific symbol via LmdbActor
+    async fn process_candle_batch(&mut self, symbol: &str, candles: Vec<(SharedCandle, bool)>) -> Result<(), WebSocketError> {
+        if let Some(lmdb_actor) = &self.lmdb_actor {
+            // Extract only closed candles for storage
+            let closed_candles: Vec<_> = candles
+                .into_iter()
+                .filter_map(|(candle, is_closed)| if is_closed { Some((*candle).clone()) } else { None })
+                .collect();
 
+            if !closed_candles.is_empty() {
+                // Store batch via LmdbActor asynchronously (non-blocking)
+                let msg = LmdbActorTell::StoreCandlesAsync {
+                    symbol: symbol.to_string(),
+                    timeframe: 60, // WebSocket stores 1-minute data only
+                    candles: closed_candles.clone(),
+                };
+
+                if let Err(e) = lmdb_actor.tell(msg).send().await {
+                    error!("❌ Failed to send async storage request to LmdbActor for {}: {}", symbol, e);
+                } else {
+                    debug!("📤 Sent {} candles for async storage to LmdbActor for {}", closed_candles.len(), symbol);
+                }
+            }
+        } else {
+            warn!("LmdbActor not available, skipping candle storage for {}", symbol);
+        }
+        
         Ok(())
     }
 
@@ -265,11 +341,20 @@ impl WebSocketActor {
             // Give a moment for cleanup
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let subscriptions = self.subscriptions.read().await.clone();
+        let subscriptions = {
+            let subscriptions_guard = self.subscriptions.read().await;
+            subscriptions_guard.clone() // Only clone when we need to hold it across await
+        };
         
         if subscriptions.is_empty() {
             warn!("No subscriptions found, cannot start connection");
+            warn!("📋 Current subscription count: {}", subscriptions.len());
             return;
+        }
+        
+        info!("📋 Starting connection with {} subscriptions", subscriptions.len());
+        for (i, sub) in subscriptions.iter().enumerate() {
+            info!("  [{}] {} -> {:?} (active: {})", i, sub.stream_type, sub.symbols, sub.is_active);
         }
 
         // Validate and normalize all symbols
@@ -343,14 +428,18 @@ impl WebSocketActor {
                                  kline_event.symbol, candle.open, candle.high, candle.low, candle.close, candle.volume, candle.number_of_trades, candle.taker_buy_base_asset_volume, is_closed);
                             
                             let process_msg = WebSocketTell::ProcessCandle {
-                                symbol: kline_event.symbol.clone(),
-                                candle,
+                                symbol: intern_symbol(&kline_event.symbol),
+                                candle: shared_candle(candle),
                                 is_closed,
                             };
                             
-                            if let Err(e) = actor_ref.tell(process_msg).send().await {
-                                warn!("Failed to send processed candle to actor: {}", e);
-                            }
+                            // Send message in background task to avoid blocking WebSocket loop
+                            let actor_ref_clone = actor_ref.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = actor_ref_clone.tell(process_msg).send().await {
+                                    warn!("Failed to send processed candle to actor: {}", e);
+                                }
+                            });
                             
                             Ok(())
                         }
@@ -392,12 +481,20 @@ impl WebSocketActor {
         }
 
         let normalized_symbols = normalize_symbols(&symbols)?;
+        // Keep symbols as Vec<String> for subscription interface compatibility
         let subscription = StreamSubscription::new(stream_type.clone(), normalized_symbols);
 
         let mut subscriptions = self.subscriptions.write().await;
         subscriptions.push(subscription);
 
         info!("➕ Added subscription: {} for {:?}", stream_type, symbols);
+        info!("📋 Total subscriptions now: {}", subscriptions.len());
+        
+        // Debug log all current subscriptions
+        for (i, sub) in subscriptions.iter().enumerate() {
+            debug!("  [{}] {} -> {:?} (active: {})", i, sub.stream_type, sub.symbols, sub.is_active);
+        }
+        
         Ok(())
     }
 
@@ -430,10 +527,17 @@ impl WebSocketActor {
     }
 
     /// Get recent candles for a symbol
-    fn get_recent_candles(&self, symbol: &str, limit: usize) -> Vec<FuturesOHLCVCandle> {
+    pub fn get_recent_candles(&self, symbol: &str, limit: usize) -> Vec<FuturesOHLCVCandle> {
         if let Some(recent) = self.recent_candles.get(symbol) {
-            let start_idx = if recent.len() > limit { recent.len() - limit } else { 0 };
-            recent[start_idx..].iter().map(|candle| (**candle).clone()).collect()
+            let take_count = std::cmp::min(limit, recent.len());
+            recent.iter()
+                .rev() // Get most recent first
+                .take(take_count)
+                .map(|candle| (**candle).clone())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev() // Restore chronological order
+                .collect()
         } else {
             Vec::new()
         }
@@ -478,6 +582,19 @@ impl Actor for WebSocketActor {
                 interval.tick().await;
                 if let Err(e) = actor_ref_clone.tell(WebSocketTell::HealthCheck).send().await {
                     warn!("Failed to send health check: {}", e);
+                    break;
+                }
+            }
+        });
+        
+        // Start periodic batch flush task to prevent stuck candles
+        let batch_flush_ref = actor_ref.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(200)); // Flush every 200ms
+            loop {
+                interval.tick().await;
+                if let Err(e) = batch_flush_ref.tell(WebSocketTell::FlushBatches).send().await {
+                    warn!("Failed to send batch flush: {}", e);
                     break;
                 }
             }
@@ -530,62 +647,73 @@ impl Message<WebSocketTell> for WebSocketActor {
                     debug!("📝 Updated last processed candle time for {}: {}", symbol, candle.close_time);
                 }
                 
-                // Store candle (both live and closed go to recent cache, only closed to LMDB)
-                if let Err(e) = self.store_candle(&symbol, &candle, is_closed) {
-                    error!("Failed to store candle for {}: {}", symbol, e);
+                // Add to recent cache immediately (synchronous, fast operation)
+                let mut recent_candles = self.recent_candles.entry(symbol.to_string()).or_insert_with(|| VecDeque::with_capacity(self.max_recent_candles));
+                recent_candles.push_back(candle.clone());
+                if recent_candles.len() > self.max_recent_candles {
+                    recent_candles.pop_front();
                 }
                 
-                // Store closed candles to PostgreSQL for dual storage strategy
-                if is_closed {
-                    let timestamp = chrono::DateTime::from_timestamp_millis(candle.close_time)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                        .unwrap_or_else(|| format!("INVALID_TIME({})", candle.close_time));
+                // Spawn background task for all heavy operations (non-blocking)
+                let lmdb_actor = self.lmdb_actor.clone();
+                let postgres_actor = self.postgres_actor.clone();
+                let timeframe_actor = self.timeframe_actor.clone();
+                let symbol_owned = symbol.to_string();
+                let candle_arc = Arc::clone(&candle); // Clone the Arc (cheap)
+                
+                tokio::spawn(async move {
+                    // Background storage operations (LMDB)
+                    if is_closed {
+                        if let Some(lmdb_actor) = lmdb_actor {
+                            let msg = LmdbActorTell::StoreCandlesAsync {
+                                symbol: symbol_owned.clone(),
+                                timeframe: 60,
+                                candles: vec![(*candle_arc).clone()], // Dereference Arc and clone candle data
+                            };
+                            
+                            if let Err(e) = lmdb_actor.tell(msg).send().await {
+                                error!("❌ Background LMDB storage failed for {}: {}", symbol_owned, e);
+                            }
+                        }
+                        
+                        // Background PostgreSQL storage
+                        if let Some(postgres_actor) = postgres_actor {
+                            let timestamp = chrono::DateTime::from_timestamp_millis(candle_arc.close_time)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                                .unwrap_or_else(|| format!("INVALID_TIME({})", candle_arc.close_time));
+                            
+                            let postgres_msg = PostgresTell::StoreCandle {
+                                symbol: symbol_owned.clone(),
+                                candle: (*candle_arc).clone(), // Dereference Arc and clone candle data
+                                source: "WebSocketActor".to_string(),
+                            };
+                            
+                            if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
+                                warn!("❌ Background PostgreSQL storage failed for {}: {}", symbol_owned, e);
+                            } else {
+                                debug!("✅ Background PostgreSQL storage completed: {} @ {}", symbol_owned, timestamp);
+                            }
+                        }
+                    }
                     
-                    info!("🔄 [WebSocketActor] Sending closed candle to PostgreSQL: {} - {} (close: {})", 
-                          symbol, timestamp, candle.close);
-                    
-                    if let Some(postgres_actor) = &self.postgres_actor {
-                        let postgres_msg = PostgresTell::StoreCandle {
-                            symbol: symbol.clone(),
-                            candle: candle.clone(),
-                            source: "WebSocketActor".to_string(),
+                    // Background Technical Analysis forwarding
+                    if let Some(timeframe_actor) = timeframe_actor {
+                        let msg = crate::technical_analysis::actors::timeframe::TimeFrameTell::ProcessCandle {
+                            symbol: symbol_owned.clone(),
+                            candle: (*candle_arc).clone(), // Dereference Arc and clone candle data
+                            is_closed,
                         };
                         
-                        if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
-                            warn!("❌ [WebSocketActor] Failed to store candle to PostgreSQL for {}: {}", symbol, e);
+                        if let Err(e) = timeframe_actor.tell(msg).send().await {
+                            error!("❌ Background TA forwarding failed for {}: {}", symbol_owned, e);
                         } else {
-                            info!("✅ [WebSocketActor] Successfully sent candle to PostgreSQL: {} @ {}", symbol, timestamp);
+                            debug!("🚀 Background TA forwarding completed: {} @ {}", symbol_owned, candle_arc.close_time);
                         }
-                    } else {
-                        warn!("⚠️  [WebSocketActor] PostgreSQL actor not available for storing candle: {} @ {}", symbol, timestamp);
                     }
-                } else {
-                    // Log live candle updates for debugging timing
-                    let timestamp = chrono::DateTime::from_timestamp_millis(candle.close_time)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                        .unwrap_or_else(|| format!("INVALID_TIME({})", candle.close_time));
-                    debug!("📊 [WebSocketActor] Processing live candle update: {} - {} (close: {})", 
-                           symbol, timestamp, candle.close);
-                }
+                });
                 
-                // Direct real-time forwarding to TimeFrame actor for immediate TA updates
-                if let Some(timeframe_actor) = &self.timeframe_actor {
-                    let forward_start = std::time::Instant::now();
-                    let msg = crate::technical_analysis::actors::timeframe::TimeFrameTell::ProcessCandle {
-                        symbol: symbol.clone(),
-                        candle: candle.clone(),
-                        is_closed,
-                    };
-                    
-                    if let Err(e) = timeframe_actor.tell(msg).send().await {
-                        error!("Failed to forward candle to TimeFrame actor: {}", e);
-                    } else {
-                        let forward_time = forward_start.elapsed();
-                        debug!("🚀 Forwarded {} candle ({}) to TimeFrame: {:.2} @ {} (fwd: {:?})", 
-                               symbol, if is_closed { "closed" } else { "live" },
-                               candle.close, candle.close_time, forward_time);
-                    }
-                }
+                // Handler completes immediately - WebSocket can process next message
+                debug!("⚡ ProcessCandle handler completed immediately for {} ({})", symbol, if is_closed { "closed" } else { "live" });
             }
             WebSocketTell::Reconnect => {
                 info!("🔄 Manual reconnection requested");
@@ -645,7 +773,7 @@ impl Message<WebSocketTell> for WebSocketActor {
                                     
                                     // Request gap filling via API actor
                                     let gap_fill_msg = crate::api::ApiTell::FillGap {
-                                        symbol: symbol.clone(),
+                                        symbol: symbol.to_string(), // Convert Arc<str> to String only when needed
                                         interval: "1m".to_string(),
                                         start_time: last_candle_time + 60000, // Start from next minute
                                         end_time: now - 60000, // End at previous minute
@@ -673,6 +801,23 @@ impl Message<WebSocketTell> for WebSocketActor {
                 info!("📨 Setting TimeFrame actor reference for WebSocketActor");
                 self.timeframe_actor = Some(timeframe_actor);
                 info!("✅ TimeFrame actor reference successfully set in WebSocketActor");
+            }
+            WebSocketTell::SetLmdbActor { lmdb_actor } => {
+                info!("📨 Setting LMDB actor reference for WebSocketActor");
+                self.lmdb_actor = Some(lmdb_actor);
+                info!("✅ LMDB actor reference successfully set in WebSocketActor - centralized storage enabled");
+            }
+            WebSocketTell::FlushBatches => {
+                // Force flush any pending batches to prevent stuck candles
+                let pending_count: usize = self.pending_batch_candles.iter().map(|entry| entry.value().len()).sum();
+                if pending_count > 0 {
+                    debug!("🔄 Periodic batch flush: {} pending candles", pending_count);
+                    if let Err(e) = self.process_batches().await {
+                        warn!("Failed to flush batches: {}", e);
+                    } else {
+                        self.last_batch_time = Some(std::time::Instant::now());
+                    }
+                }
             }
         }
     }
