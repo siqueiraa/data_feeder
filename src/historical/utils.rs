@@ -166,8 +166,9 @@ pub fn aggregate_candles_with_gap_filling(
                     prev_close,
                     prev_close,
                     prev_close,
-                    0.0,
-                    current_bucket_start,
+                    0.0, // No volume in gap
+                    0, // No trades in gap
+                    0.0, // No taker buy volume in gap
                     true,
                 ));
             } else if fill_gaps {
@@ -176,7 +177,10 @@ pub fn aggregate_candles_with_gap_filling(
                 candles.push(FuturesOHLCVCandle::new_from_values(
                     current_bucket_start,
                     bucket_end - 1,
-                    0.0, 0.0, 0.0, 0.0, 0.0, current_bucket_start, true,
+                    0.0, 0.0, 0.0, 0.0, 0.0, // OHLCV all zeros for first gap
+                    0, // No trades in gap
+                    0.0, // No taker buy volume in gap
+                    true,
                 ));
             }
         } else {
@@ -185,6 +189,14 @@ pub fn aggregate_candles_with_gap_filling(
             let high = bucket_trades.iter().map(|t| t.price).fold(f64::MIN, f64::max);
             let low = bucket_trades.iter().map(|t| t.price).fold(f64::MAX, f64::min);
             let volume = bucket_trades.iter().map(|t| t.size).sum();
+            
+            // Calculate taker buy volume (when buyer is the taker, not maker)
+            let taker_buy_volume = bucket_trades.iter()
+                .filter(|t| !t.is_buyer_maker) // Buyer is taker when not maker
+                .map(|t| t.size)
+                .sum();
+            
+            let number_of_trades = bucket_trades.len() as u64;
 
             candles.push(FuturesOHLCVCandle::new_from_values(
                 current_bucket_start,
@@ -194,7 +206,8 @@ pub fn aggregate_candles_with_gap_filling(
                 low,
                 close,
                 volume,
-                current_bucket_start,
+                number_of_trades,
+                taker_buy_volume,
                 true,
             ));
         }
@@ -268,6 +281,65 @@ pub fn fast_parse_i64(bytes: &[u8]) -> Result<i64, HistoricalDataError> {
     }
 
     Ok(if negative { -result } else { result })
+}
+
+#[inline(always)]
+#[allow(clippy::needless_range_loop)]
+pub fn fast_parse_u64(bytes: &[u8]) -> Result<u64, HistoricalDataError> {
+    let mut result = 0u64;
+
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => {
+                result = result * 10 + (bytes[i] - b'0') as u64;
+            }
+            _ => return Err(HistoricalDataError::ParseString("Invalid character in unsigned integer".to_string())),
+        }
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod parsing_tests {
+    use super::*;
+
+    #[test]
+    fn test_fast_parse_u64() {
+        assert_eq!(fast_parse_u64(b"0").unwrap(), 0);
+        assert_eq!(fast_parse_u64(b"123").unwrap(), 123);
+        assert_eq!(fast_parse_u64(b"999999999999999999").unwrap(), 999999999999999999);
+        
+        // Test error cases
+        assert!(fast_parse_u64(b"abc").is_err());
+        assert!(fast_parse_u64(b"12.34").is_err());
+        assert!(fast_parse_u64(b"-123").is_err()); // No negative numbers for u64
+    }
+
+    #[test]
+    fn test_csv_parsing_with_complete_binance_data() {
+        // Sample Binance kline CSV data with all fields
+        let csv_data = b"1609459200000,29374.15,29433.73,29200.00,29374.15,508.24723000,1609459259999,14932134.23778210,2283,254.56784000,7477631.17645690,0";
+        
+        let candles = parse_csv_to_klines(csv_data, 300).expect("Should parse complete Binance data");
+        assert_eq!(candles.len(), 1);
+        
+        let candle = &candles[0];
+        assert_eq!(candle.open_time, 1609459200000);
+        assert_eq!(candle.close_time, 1609459259999);
+        assert_eq!(candle.volume, 508.24723000);
+        assert_eq!(candle.number_of_trades, 2283);
+        assert_eq!(candle.taker_buy_base_asset_volume, 254.56784000);
+        
+        // Verify that both taker buy and trade count are non-zero
+        assert!(candle.number_of_trades > 0, "Trade count should be positive");
+        assert!(candle.taker_buy_base_asset_volume > 0.0, "Taker buy volume should be positive");
+        
+        println!("✅ CSV parsing test passed with realistic data:");
+        println!("   Volume: {:.8}", candle.volume);
+        println!("   Trades: {}", candle.number_of_trades);
+        println!("   Taker Buy Volume: {:.8}", candle.taker_buy_base_asset_volume);
+    }
 }
 
 pub fn parse_csv_to_trade(csv_data: &[u8]) -> Result<Vec<FuturesExchangeTrade>, HistoricalDataError> {
@@ -367,6 +439,8 @@ pub fn parse_csv_to_klines(csv_data: &[u8], _timeframe: Seconds) -> Result<Vec<F
         let mut close = 0.0;
         let mut volume = 0.0;
         let mut close_time = 0i64;
+        let mut number_of_trades = 0u64;
+        let mut taker_buy_volume = 0.0;
 
         for i in 0..=line.len() {
             if i == line.len() || line[i] == b',' {
@@ -380,7 +454,9 @@ pub fn parse_csv_to_klines(csv_data: &[u8], _timeframe: Seconds) -> Result<Vec<F
                     4 => close = fast_parse_f64(field)?,
                     5 => volume = fast_parse_f64(field)?,
                     6 => close_time = fast_parse_i64(field)?,
-                    _ => {}
+                    8 => number_of_trades = fast_parse_u64(field)?,
+                    9 => taker_buy_volume = fast_parse_f64(field)?,
+                    _ => {} // Skip unused fields (7=quoteAssetVolume, 10=takerBuyQuoteAssetVolume, 11=ignored)
                 }
 
                 field_start = i + 1;
@@ -389,8 +465,8 @@ pub fn parse_csv_to_klines(csv_data: &[u8], _timeframe: Seconds) -> Result<Vec<F
         }
 
         let candle = FuturesOHLCVCandle::new_from_values(
-            open_time, close_time, open, high, low, close, volume, close_time,
-            true,
+            open_time, close_time, open, high, low, close, volume,
+            number_of_trades, taker_buy_volume, true,
         );
 
         candles.push(candle);

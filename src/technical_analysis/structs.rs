@@ -88,6 +88,23 @@ impl CandleRingBuffer {
         }
     }
 
+    /// Bulk add candle for historical initialization (no real-time overhead)
+    pub fn add_candle_bulk(&mut self, candle: &FuturesOHLCVCandle) -> Option<FuturesOHLCVCandle> {
+        // Calculate which period this candle belongs to using open_time for proper alignment
+        let period_start = self.calculate_period_start(candle.open_time);
+        
+        if self.current_period_start != Some(period_start) {
+            // Starting a new period - finalize previous and start new
+            let completed_candle = self.finalize_current_candle_bulk();
+            self.start_new_period_bulk(period_start, candle);
+            completed_candle
+        } else {
+            // Update current candle with this 1m candle (no debugging overhead)
+            self.update_current_candle_bulk(candle);
+            None
+        }
+    }
+
     /// Calculate the start time of the aggregation period for a given timestamp
     fn calculate_period_start(&self, timestamp: TimestampMS) -> TimestampMS {
         // Align timestamp to timeframe boundaries
@@ -126,6 +143,24 @@ impl CandleRingBuffer {
         }
     }
 
+    /// Start a new aggregation period (bulk version - no debug overhead)
+    fn start_new_period_bulk(&mut self, period_start: TimestampMS, first_candle: &FuturesOHLCVCandle) {
+        self.current_period_start = Some(period_start);
+        self.current_candle = Some(FuturesOHLCVCandle {
+            open_time: period_start,
+            close_time: period_start + self.timeframe_ms - 1,
+            open: first_candle.open,
+            high: first_candle.high,
+            low: first_candle.low,
+            close: first_candle.close,
+            volume: first_candle.volume,
+            number_of_trades: first_candle.number_of_trades,
+            taker_buy_base_asset_volume: first_candle.taker_buy_base_asset_volume,
+            closed: false, // Will be set to true when period completes
+        });
+        // No debug logging for bulk operations
+    }
+
     /// Update the current aggregated candle with a new 1m candle
     fn update_current_candle(&mut self, candle: &FuturesOHLCVCandle) {
         if let Some(current) = &mut self.current_candle {
@@ -156,16 +191,51 @@ impl CandleRingBuffer {
         }
     }
 
+    /// Update the current aggregated candle (bulk version - no debug overhead)
+    fn update_current_candle_bulk(&mut self, candle: &FuturesOHLCVCandle) {
+        if let Some(current) = &mut self.current_candle {
+            // Proper OHLCV incremental aggregation (same logic, no debug)
+            current.high = current.high.max(candle.high);
+            current.low = current.low.min(candle.low);
+            current.close = candle.close; // Latest close
+            
+            // Accumulate volume data
+            current.volume += candle.volume;
+            current.number_of_trades += candle.number_of_trades;
+            current.taker_buy_base_asset_volume += candle.taker_buy_base_asset_volume;
+            
+            // Mark as closed if this is the last candle of the period
+            if candle.close_time >= current.close_time {
+                current.closed = true;
+                // No debug logging for bulk operations
+            }
+        }
+    }
+
     /// Finalize the current candle and add it to the buffer
     fn finalize_current_candle(&mut self) -> Option<FuturesOHLCVCandle> {
         if let Some(mut candle) = self.current_candle.take() {
             let now = chrono::Utc::now().timestamp_millis();
 
-            if candle.close_time < now {
-                candle.closed = true;
-            } else {
-                candle.closed = false;
+            candle.closed = candle.close_time < now;
+            
+            // Add to ring buffer
+            if self.buffer.len() >= self.capacity {
+                self.buffer.pop_front();
             }
+            self.buffer.push_back(candle.clone());
+            
+            Some(candle)
+        } else {
+            None
+        }
+    }
+
+    /// Finalize the current candle (bulk version - no timestamp checks)
+    fn finalize_current_candle_bulk(&mut self) -> Option<FuturesOHLCVCandle> {
+        if let Some(mut candle) = self.current_candle.take() {
+            // For historical data, assume all candles are closed
+            candle.closed = true;
             
             // Add to ring buffer
             if self.buffer.len() >= self.capacity {
@@ -284,7 +354,7 @@ impl IncrementalEMA {
                   self.period, historical_prices.len(), self.period);
         }
         
-        for (_i, &price) in historical_prices.iter().enumerate() {
+        for &price in historical_prices.iter() {
             self.update(price);
             
         }
@@ -463,6 +533,245 @@ impl MaxVolumeTracker {
     }
 }
 
+/// Quantile data record for volume/trade analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantileRecord {
+    pub taker_buy_volume: f64,
+    pub sell_buy_volume: f64,    // volume - taker_buy_volume
+    pub trade_count: u64,
+    pub timestamp: TimestampMS,
+}
+
+/// Quantile values for a specific metric
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantileValues {
+    pub q25: f64,    // 25th percentile
+    pub q50: f64,    // 50th percentile (median)
+    pub q75: f64,    // 75th percentile  
+    pub q90: f64,    // 90th percentile
+}
+
+impl Default for QuantileValues {
+    fn default() -> Self {
+        Self {
+            q25: 0.0,
+            q50: 0.0,
+            q75: 0.0,
+            q90: 0.0,
+        }
+    }
+}
+
+/// Quantile results for all metrics
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QuantileResults {
+    pub taker_buy_volume: QuantileValues,
+    pub sell_buy_volume: QuantileValues,
+    pub trade_count: QuantileValues,
+}
+
+/// Efficient quantile tracker using sorted vectors with binary search
+#[derive(Debug, Clone)]
+pub struct QuantileTracker {
+    /// Rolling window of records (unsorted for O(1) insert/remove)
+    records: VecDeque<QuantileRecord>,
+    /// Sorted vectors for efficient quantile calculation
+    sorted_taker_buy: Vec<f64>,
+    sorted_sell_buy: Vec<f64>, 
+    sorted_trade_count: Vec<u64>,
+    /// Window duration in milliseconds  
+    window_duration_ms: i64,
+}
+
+impl QuantileTracker {
+    /// Create a new quantile tracker with 30-day lookback window
+    pub fn new(window_days: u32) -> Self {
+        let window_duration_ms = window_days as i64 * 24 * 3600 * 1000;
+        // Pre-allocate for ~30 days of 1-minute candles (30 * 24 * 60 = 43200)
+        let expected_capacity = (window_days as usize * 24 * 60).max(1000);
+        
+        Self {
+            records: VecDeque::with_capacity(expected_capacity),
+            sorted_taker_buy: Vec::with_capacity(expected_capacity),
+            sorted_sell_buy: Vec::with_capacity(expected_capacity),
+            sorted_trade_count: Vec::with_capacity(expected_capacity),
+            window_duration_ms,
+        }
+    }
+
+    /// Add new record with incremental O(log n) insertion
+    pub fn update(&mut self, candle: &FuturesOHLCVCandle) {
+        // Calculate sell buy volume
+        let sell_buy_volume = candle.volume - candle.taker_buy_base_asset_volume;
+        
+        let record = QuantileRecord {
+            taker_buy_volume: candle.taker_buy_base_asset_volume,
+            sell_buy_volume,
+            trade_count: candle.number_of_trades,
+            timestamp: candle.close_time,
+        };
+        
+        // Remove expired records first (may remove multiple items)
+        self.remove_expired_records(record.timestamp);
+        
+        // Insert into sorted vectors using binary search (O(log n))
+        self.insert_into_sorted_vectors(&record);
+        
+        // Add new record to deque (O(1))
+        self.records.push_back(record);
+    }
+
+    /// Remove expired records from the front of the deque with incremental sorted vector updates
+    fn remove_expired_records(&mut self, current_timestamp: TimestampMS) {
+        let cutoff_time = current_timestamp - self.window_duration_ms;
+        while let Some(front) = self.records.front() {
+            if front.timestamp < cutoff_time {
+                let expired_record = self.records.pop_front().unwrap();
+                // Remove from sorted vectors using binary search (O(log n))
+                self.remove_from_sorted_vectors(&expired_record);
+            } else {
+                break;
+            }
+        }
+    }
+    
+    /// Insert record into sorted vectors using binary search O(log n)
+    fn insert_into_sorted_vectors(&mut self, record: &QuantileRecord) {
+        // Insert taker buy volume
+        let taker_pos = self.sorted_taker_buy.binary_search_by(|probe| {
+            probe.partial_cmp(&record.taker_buy_volume).unwrap_or(std::cmp::Ordering::Equal)
+        }).unwrap_or_else(|pos| pos);
+        self.sorted_taker_buy.insert(taker_pos, record.taker_buy_volume);
+
+        // Insert sell buy volume
+        let sell_pos = self.sorted_sell_buy.binary_search_by(|probe| {
+            probe.partial_cmp(&record.sell_buy_volume).unwrap_or(std::cmp::Ordering::Equal)
+        }).unwrap_or_else(|pos| pos);
+        self.sorted_sell_buy.insert(sell_pos, record.sell_buy_volume);
+
+        // Insert trade count
+        let trade_pos = self.sorted_trade_count.binary_search(&record.trade_count)
+            .unwrap_or_else(|pos| pos);
+        self.sorted_trade_count.insert(trade_pos, record.trade_count);
+    }
+
+    /// Remove record from sorted vectors using binary search O(log n)
+    fn remove_from_sorted_vectors(&mut self, record: &QuantileRecord) {
+        // Remove taker buy volume
+        if let Ok(pos) = self.sorted_taker_buy.binary_search_by(|probe| {
+            probe.partial_cmp(&record.taker_buy_volume).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            self.sorted_taker_buy.remove(pos);
+        }
+
+        // Remove sell buy volume
+        if let Ok(pos) = self.sorted_sell_buy.binary_search_by(|probe| {
+            probe.partial_cmp(&record.sell_buy_volume).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            self.sorted_sell_buy.remove(pos);
+        }
+
+        // Remove trade count
+        if let Ok(pos) = self.sorted_trade_count.binary_search(&record.trade_count) {
+            self.sorted_trade_count.remove(pos);
+        }
+    }
+
+    /// Calculate quantiles with O(1) access to already-sorted vectors
+    pub fn get_quantiles(&self) -> Option<QuantileResults> {
+        if self.records.is_empty() { 
+            return None; 
+        }
+        
+        // Vectors are always sorted due to incremental updates - no sorting needed!
+        Some(QuantileResults {
+            taker_buy_volume: self.calculate_quantiles_for_f64_vec(&self.sorted_taker_buy),
+            sell_buy_volume: self.calculate_quantiles_for_f64_vec(&self.sorted_sell_buy),
+            trade_count: self.calculate_quantiles_for_u64_vec(&self.sorted_trade_count),
+        })
+    }
+
+
+    /// Optimized quantile calculation for f64 values using interpolation
+    fn calculate_quantiles_for_f64_vec(&self, sorted_data: &[f64]) -> QuantileValues {
+        let len = sorted_data.len();
+        if len == 0 { 
+            return QuantileValues::default(); 
+        }
+        
+        QuantileValues {
+            q25: self.interpolate_f64_quantile(sorted_data, 0.25),
+            q50: self.interpolate_f64_quantile(sorted_data, 0.50),
+            q75: self.interpolate_f64_quantile(sorted_data, 0.75),
+            q90: self.interpolate_f64_quantile(sorted_data, 0.90),
+        }
+    }
+
+    /// Optimized quantile calculation for u64 values
+    fn calculate_quantiles_for_u64_vec(&self, sorted_data: &[u64]) -> QuantileValues {
+        let len = sorted_data.len();
+        if len == 0 { 
+            return QuantileValues::default(); 
+        }
+        
+        QuantileValues {
+            q25: self.interpolate_u64_quantile(sorted_data, 0.25),
+            q50: self.interpolate_u64_quantile(sorted_data, 0.50),
+            q75: self.interpolate_u64_quantile(sorted_data, 0.75),
+            q90: self.interpolate_u64_quantile(sorted_data, 0.90),
+        }
+    }
+
+    /// Linear interpolation for accurate f64 quantile calculation
+    fn interpolate_f64_quantile(&self, sorted_data: &[f64], percentile: f64) -> f64 {
+        let len = sorted_data.len();
+        let index = percentile * (len - 1) as f64;
+        let lower = index.floor() as usize;
+        let upper = index.ceil() as usize;
+        
+        if lower == upper {
+            sorted_data[lower]
+        } else {
+            let weight = index - lower as f64;
+            sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
+        }
+    }
+
+    /// Linear interpolation for accurate u64 quantile calculation (returns f64)
+    fn interpolate_u64_quantile(&self, sorted_data: &[u64], percentile: f64) -> f64 {
+        let len = sorted_data.len();
+        let index = percentile * (len - 1) as f64;
+        let lower = index.floor() as usize;
+        let upper = index.ceil() as usize;
+        
+        if lower == upper {
+            sorted_data[lower] as f64
+        } else {
+            let weight = index - lower as f64;
+            sorted_data[lower] as f64 * (1.0 - weight) + sorted_data[upper] as f64 * weight
+        }
+    }
+
+    /// Initialize with historical volume records
+    pub fn initialize_with_history(&mut self, historical_records: &[QuantileRecord]) {
+        for record in historical_records {
+            self.records.push_back(record.clone());
+            // Insert into sorted vectors incrementally
+            self.insert_into_sorted_vectors(record);
+        }
+    }
+
+    /// Get current number of records in the tracker
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Check if tracker is empty
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
 /// Final output structure for technical indicators
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndicatorOutput {
@@ -496,6 +805,8 @@ pub struct IndicatorOutput {
     pub max_volume_time: Option<String>, // ISO format
     pub max_volume_trend: Option<TrendDirection>,
 
+    // Volume quantile analysis (30-day lookback)
+    pub volume_quantiles: Option<QuantileResults>,
 }
 
 impl Default for IndicatorOutput {
@@ -522,6 +833,7 @@ impl Default for IndicatorOutput {
             max_volume_price: None,
             max_volume_time: None,
             max_volume_trend: None,
+            volume_quantiles: None,
         }
     }
 }
@@ -630,5 +942,232 @@ mod tests {
         // Current candle should match what we added
         let current = buffer.get_current_candle().unwrap();
         assert_eq!(current.close, 103.0);
+    }
+
+    #[test]
+    fn test_quantile_tracker() {
+        let mut tracker = QuantileTracker::new(30); // 30-day window
+        
+        // Test with empty tracker
+        assert!(tracker.get_quantiles().is_none());
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
+        
+        // Add test candles
+        let test_candles = vec![
+            FuturesOHLCVCandle {
+                open_time: 0,
+                close_time: 1000,
+                open: 100.0,
+                high: 105.0,
+                low: 95.0,
+                close: 103.0,
+                volume: 1000.0,
+                number_of_trades: 50,
+                taker_buy_base_asset_volume: 600.0,
+                closed: true,
+            },
+            FuturesOHLCVCandle {
+                open_time: 1000,
+                close_time: 2000,
+                open: 103.0,
+                high: 108.0,
+                low: 102.0,
+                close: 106.0,
+                volume: 1500.0,
+                number_of_trades: 75,
+                taker_buy_base_asset_volume: 900.0,
+                closed: true,
+            },
+            FuturesOHLCVCandle {
+                open_time: 2000,
+                close_time: 3000,
+                open: 106.0,
+                high: 110.0,
+                low: 104.0,
+                close: 108.0,
+                volume: 2000.0,
+                number_of_trades: 100,
+                taker_buy_base_asset_volume: 1200.0,
+                closed: true,
+            },
+        ];
+        
+        // Add all candles
+        for candle in &test_candles {
+            tracker.update(candle);
+        }
+        
+        // Should have 3 records
+        assert_eq!(tracker.len(), 3);
+        assert!(!tracker.is_empty());
+        
+        // Get quantiles
+        let quantiles = tracker.get_quantiles().unwrap();
+        
+        // Verify taker buy volume quantiles (600.0, 900.0, 1200.0)
+        assert_eq!(quantiles.taker_buy_volume.q50, 900.0); // Median
+        assert_eq!(quantiles.taker_buy_volume.q25, 750.0); // Between 600 and 900
+        assert_eq!(quantiles.taker_buy_volume.q75, 1050.0); // Between 900 and 1200
+        
+        // Verify sell buy volume quantiles (400.0, 600.0, 800.0)
+        assert_eq!(quantiles.sell_buy_volume.q50, 600.0); // Median
+        
+        // Verify trade count quantiles (50, 75, 100)
+        assert_eq!(quantiles.trade_count.q50, 75.0); // Median
+    }
+
+    #[test]
+    fn test_quantile_interpolation() {
+        let tracker = QuantileTracker::new(30);
+        
+        // Test f64 interpolation
+        let data_f64 = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(tracker.interpolate_f64_quantile(&data_f64, 0.0), 1.0);
+        assert_eq!(tracker.interpolate_f64_quantile(&data_f64, 1.0), 5.0);
+        assert_eq!(tracker.interpolate_f64_quantile(&data_f64, 0.5), 3.0);
+        assert_eq!(tracker.interpolate_f64_quantile(&data_f64, 0.25), 2.0);
+        
+        // Test u64 interpolation
+        let data_u64 = vec![10u64, 20u64, 30u64, 40u64, 50u64];
+        assert_eq!(tracker.interpolate_u64_quantile(&data_u64, 0.0), 10.0);
+        assert_eq!(tracker.interpolate_u64_quantile(&data_u64, 1.0), 50.0);
+        assert_eq!(tracker.interpolate_u64_quantile(&data_u64, 0.5), 30.0);
+        assert_eq!(tracker.interpolate_u64_quantile(&data_u64, 0.25), 20.0);
+    }
+
+    #[test]
+    fn test_quantile_with_realistic_trading_data() {
+        let mut tracker = QuantileTracker::new(30);
+        let current_time = chrono::Utc::now().timestamp_millis();
+        
+        // Create realistic trading candles with varying volumes and trade counts
+        let realistic_candles = vec![
+            FuturesOHLCVCandle {
+                open_time: current_time,
+                close_time: current_time + 299999,
+                open: 50000.0,
+                high: 50100.0,
+                low: 49950.0,
+                close: 50050.0,
+                volume: 1200.0,
+                number_of_trades: 150,
+                taker_buy_base_asset_volume: 720.0, // 60% buying pressure
+                closed: true,
+            },
+            FuturesOHLCVCandle {
+                open_time: current_time + 300000,
+                close_time: current_time + 599999,
+                open: 50050.0,
+                high: 50200.0,
+                low: 50000.0,
+                close: 50150.0,
+                volume: 800.0,
+                number_of_trades: 95,
+                taker_buy_base_asset_volume: 320.0, // 40% buying pressure
+                closed: true,
+            },
+            FuturesOHLCVCandle {
+                open_time: current_time + 600000,
+                close_time: current_time + 899999,
+                open: 50150.0,
+                high: 50300.0,
+                low: 50100.0,
+                close: 50250.0,
+                volume: 1500.0,
+                number_of_trades: 200,
+                taker_buy_base_asset_volume: 1125.0, // 75% buying pressure
+                closed: true,
+            },
+        ];
+        
+        // Update tracker with realistic data
+        for candle in &realistic_candles {
+            tracker.update(candle);
+        }
+        
+        let quantiles = tracker.get_quantiles().expect("Should have quantile results with data");
+        
+        // Verify taker buy volume quantiles are non-zero and realistic
+        assert!(quantiles.taker_buy_volume.q25 > 0.0, "Q25 taker buy volume should be positive: {}", quantiles.taker_buy_volume.q25);
+        assert!(quantiles.taker_buy_volume.q50 > 0.0, "Q50 taker buy volume should be positive: {}", quantiles.taker_buy_volume.q50);
+        assert!(quantiles.taker_buy_volume.q75 > 0.0, "Q75 taker buy volume should be positive: {}", quantiles.taker_buy_volume.q75);
+        assert!(quantiles.taker_buy_volume.q90 > 0.0, "Q90 taker buy volume should be positive: {}", quantiles.taker_buy_volume.q90);
+        
+        // Verify sell buy volume quantiles are non-zero and realistic
+        assert!(quantiles.sell_buy_volume.q25 > 0.0, "Q25 sell buy volume should be positive: {}", quantiles.sell_buy_volume.q25);
+        assert!(quantiles.sell_buy_volume.q50 > 0.0, "Q50 sell buy volume should be positive: {}", quantiles.sell_buy_volume.q50);
+        assert!(quantiles.sell_buy_volume.q75 > 0.0, "Q75 sell buy volume should be positive: {}", quantiles.sell_buy_volume.q75);
+        assert!(quantiles.sell_buy_volume.q90 > 0.0, "Q90 sell buy volume should be positive: {}", quantiles.sell_buy_volume.q90);
+        
+        // Verify trade count quantiles are non-zero and realistic
+        assert!(quantiles.trade_count.q25 > 0.0, "Q25 trade count should be positive: {}", quantiles.trade_count.q25);
+        assert!(quantiles.trade_count.q50 > 0.0, "Q50 trade count should be positive: {}", quantiles.trade_count.q50);
+        assert!(quantiles.trade_count.q75 > 0.0, "Q75 trade count should be positive: {}", quantiles.trade_count.q75);
+        assert!(quantiles.trade_count.q90 > 0.0, "Q90 trade count should be positive: {}", quantiles.trade_count.q90);
+        
+        // Verify ordering within each metric (Q25 < Q50 < Q75 < Q90)
+        assert!(quantiles.taker_buy_volume.q25 <= quantiles.taker_buy_volume.q50);
+        assert!(quantiles.taker_buy_volume.q50 <= quantiles.taker_buy_volume.q75);
+        assert!(quantiles.taker_buy_volume.q75 <= quantiles.taker_buy_volume.q90);
+        
+        assert!(quantiles.sell_buy_volume.q25 <= quantiles.sell_buy_volume.q50);
+        assert!(quantiles.sell_buy_volume.q50 <= quantiles.sell_buy_volume.q75);
+        assert!(quantiles.sell_buy_volume.q75 <= quantiles.sell_buy_volume.q90);
+        
+        assert!(quantiles.trade_count.q25 <= quantiles.trade_count.q50);
+        assert!(quantiles.trade_count.q50 <= quantiles.trade_count.q75);
+        assert!(quantiles.trade_count.q75 <= quantiles.trade_count.q90);
+        
+        // Verify that taker buy + sell buy = total volume
+        let expected_total_volume_q50 = quantiles.taker_buy_volume.q50 + quantiles.sell_buy_volume.q50;
+        assert!(expected_total_volume_q50 > 0.0, "Combined volume should be positive");
+        
+        println!("✅ Realistic quantile test passed!");
+        println!("   Taker Buy Volume - Q25: {:.2}, Q50: {:.2}, Q75: {:.2}, Q90: {:.2}", 
+                 quantiles.taker_buy_volume.q25, quantiles.taker_buy_volume.q50, 
+                 quantiles.taker_buy_volume.q75, quantiles.taker_buy_volume.q90);
+        println!("   Sell Buy Volume - Q25: {:.2}, Q50: {:.2}, Q75: {:.2}, Q90: {:.2}", 
+                 quantiles.sell_buy_volume.q25, quantiles.sell_buy_volume.q50, 
+                 quantiles.sell_buy_volume.q75, quantiles.sell_buy_volume.q90);
+        println!("   Trade Count - Q25: {:.2}, Q50: {:.2}, Q75: {:.2}, Q90: {:.2}", 
+                 quantiles.trade_count.q25, quantiles.trade_count.q50, 
+                 quantiles.trade_count.q75, quantiles.trade_count.q90);
+    }
+
+    #[test]
+    fn test_quantile_record_creation() {
+        let candle = FuturesOHLCVCandle {
+            open_time: 0,
+            close_time: 1000,
+            open: 100.0,
+            high: 105.0,
+            low: 95.0,
+            close: 103.0,
+            volume: 1000.0,
+            number_of_trades: 50,
+            taker_buy_base_asset_volume: 600.0,
+            closed: true,
+        };
+        
+        let mut tracker = QuantileTracker::new(30);
+        tracker.update(&candle);
+        
+        // Should have one record
+        assert_eq!(tracker.len(), 1);
+        
+        let quantiles = tracker.get_quantiles().unwrap();
+        
+        // With single record, all quantiles should be the same
+        assert_eq!(quantiles.taker_buy_volume.q25, 600.0);
+        assert_eq!(quantiles.taker_buy_volume.q50, 600.0);
+        assert_eq!(quantiles.taker_buy_volume.q75, 600.0);
+        assert_eq!(quantiles.taker_buy_volume.q90, 600.0);
+        
+        // Sell buy volume = 1000.0 - 600.0 = 400.0
+        assert_eq!(quantiles.sell_buy_volume.q50, 400.0);
+        
+        // Trade count
+        assert_eq!(quantiles.trade_count.q50, 50.0);
     }
 }

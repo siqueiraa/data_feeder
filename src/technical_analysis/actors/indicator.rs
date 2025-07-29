@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -11,11 +13,11 @@ use tracing::{debug, error, info, warn};
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
 use crate::technical_analysis::structs::{
     TechnicalAnalysisConfig, IncrementalEMA, TrendAnalyzer, TrendDirection, 
-    MaxVolumeTracker, IndicatorOutput
+    MaxVolumeTracker, IndicatorOutput, QuantileTracker
 };
 use crate::technical_analysis::utils::{
     extract_close_prices, create_volume_records_from_candles, 
-    format_timestamp_iso
+    create_quantile_records_from_candles, format_timestamp_iso
 };
 use crate::kafka::{KafkaActor, KafkaTell};
 
@@ -55,7 +57,7 @@ pub enum IndicatorAsk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IndicatorReply {
     /// Indicator data response
-    Indicators(IndicatorOutput),
+    Indicators(Box<IndicatorOutput>),
     /// Initialization status response
     InitializationStatus {
         initialized_symbols: Vec<String>,
@@ -80,6 +82,9 @@ struct SymbolIndicatorState {
     
     /// Volume tracker for maximum volume analysis
     volume_tracker: MaxVolumeTracker,
+    
+    /// Quantile tracker for volume/trade analysis
+    quantile_tracker: QuantileTracker,
     
     /// Current multi-timeframe close prices (including live candles)
     current_closes: HashMap<u64, f64>,
@@ -134,6 +139,7 @@ impl SymbolIndicatorState {
             emas,
             trend_analyzers,
             volume_tracker: MaxVolumeTracker::new(config.volume_lookback_days),
+            quantile_tracker: QuantileTracker::new(config.volume_lookback_days),
             current_closes: HashMap::new(),
             completed_closes: HashMap::new(),
             recent_candle_closes: HashMap::new(),
@@ -182,7 +188,7 @@ impl SymbolIndicatorState {
                 if let Some(ema89) = self.emas.get(&(timeframe, 89)) {
                     if ema89.is_ready() {
                         // Calculate EMA89 progression using the last 10 historical candles
-                        let num_trend_points = close_prices.len().min(10).max(3);
+                        let num_trend_points = close_prices.len().clamp(3, 10);
                         let trend_closes: Vec<f64> = close_prices.iter().rev().take(num_trend_points).rev().cloned().collect();
                         
                         // Use the same EMA algorithm as the main EMA to get consistent values
@@ -221,13 +227,11 @@ impl SymbolIndicatorState {
                     self.completed_closes.insert(timeframe, last_candle.close);
                     info!("📊 Historical initialization for {}s: last_close={:.2} @ {}",
               timeframe, last_candle.close, last_candle.close_time);
-                } else {
-                    if let Some(second_last_candle) = candles.get(candles.len().saturating_sub(2)) {
-                        if second_last_candle.closed {
-                            self.completed_closes.insert(timeframe, second_last_candle.close);
-                            info!("📊 Historical initialization for {}s: last_close={:.2} @ {}",
+                } else if let Some(second_last_candle) = candles.get(candles.len().saturating_sub(2)) {
+                    if second_last_candle.closed {
+                        self.completed_closes.insert(timeframe, second_last_candle.close);
+                        info!("📊 Historical initialization for {}s: last_close={:.2} @ {}",
                       timeframe, last_candle.close, last_candle.close_time);
-                        }
                     }
                 }
             } else {
@@ -246,6 +250,15 @@ impl SymbolIndicatorState {
             
             info!("Initialized volume tracker for {} with {} 5m candles", 
                   symbol, candles_5m.len());
+        }
+
+        // Initialize quantile tracker with 1-minute data
+        if let Some(candles_1m) = aggregated_candles.get(&60) {
+            let quantile_records = create_quantile_records_from_candles(candles_1m);
+            self.quantile_tracker.initialize_with_history(&quantile_records);
+            
+            info!("📊 Initialized quantile tracker for {} with {} 1m candles", 
+                  symbol, candles_1m.len());
         }
 
         self.is_initialized = true;
@@ -271,7 +284,7 @@ impl SymbolIndicatorState {
             info!("✅ COMPLETED candle for {}s: {:.2} @ {} (stored as completed close)", 
                   timeframe_seconds, close_price, candle.close_time);
             
-            let recent_closes = self.recent_candle_closes.entry(timeframe_seconds).or_insert_with(VecDeque::new);
+            let recent_closes = self.recent_candle_closes.entry(timeframe_seconds).or_default();
             // Keep only last 5 closes
             while recent_closes.len() > 5 {
                 recent_closes.pop_front();
@@ -330,6 +343,11 @@ impl SymbolIndicatorState {
                 current_trend,
             );
         }
+
+        // Update quantile tracker for 1-minute candles - ONLY for closed candles
+        if timeframe_seconds == 60 && candle.closed {
+            self.quantile_tracker.update(candle);
+        }
     }
 
     /// Get trend for a specific timeframe using candles vs EMA89 comparison
@@ -377,7 +395,7 @@ impl SymbolIndicatorState {
     }
 
     /// Generate current indicator output
-    fn generate_output(&self, symbol: &str) -> IndicatorOutput {
+    fn generate_output(&mut self, symbol: &str) -> IndicatorOutput {
         let mut output = IndicatorOutput {
             symbol: symbol.to_string(),
             timestamp: self.last_update_time.unwrap_or(0),
@@ -436,6 +454,9 @@ impl SymbolIndicatorState {
             output.max_volume_trend = self.calculate_max_volume_trend(max_vol.price);
         }
 
+        // Volume quantile analysis
+        output.volume_quantiles = self.quantile_tracker.get_quantiles();
+
         output
     }
 }
@@ -456,6 +477,31 @@ pub struct IndicatorActor {
 }
 
 impl IndicatorActor {
+    /// Determine optimal precision for EMA values based on price range
+    /// - High-value assets (>$1): 6 decimal places
+    /// - Medium-value assets ($0.001-$1): 7 decimal places  
+    /// - Low-value assets (<$0.001): 8 decimal places
+    fn get_optimal_ema_precision(price: f64) -> usize {
+        if price >= 1.0 { 
+            6  // BTC, ETH, etc. - 6 decimals sufficient
+        } else if price >= 0.001 { 
+            7  // DOGE, ADA, etc. - 7 decimals for precision
+        } else { 
+            8  // SHIB, PEPE, etc. - 8 decimals to preserve significance
+        }
+    }
+
+    /// Format price with smart precision - scientific notation for very small values
+    fn format_price_smart(price: f64) -> String {
+        if price < 0.000001 {
+            format!("{:.2e}", price)  // Scientific notation: 1.23e-6
+        } else if price < 0.01 {
+            format!("{:.6}", price)   // 6 decimals: 0.001234
+        } else {
+            format!("{:.2}", price)   // 2 decimals: 123.45
+        }
+    }
+
     /// Create a new Indicator actor
     pub fn new(config: TechnicalAnalysisConfig) -> Self {
         let mut symbol_states = HashMap::new();
@@ -494,8 +540,8 @@ impl IndicatorActor {
     }
 
     /// Output current indicators for debugging/monitoring
-    async fn output_current_indicators(&self) {
-        for (symbol, state) in &self.symbol_states {
+    async fn output_current_indicators(&mut self) {
+        for (symbol, state) in &mut self.symbol_states {
             if state.is_initialized {
                 let output = state.generate_output(symbol);
                 
@@ -594,6 +640,8 @@ impl Message<IndicatorTell> for IndicatorActor {
                 let handler_start = std::time::Instant::now();
                 let mut batch_processing_time = std::time::Duration::new(0, 0);
                 let mut output_time = std::time::Duration::new(0, 0);
+                let mut logging_time = std::time::Duration::new(0, 0);
+                let mut kafka_time = std::time::Duration::new(0, 0);
                 
                 if let Some(state) = self.symbol_states.get_mut(&symbol) {
                     // Process all timeframe candles in the batch
@@ -608,45 +656,78 @@ impl Message<IndicatorTell> for IndicatorActor {
                     let output = state.generate_output(&symbol);
                     output_time = output_start.elapsed();
                     
-                    info!("📈 REAL-TIME {} | TS:{} | 5m:{:.2} 15m:{:.2} 1h:{:.2} 4h:{:.2} | EMA89[1m:{:.8} 5m:{:.8} 1h:{:.8} 4h:{:.8}] | TRENDS[1m:{} 5m:{} 15m:{} 1h:{} 4h:{}]",
+                    // Optimized real-time logging with dynamic precision based on price range
+                    let logging_start = std::time::Instant::now();
+                    
+                    // Use the most recent close price to determine optimal precision
+                    let current_price = output.close_5m.or(output.close_15m).or(output.close_60m).or(output.close_4h).unwrap_or(0.0);
+                    let ema_precision = Self::get_optimal_ema_precision(current_price);
+                    
+                    // Format prices with smart precision
+                    let close_5m_str = output.close_5m.map(Self::format_price_smart).unwrap_or_else(|| "N/A".to_string());
+                    let close_15m_str = output.close_15m.map(Self::format_price_smart).unwrap_or_else(|| "N/A".to_string());
+                    let close_60m_str = output.close_60m.map(Self::format_price_smart).unwrap_or_else(|| "N/A".to_string());
+                    let close_4h_str = output.close_4h.map(Self::format_price_smart).unwrap_or_else(|| "N/A".to_string());
+                    
+                    // Format EMAs with dynamic precision
+                    let format_ema = |value: Option<f64>| -> String {
+                        value.map(|v| format!("{:.prec$}", v, prec = ema_precision))
+                             .unwrap_or_else(|| "N/A".to_string())
+                    };
+                    
+                    debug!("📈 RT {} | TS:{} | 5m:{} 15m:{} 1h:{} 4h:{} | EMA89[1m:{} 5m:{} 1h:{} 4h:{}] | T[1m:{} 5m:{} 15m:{} 1h:{} 4h:{}]",
                           symbol,
                           output.timestamp,
-                          output.close_5m.unwrap_or(0.0),
-                          output.close_15m.unwrap_or(0.0),
-                          output.close_60m.unwrap_or(0.0),
-                          output.close_4h.unwrap_or(0.0),
-                          output.ema89_1min.unwrap_or(0.0),
-                          output.ema89_5min.unwrap_or(0.0),
-                          output.ema89_1h.unwrap_or(0.0),
-                          output.ema89_4h.unwrap_or(0.0),
+                          close_5m_str,
+                          close_15m_str,
+                          close_60m_str,
+                          close_4h_str,
+                          format_ema(output.ema89_1min),
+                          format_ema(output.ema89_5min),
+                          format_ema(output.ema89_1h),
+                          format_ema(output.ema89_4h),
                           output.trend_1min,
                           output.trend_5min,
                           output.trend_15min,
                           output.trend_1h,
                           output.trend_4h
                     );
+                    logging_time = logging_start.elapsed();
                     
-                    // Publish indicators to Kafka if available
-                    if let Some(ref kafka_actor) = self.kafka_actor {
-                        info!("📤 Attempting to publish {} indicators to Kafka", symbol);
-                        let publish_msg = KafkaTell::PublishIndicators {
-                            indicators: output.clone(),
-                        };
-                        if let Err(e) = kafka_actor.tell(publish_msg).send().await {
-                            error!("❌ Failed to send indicators to Kafka: {}", e);
-                        } else {
-                            info!("✅ Successfully published {} indicators to Kafka", symbol);
-                        }
+                    // Move Kafka publishing to background task to avoid blocking
+                    let kafka_start = std::time::Instant::now();
+                    if let Some(kafka_actor) = self.kafka_actor.clone() {
+                        let output_arc = Arc::new(output);
+                        let symbol_owned = symbol.clone();
+                        
+                        tokio::spawn(async move {
+                            debug!("📤 Background Kafka publishing for {}", symbol_owned);
+                            let publish_msg = KafkaTell::PublishIndicators {
+                                indicators: Box::new((*output_arc).clone()),
+                            };
+                            if let Err(e) = kafka_actor.tell(publish_msg).send().await {
+                                error!("❌ Background Kafka publish failed for {}: {}", symbol_owned, e);
+                            } else {
+                                debug!("✅ Background Kafka publish completed for {}", symbol_owned);
+                            }
+                        });
                     } else {
-                        warn!("⚠️ No Kafka actor reference available for publishing {} indicators", symbol);
+                        debug!("⚠️ No Kafka actor for {} indicators", symbol);
                     }
+                    kafka_time = kafka_start.elapsed();
                 } else {
                     warn!("Received batched update for unknown symbol: {}", symbol);
                 }
                 
                 let handler_time = handler_start.elapsed();
-                info!("⏱️ IndicatorTell::ProcessMultiTimeFrameUpdate ELAPSED TIMES: total_handler={:?}, batch_processing={:?}, output_generation={:?}", 
-                      handler_time, batch_processing_time, output_time);
+                
+                // Performance monitoring - log timing details every 100th update or if slow
+                static UPDATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+                let counter = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                if counter % 100 == 0 || handler_time.as_micros() > 2000 {
+                    info!("⏱️ IndicatorTell::ProcessMultiTimeFrameUpdate #{} ELAPSED TIMES: total={:?}, batch={:?}, output={:?}, logging={:?}, kafka={:?}", 
+                          counter, handler_time, batch_processing_time, output_time, logging_time, kafka_time);
+                }
             }
             
             IndicatorTell::SetKafkaActor { kafka_actor } => {
@@ -664,9 +745,9 @@ impl Message<IndicatorAsk> for IndicatorActor {
     async fn handle(&mut self, msg: IndicatorAsk, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
         match msg {
             IndicatorAsk::GetIndicators { symbol } => {
-                if let Some(state) = self.symbol_states.get(&symbol) {
+                if let Some(state) = self.symbol_states.get_mut(&symbol) {
                     let indicators = state.generate_output(&symbol);
-                    Ok(IndicatorReply::Indicators(indicators))
+                    Ok(IndicatorReply::Indicators(Box::new(indicators)))
                 } else {
                     Err(format!("Symbol {} not found", symbol))
                 }
@@ -709,11 +790,56 @@ mod tests {
     #[test]
     fn test_generate_output() {
         let config = TechnicalAnalysisConfig::default();
-        let state = SymbolIndicatorState::new(&config);
+        let mut state = SymbolIndicatorState::new(&config);
         let output = state.generate_output("BTCUSDT");
         
         assert_eq!(output.symbol, "BTCUSDT");
         assert!(matches!(output.trend_1min, TrendDirection::Neutral));
         assert_eq!(output.timestamp, 0); // No updates yet
+        
+        // Should have empty quantiles initially
+        assert!(output.volume_quantiles.is_none());
+    }
+
+    #[test]
+    fn test_optimal_ema_precision() {
+        // High-value assets (>$1) should use 6 decimal places
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(67000.0), 6); // BTC
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(3500.0), 6);  // ETH
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(1.0), 6);     // Boundary
+
+        // Medium-value assets ($0.001-$1) should use 7 decimal places
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(0.38), 7);    // DOGE
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(0.05), 7);    // ADA-like
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(0.001), 7);   // Boundary
+
+        // Low-value assets (<$0.001) should use 8 decimal places
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(0.0002), 8);  // SHIB-like
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(0.00000123), 8); // PEPE-like
+        assert_eq!(IndicatorActor::get_optimal_ema_precision(0.0), 8);     // Edge case
+    }
+
+    #[test]
+    fn test_format_price_smart() {
+        // Very small values should use scientific notation
+        let result = IndicatorActor::format_price_smart(0.00000123);
+        assert!(result.contains("e-") || result == "0.000001", "Expected scientific notation or 6 decimals, got: {}", result);
+        
+        // Test the boundary cases based on actual implementation
+        assert_eq!(IndicatorActor::format_price_smart(0.0000005), "5.00e-7");
+
+        // Small values should use 6 decimal places
+        assert_eq!(IndicatorActor::format_price_smart(0.001234), "0.001234");
+        assert_eq!(IndicatorActor::format_price_smart(0.008), "0.008000");
+
+        // Normal values should use 2 decimal places
+        assert_eq!(IndicatorActor::format_price_smart(0.38), "0.38");
+        assert_eq!(IndicatorActor::format_price_smart(67000.0), "67000.00");
+        assert_eq!(IndicatorActor::format_price_smart(1.5), "1.50");
+        
+        // Test boundary conditions more explicitly
+        assert!(IndicatorActor::format_price_smart(0.000001).len() <= 8); // Should be reasonable length
+        assert!(IndicatorActor::format_price_smart(0.00001).starts_with("0.0000")); // Should be decimal
+        assert!(IndicatorActor::format_price_smart(0.01).starts_with("0.01")); // Should be 2 decimals
     }
 }

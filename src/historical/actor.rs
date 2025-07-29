@@ -62,6 +62,55 @@ impl HistoricalActor {
         self.lmdb_actor = Some(lmdb_actor);
     }
 
+    /// Non-blocking cleanup of CSV files - spawns a background task
+    fn cleanup_csv_files_non_blocking(&self) {
+        let csv_path = self.csv_path.clone();
+        tokio::spawn(async move {
+            info!("🧹 Starting non-blocking CSV cleanup in directory: {}", csv_path.display());
+            
+            let mut csv_count = 0;
+            let mut checksum_count = 0;
+            let mut zip_count = 0;
+            
+            if let Ok(mut entries) = tokio::fs::read_dir(&csv_path).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if let Some(extension) = path.extension() {
+                        match extension.to_str() {
+                            Some("csv") => {
+                                if let Err(e) = tokio::fs::remove_file(&path).await {
+                                    warn!("Failed to delete CSV file {}: {}", path.display(), e);
+                                } else {
+                                    csv_count += 1;
+                                }
+                            }
+                            Some("CHECKSUM") => {
+                                if let Err(e) = tokio::fs::remove_file(&path).await {
+                                    warn!("Failed to delete checksum file {}: {}", path.display(), e);
+                                } else {
+                                    checksum_count += 1;
+                                }
+                            }
+                            Some("zip") => {
+                                // Also clean up any leftover zip files
+                                if let Err(e) = tokio::fs::remove_file(&path).await {
+                                    warn!("Failed to delete ZIP file {}: {}", path.display(), e);
+                                } else {
+                                    zip_count += 1;
+                                }
+                            }
+                            _ => {} // Ignore other file types
+                        }
+                    }
+                }
+                info!("✅ CSV cleanup complete: deleted {} CSV files, {} checksum files, and {} ZIP files", 
+                      csv_count, checksum_count, zip_count);
+            } else {
+                warn!("Could not read CSV directory: {}", csv_path.display());
+            }
+        });
+    }
+
     async fn get_certified_range(&self, _symbol: &str, _timeframe: Seconds) -> Result<Option<TimeRange>, HistoricalDataError> {
         // This will be implemented using the LmdbActor once we have certified range support in messages
         // For now, return None to maintain compatibility
@@ -272,8 +321,9 @@ impl HistoricalActor {
                                 prev_candle.close(),
                                 prev_candle.close(),
                                 prev_candle.close(),
-                                0.0,
-                                current_time,
+                                0.0, // No volume in gap filler
+                                0, // No trades in gap filler
+                                0.0, // No taker buy volume in gap filler
                                 true,
                             );
                             filled_candles.push(filler_candle);
@@ -446,6 +496,10 @@ impl HistoricalActor {
                 info!("✅ Updated certified range for symbol {}, timeframe {}s", symbol, tf);
             }
         }
+
+        // Cleanup CSV files non-blocking after successful trade processing
+        info!("🧹 Triggering CSV cleanup after successful trade processing");
+        self.cleanup_csv_files_non_blocking();
 
         let smallest_tf = *timeframes.iter().min().unwrap_or(&60);
         let final_candles = final_candles_by_timeframe
@@ -837,6 +891,10 @@ impl HistoricalActor {
 
             self.set_certified_range(symbol, timeframe, TimeRange { start: candle_start, end: candle_end }).await?;
             info!("✅ Stored {} {} klines and updated certified range", all_candles.len(), data_type);
+            
+            // Cleanup CSV files non-blocking after successful processing
+            info!("🧹 Triggering CSV cleanup after successful {} processing", data_type);
+            self.cleanup_csv_files_non_blocking();
         }
 
         Ok(all_candles)

@@ -1,96 +1,13 @@
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
-use crate::technical_analysis::structs::{VolumeRecord, TrendDirection};
-use heed::{Database};
-use heed::types::{SerdeBincode, Str};
-use std::path::PathBuf;
+use crate::technical_analysis::structs::{VolumeRecord, TrendDirection, QuantileRecord};
 use tracing::{debug, info, warn};
 use kameo::actor::ActorRef;
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
-use crate::common::lmdb_config::open_lmdb_environment;
-use crate::common::constants::CANDLES_DB_NAME;
 
-/// Load recent candles from LMDB for initialization
-/// Returns candles sorted by close_time (oldest first)
-pub async fn load_recent_candles_from_db(
-    symbol: &str,
-    timeframe_seconds: u64,
-    lookback_days: u32,
-    base_path: &PathBuf,
-    reference_timestamp: Option<i64>,
-) -> Result<Vec<FuturesOHLCVCandle>, Box<dyn std::error::Error + Send + Sync>> {
-    let db_name = format!("{}_{}", symbol, timeframe_seconds);
-    let db_path = base_path.join(db_name);
-
-    if !db_path.exists() {
-        warn!("Database path does not exist: {}", db_path.display());
-        return Ok(Vec::new());
-    }
-
-    // Use shared LMDB configuration to prevent "environment already opened with different options" errors
-    let env = open_lmdb_environment(&db_path)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-    let rtxn = env.read_txn()?;
-    let candle_db: Database<Str, SerdeBincode<FuturesOHLCVCandle>> = 
-        env.open_database(&rtxn, Some(CANDLES_DB_NAME))?.ok_or("Candles database not found")?;
-    
-    // Calculate cutoff time for lookback period using provided reference timestamp or current time
-    let now = reference_timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-    let cutoff_time = now - (lookback_days as i64 * 24 * 3600 * 1000);
-    
-    if reference_timestamp.is_some() {
-        info!("🕐 TA loading using SYNCHRONIZED timestamp: {} (cutoff: {})", now, cutoff_time);
-    } else {
-        info!("🕐 TA loading using current timestamp: {} (cutoff: {})", now, cutoff_time);
-    }
-    
-    // Add human-readable timestamp debugging for TA loading
-    let now_str = chrono::DateTime::from_timestamp_millis(now)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| format!("INVALID_TIME({})", now));
-    let cutoff_str = chrono::DateTime::from_timestamp_millis(cutoff_time)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| format!("INVALID_TIME({})", cutoff_time));
-    info!("🕐 Human-readable TA loading: {} back to {} ({} days)", now_str, cutoff_str, lookback_days);
-
-    let mut candles = Vec::new();
-    let iter = candle_db.iter(&rtxn)?;
-
-    for result in iter {
-        let (key, candle) = result?;
-        
-        // Parse timestamp from key format: "timeframe:timestamp"
-        if let Some(timestamp_str) = key.split(':').nth(1) {
-            if let Ok(timestamp) = timestamp_str.parse::<i64>() {
-                if timestamp >= cutoff_time {
-                    candles.push(candle);
-                }
-            }
-        }
-    }
-
-    // Sort by close_time (oldest first)
-    candles.sort_by_key(|c| c.close_time);
-
-    if !candles.is_empty() {
-        let first_time = candles[0].open_time;
-        let last_time = candles[candles.len()-1].close_time;
-        debug!("Loaded {} recent candles for {} {}s (last {} days): {} to {}", 
-              candles.len(), symbol, timeframe_seconds, lookback_days, first_time, last_time);
-              
-        // Debug the time range to understand boundary issues
-        let time_span_hours = (last_time - first_time) / (1000 * 3600);
-        debug!("📊 Historical data spans {} hours ({:.1} days)", time_span_hours, time_span_hours as f64 / 24.0);
-    } else {
-        info!("Loaded 0 candles for {} {}s (last {} days)", symbol, timeframe_seconds, lookback_days);
-    }
-
-    Ok(candles)
-}
 
 /// Load recent candles from LMDB using LmdbActor (prevents environment conflicts)
 /// Returns candles sorted by close_time (oldest first)
-pub async fn load_recent_candles_via_actor(
+pub async fn load_recent_candles_from_db(
     symbol: &str,
     timeframe_seconds: u64,
     lookback_days: u32,
@@ -422,6 +339,21 @@ pub fn create_volume_records_from_candles(
     }).collect()
 }
 
+/// Create quantile records from 5-minute candles for quantile analysis initialization
+pub fn create_quantile_records_from_candles(
+    candles_5m: &[FuturesOHLCVCandle],
+) -> Vec<QuantileRecord> {
+    candles_5m.iter().map(|candle| {
+        let sell_buy_volume = candle.volume - candle.taker_buy_base_asset_volume;
+        QuantileRecord {
+            taker_buy_volume: candle.taker_buy_base_asset_volume,
+            sell_buy_volume,
+            trade_count: candle.number_of_trades,
+            timestamp: candle.close_time,
+        }
+    }).collect()
+}
+
 /// Calculate timeframe string for logging
 pub fn timeframe_to_string(timeframe_seconds: u64) -> String {
     match timeframe_seconds {
@@ -437,7 +369,7 @@ pub fn timeframe_to_string(timeframe_seconds: u64) -> String {
 /// Format timestamp to ISO string for output
 pub fn format_timestamp_iso(timestamp_ms: TimestampMS) -> String {
     let datetime = chrono::DateTime::from_timestamp_millis(timestamp_ms)
-        .unwrap_or_else(|| chrono::Utc::now());
+        .unwrap_or_else(chrono::Utc::now);
     datetime.to_rfc3339()
 }
 

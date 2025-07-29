@@ -256,7 +256,7 @@ impl WebSocketActor {
     async fn add_to_batch(&mut self, symbol: &str, candle: &SharedCandle, is_closed: bool) -> Result<(), WebSocketError> {
         // Add to batch queue and determine if we should process
         let (should_process, batch_len, total_pending) = {
-            let mut batch = self.pending_batch_candles.entry(symbol.to_string()).or_insert_with(Vec::new);
+            let mut batch = self.pending_batch_candles.entry(symbol.to_string()).or_default();
             batch.push((Arc::clone(candle), is_closed));
             
             let total_pending: usize = self.pending_batch_candles.iter().map(|entry| entry.value().len()).sum();
@@ -543,22 +543,17 @@ impl WebSocketActor {
         }
     }
 
-    /// Get the number of initialized database environments (for testing)
-    #[cfg(test)]
-    pub fn env_count(&self) -> usize {
-        self.envs.len()
-    }
-
-    /// Get the number of initialized candle databases (for testing)
-    #[cfg(test)]
-    pub fn candle_db_count(&self) -> usize {
-        self.candle_dbs.len()
-    }
 
     /// Get the number of symbols with recent candles cache (for testing)
     #[cfg(test)]
     pub fn recent_candles_count(&self) -> usize {
         self.recent_candles.len()
+    }
+
+    /// Check if LmdbActor is set (for testing)
+    #[cfg(test)]
+    pub fn has_lmdb_actor(&self) -> bool {
+        self.lmdb_actor.is_some()
     }
 }
 
@@ -859,9 +854,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
         
-        assert_eq!(actor.envs.len(), 0);
-        assert_eq!(actor.candle_dbs.len(), 0);
+        // Test that actor is created with empty cache and no LmdbActor reference initially
         assert_eq!(actor.recent_candles.len(), 0);
+        assert!(!actor.has_lmdb_actor());
     }
 
     #[tokio::test]
@@ -913,8 +908,8 @@ mod tests {
         let result = actor.init_symbol_db("BTCUSDT");
         assert!(result.is_ok());
         
-        assert!(actor.envs.contains_key("BTCUSDT"));
-        assert!(actor.candle_dbs.contains_key("BTCUSDT"));
+        // With new architecture, only the recent candles cache is initialized immediately
+        // LMDB initialization happens in background via LmdbActor
         assert!(actor.recent_candles.contains_key("BTCUSDT"));
     }
 

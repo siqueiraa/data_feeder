@@ -259,9 +259,9 @@ mod actor_tests {
         let temp_dir = TempDir::new().unwrap();
         let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
         
-        assert_eq!(actor.env_count(), 0);
-        assert_eq!(actor.candle_db_count(), 0);
+        // Test that actor starts with empty recent candles cache and no LmdbActor
         assert_eq!(actor.recent_candles_count(), 0);
+        assert!(!actor.has_lmdb_actor());
     }
 
     #[tokio::test]

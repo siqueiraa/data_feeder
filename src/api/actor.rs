@@ -357,13 +357,8 @@ impl Message<ApiAsk> for ApiActor {
             }
             ApiAsk::GetDataRange { symbol, interval } => {
                 let timeframe_seconds = self.interval_to_seconds(&interval);
-                
-                // Initialize database if needed
-                if let Err(e) = self.init_database(&symbol, &interval).await {
-                    return Ok(ApiReply::Error(format!("Failed to initialize database: {}", e)));
-                }
 
-                // Get data range from LmdbActor
+                // Get data range from LmdbActor (will initialize if needed through ensure_database_initialized)
                 let msg = LmdbActorMessage::GetDataRange {
                     symbol: symbol.clone(),
                     timeframe: timeframe_seconds,

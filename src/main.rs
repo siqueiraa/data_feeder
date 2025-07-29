@@ -203,6 +203,7 @@ DataFeederConfig {
 }
 */
 
+
 /// Parse human-readable datetime string to timestamp in milliseconds
 fn parse_start_date(date_str: &str) -> Result<i64, String> {
     chrono::DateTime::parse_from_rfc3339(date_str)
@@ -212,6 +213,7 @@ fn parse_start_date(date_str: &str) -> Result<i64, String> {
 
 /// Simplified gap detection using LmdbActor
 /// Delegates gap detection to LmdbActor and assigns gaps to optimal actors
+#[allow(clippy::too_many_arguments)]
 async fn detect_and_fill_gaps(
     symbol: &str, 
     timeframe_seconds: u64,
@@ -753,7 +755,7 @@ async fn launch_ta_actors(
     
     // Create timeframe actor and set its dependencies
     let timeframe_actor = {
-        let mut actor = TimeFrameActor::new(config.ta_config.clone(), config.storage_path.clone());
+        let mut actor = TimeFrameActor::new(config.ta_config.clone());
         actor.set_indicator_actor(indicator_actor.clone());
         actor.set_api_actor(api_actor.clone());
         actor.set_lmdb_actor(lmdb_actor.clone());

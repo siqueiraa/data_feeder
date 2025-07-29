@@ -200,7 +200,7 @@ impl BinanceKlinesClient {
             .and_then(|s| s.parse::<u32>().ok());
 
         let requests_limit = headers.get("x-mbx-used-weight-1m")
-            .and_then(|_| Some(1200u32)); // Binance Futures limit
+            .map(|_| 1200u32); // Binance Futures limit
 
         let retry_after = headers.get("retry-after")
             .and_then(|h| h.to_str().ok())

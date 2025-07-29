@@ -27,7 +27,8 @@ impl FuturesOHLCVCandle {
         low: f64,
         close: f64,
         volume: f64,
-        _timestamp: TimestampMS, // This is a dummy argument for compatibility
+        number_of_trades: u64,
+        taker_buy_base_asset_volume: f64,
         closed: bool,
     ) -> Self {
         Self {
@@ -38,8 +39,8 @@ impl FuturesOHLCVCandle {
             low,
             close,
             volume,
-            number_of_trades: 0,
-            taker_buy_base_asset_volume: 0.0,
+            number_of_trades,
+            taker_buy_base_asset_volume,
             closed,
         }
     }
