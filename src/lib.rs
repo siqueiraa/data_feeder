@@ -7,3 +7,5 @@ pub mod kafka;
 pub mod common;
 pub mod health;
 pub mod lmdb;
+pub mod metrics;
+pub mod metrics_server;

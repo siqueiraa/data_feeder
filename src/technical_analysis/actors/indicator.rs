@@ -10,6 +10,8 @@ use kameo::{Actor, mailbox::unbounded::UnboundedMailbox};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
+use crate::{record_indicator_timing, record_memory_pool_hit};
+
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
 use crate::technical_analysis::structs::{
     TechnicalAnalysisConfig, IncrementalEMA, TrendAnalyzer, TrendDirection, 
@@ -111,11 +113,17 @@ impl SymbolIndicatorState {
         
         // Initialize EMAs for all timeframe/period combinations
         for tf_idx in 0..TIMEFRAME_COUNT {
-            let _timeframe_seconds = TimeFrameIndex::from_index(tf_idx).to_seconds();
+            // Safe unwrap: tf_idx is guaranteed to be valid (0..TIMEFRAME_COUNT)
+            let _timeframe_seconds = TimeFrameIndex::from_index(tf_idx)
+                .expect("tf_idx is within valid range")
+                .to_seconds();
             
             // Initialize EMAs for this timeframe
             for period_idx in 0..EMA_PERIOD_COUNT {
-                let period = EmaPeriodIndex::from_index(period_idx).to_period();
+                // Safe unwrap: period_idx is guaranteed to be valid (0..EMA_PERIOD_COUNT)
+                let period = EmaPeriodIndex::from_index(period_idx)
+                    .expect("period_idx is within valid range")
+                    .to_period();
                 emas[tf_idx][period_idx] = Some(IncrementalEMA::new(period));
             }
             
@@ -381,12 +389,19 @@ impl SymbolIndicatorState {
         // But keep the closed check as a safety net for historical compatibility
         if candle.closed {
             // MEMORY POOL: Use direct array access instead of iterator to avoid allocation
+            record_memory_pool_hit!("ema_periods", "indicator_actor");
             for &period in &[21, 89] {
                 if let Some(ema) = self.get_ema_mut(timeframe_seconds, period) {
                     let new_ema = ema.update(close_price);
                     if let Some(ema_val) = new_ema {
                         debug!("📊 Updated EMA{} for {}s: {:.8} (from close: {:.2})", 
                                period, timeframe_seconds, ema_val, close_price);
+                        // Record EMA calculation for metrics
+                        if let Some(metrics) = crate::metrics::get_metrics() {
+                            metrics.ema_calculations_total
+                                .with_label_values(&["unknown", &timeframe_seconds.to_string(), &period.to_string()])
+                                .inc();
+                        }
                     }
                 }
             }
@@ -430,6 +445,10 @@ impl SymbolIndicatorState {
         // Update quantile tracker for 1-minute candles - ONLY for closed candles
         if timeframe_seconds == 60 && candle.closed {
             self.quantile_tracker.update(candle);
+            // Record T-Digest update for metrics
+            if let Some(metrics) = crate::metrics::get_metrics() {
+                metrics.record_t_digest_update("unknown", "volume_quantiles");
+            }
         }
     }
 
@@ -810,6 +829,13 @@ impl Message<IndicatorTell> for IndicatorActor {
                 // Performance monitoring - log timing details every 100th update or if slow
                 static UPDATE_COUNTER: AtomicU64 = AtomicU64::new(0);
                 let counter = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                
+                // Record Prometheus metrics for performance monitoring
+                record_indicator_timing!(&symbol, "batch_processing", batch_processing_time.as_secs_f64());
+                record_indicator_timing!(&symbol, "output_generation", output_time.as_secs_f64());
+                record_indicator_timing!(&symbol, "kafka_publish", kafka_time.as_secs_f64());
+                record_indicator_timing!(&symbol, "total_processing", handler_time.as_secs_f64());
+                
                 if counter % 100 == 0 || handler_time.as_micros() > 2000 {
                     info!("⏱️ IndicatorTell::ProcessMultiTimeFrameUpdate #{} ELAPSED TIMES: total={:?}, batch={:?}, output={:?}, logging={:?}, kafka={:?}", 
                           counter, handler_time, batch_processing_time, output_time, logging_time, kafka_time);

@@ -5,6 +5,15 @@ use tracing::debug;
 use tdigest::TDigest;
 use crate::technical_analysis::simd_math;
 
+/// Error type for index conversion failures
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum IndexConversionError {
+    #[error("Invalid TimeFrameIndex: {0}")]
+    InvalidTimeFrameIndex(usize),
+    #[error("Invalid EmaPeriodIndex: {0}")]
+    InvalidEmaPeriodIndex(usize),
+}
+
 /// Fixed timeframe indices for array-based access (O(1) instead of HashMap O(log n))
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -50,14 +59,14 @@ impl TimeFrameIndex {
     
     /// Convert array index to TimeFrameIndex
     #[inline(always)]
-    pub fn from_index(index: usize) -> Self {
+    pub fn from_index(index: usize) -> Result<Self, IndexConversionError> {
         match index {
-            0 => Self::OneMin,
-            1 => Self::FiveMin,
-            2 => Self::FifteenMin,
-            3 => Self::OneHour,
-            4 => Self::FourHour,
-            _ => panic!("Invalid TimeFrameIndex: {}", index),
+            0 => Ok(Self::OneMin),
+            1 => Ok(Self::FiveMin),
+            2 => Ok(Self::FifteenMin),
+            3 => Ok(Self::OneHour),
+            4 => Ok(Self::FourHour),
+            _ => Err(IndexConversionError::InvalidTimeFrameIndex(index)),
         }
     }
 }
@@ -98,11 +107,11 @@ impl EmaPeriodIndex {
     
     /// Convert array index to EmaPeriodIndex
     #[inline(always)]
-    pub fn from_index(index: usize) -> Self {
+    pub fn from_index(index: usize) -> Result<Self, IndexConversionError> {
         match index {
-            0 => Self::Ema21,
-            1 => Self::Ema89,
-            _ => panic!("Invalid EmaPeriodIndex: {}", index),
+            0 => Ok(Self::Ema21),
+            1 => Ok(Self::Ema89),
+            _ => Err(IndexConversionError::InvalidEmaPeriodIndex(index)),
         }
     }
 }
@@ -1183,22 +1192,39 @@ mod tests {
     }
 
     #[test]
-    fn test_quantile_interpolation() {
-        let tracker = QuantileTracker::new(30);
+    fn test_quantile_tracker_basic_functionality() {
+        let mut tracker = QuantileTracker::new(30);
         
-        // Test f64 interpolation
-        let data_f64 = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        assert_eq!(tracker.interpolate_f64_quantile(&data_f64, 0.0), 1.0);
-        assert_eq!(tracker.interpolate_f64_quantile(&data_f64, 1.0), 5.0);
-        assert_eq!(tracker.interpolate_f64_quantile(&data_f64, 0.5), 3.0);
-        assert_eq!(tracker.interpolate_f64_quantile(&data_f64, 0.25), 2.0);
+        // Test that new tracker returns None (no data)
+        assert!(tracker.get_quantiles().is_none());
         
-        // Test u64 interpolation
-        let data_u64 = vec![10u64, 20u64, 30u64, 40u64, 50u64];
-        assert_eq!(tracker.interpolate_u64_quantile(&data_u64, 0.0), 10.0);
-        assert_eq!(tracker.interpolate_u64_quantile(&data_u64, 1.0), 50.0);
-        assert_eq!(tracker.interpolate_u64_quantile(&data_u64, 0.5), 30.0);
-        assert_eq!(tracker.interpolate_u64_quantile(&data_u64, 0.25), 20.0);
+        // Add some test data
+        let test_candle = FuturesOHLCVCandle {
+            open: 100.0,
+            high: 105.0,
+            low: 95.0,
+            close: 102.0,
+            volume: 1000.0,
+            close_time: 1640995200000, // 2022-01-01
+            open_time: 1640995140000,
+            taker_buy_base_asset_volume: 600.0,
+            number_of_trades: 150,
+            closed: true,
+        };
+        
+        // Add data to tracker
+        tracker.update(&test_candle);
+        
+        // Should now have quantile results
+        let quantiles = tracker.get_quantiles();
+        assert!(quantiles.is_some());
+        
+        let q = quantiles.unwrap();
+        // Basic validation that quantiles exist and are reasonable
+        assert!(q.volume.q50 > 0.0);
+        assert!(q.volume.q25 <= q.volume.q50);
+        assert!(q.volume.q50 <= q.volume.q75);
+        assert!(q.volume.q75 <= q.volume.q90);
     }
 
     #[test]
