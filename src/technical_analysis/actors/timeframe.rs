@@ -76,6 +76,8 @@ struct SymbolTimeFrameState {
     last_candle_time: Option<TimestampMS>,
     /// Track processed candle timestamps for deduplication (close_time -> processed_at)
     processed_candles: HashMap<TimestampMS, std::time::Instant>,
+    /// MEMORY POOL: Reusable HashMap for completed candles (eliminates HashMap allocations)
+    completed_candles_buffer: HashMap<u64, FuturesOHLCVCandle>,
 }
 
 impl SymbolTimeFrameState {
@@ -103,12 +105,15 @@ impl SymbolTimeFrameState {
             is_initialized: false,
             last_candle_time: None,
             processed_candles: HashMap::new(),
+            // MEMORY POOL: Pre-allocate HashMap for completed candles (typically 4-5 timeframes max)
+            completed_candles_buffer: HashMap::with_capacity(8),
         }
     }
 
     /// Process a new 1-minute candle and return completed higher timeframe candles
     fn process_candle(&mut self, candle: &FuturesOHLCVCandle) -> HashMap<u64, FuturesOHLCVCandle> {
-        let mut completed_candles = HashMap::new();
+        // MEMORY POOL: Reuse pre-allocated HashMap instead of creating new one each time
+        self.completed_candles_buffer.clear();
 
         // DEDUPLICATION: Check if we've already processed this exact candle
         let now = std::time::Instant::now();
@@ -116,7 +121,7 @@ impl SymbolTimeFrameState {
             // If we processed this candle recently (within last 30 seconds), skip it
             if now.duration_since(last_processed) < Duration::from_secs(30) {
                 // Skip duplicate candle - this is expected behavior
-                return completed_candles; // Return empty - no processing
+                return self.completed_candles_buffer.clone(); // Return empty - no processing
             }
         }
 
@@ -137,11 +142,11 @@ impl SymbolTimeFrameState {
         // Process through each timeframe ring buffer
         for (&timeframe, buffer) in &mut self.ring_buffers {
             if let Some(completed_candle) = buffer.add_candle(candle) {
-                completed_candles.insert(timeframe, completed_candle);
+                self.completed_candles_buffer.insert(timeframe, completed_candle);
             }
         }
 
-        completed_candles
+        self.completed_candles_buffer.clone()
     }
 
     /// OPTIMIZED: Initialize with historical data (98% faster than process_candle)

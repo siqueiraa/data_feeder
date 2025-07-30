@@ -2,6 +2,8 @@ pub mod actors;
 pub mod structs; 
 pub mod indicators;
 pub mod utils;
+pub mod simd_math;
+pub mod fast_serialization;
 
 // Re-export commonly used types for convenience
 pub use structs::{

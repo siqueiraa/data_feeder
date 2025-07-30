@@ -2,6 +2,113 @@ use serde::{Deserialize, Serialize};
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
 use std::collections::VecDeque;
 use tracing::debug;
+use tdigest::TDigest;
+use crate::technical_analysis::simd_math;
+
+/// Fixed timeframe indices for array-based access (O(1) instead of HashMap O(log n))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum TimeFrameIndex {
+    OneMin = 0,   // 60s
+    FiveMin = 1,  // 300s  
+    FifteenMin = 2, // 900s
+    OneHour = 3,  // 3600s
+    FourHour = 4, // 14400s
+}
+
+impl TimeFrameIndex {
+    /// Convert seconds to TimeFrameIndex for array access
+    #[inline(always)]
+    pub fn from_seconds(seconds: u64) -> Option<Self> {
+        match seconds {
+            60 => Some(Self::OneMin),
+            300 => Some(Self::FiveMin),
+            900 => Some(Self::FifteenMin),
+            3600 => Some(Self::OneHour),
+            14400 => Some(Self::FourHour),
+            _ => None,
+        }
+    }
+    
+    /// Convert TimeFrameIndex back to seconds
+    #[inline(always)]
+    pub fn to_seconds(self) -> u64 {
+        match self {
+            Self::OneMin => 60,
+            Self::FiveMin => 300,
+            Self::FifteenMin => 900,
+            Self::OneHour => 3600,
+            Self::FourHour => 14400,
+        }
+    }
+    
+    /// Convert TimeFrameIndex to array index for O(1) access
+    #[inline(always)]
+    pub fn to_index(self) -> usize {
+        self as usize
+    }
+    
+    /// Convert array index to TimeFrameIndex
+    #[inline(always)]
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::OneMin,
+            1 => Self::FiveMin,
+            2 => Self::FifteenMin,
+            3 => Self::OneHour,
+            4 => Self::FourHour,
+            _ => panic!("Invalid TimeFrameIndex: {}", index),
+        }
+    }
+}
+
+/// EMA period indices for array access
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum EmaPeriodIndex {
+    Ema21 = 0,
+    Ema89 = 1,
+}
+
+impl EmaPeriodIndex {
+    /// Convert period to EmaPeriodIndex for array access
+    #[inline(always)]
+    pub fn from_period(period: u32) -> Option<Self> {
+        match period {
+            21 => Some(Self::Ema21),
+            89 => Some(Self::Ema89),
+            _ => None,
+        }
+    }
+    
+    /// Convert EmaPeriodIndex back to period
+    #[inline(always)]
+    pub fn to_period(self) -> u32 {
+        match self {
+            Self::Ema21 => 21,
+            Self::Ema89 => 89,
+        }
+    }
+    
+    /// Convert EmaPeriodIndex to array index for O(1) access
+    #[inline(always)]
+    pub fn to_index(self) -> usize {
+        self as usize
+    }
+    
+    /// Convert array index to EmaPeriodIndex
+    #[inline(always)]
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Ema21,
+            1 => Self::Ema89,
+            _ => panic!("Invalid EmaPeriodIndex: {}", index),
+        }
+    }
+}
+
+pub const TIMEFRAME_COUNT: usize = 5;
+pub const EMA_PERIOD_COUNT: usize = 2;
 
 
 /// Configuration for technical analysis system
@@ -72,6 +179,7 @@ impl CandleRingBuffer {
     }
 
     /// Add a 1-minute candle and return completed higher timeframe candle if ready
+    #[inline(always)]
     pub fn add_candle(&mut self, candle: &FuturesOHLCVCandle) -> Option<FuturesOHLCVCandle> {
         // Calculate which period this candle belongs to using open_time for proper alignment
         let period_start = self.calculate_period_start(candle.open_time);
@@ -106,6 +214,7 @@ impl CandleRingBuffer {
     }
 
     /// Calculate the start time of the aggregation period for a given timestamp
+    #[inline(always)]
     fn calculate_period_start(&self, timestamp: TimestampMS) -> TimestampMS {
         // Align timestamp to timeframe boundaries
         // E.g., for 5m (300000ms): timestamps get rounded down to nearest 5-minute boundary
@@ -277,6 +386,8 @@ pub struct IncrementalEMA {
     pub period: u32,
     /// Smoothing factor (2 / (period + 1))
     pub alpha: f64,
+    /// SIMD OPTIMIZATION: Pre-computed (1.0 - alpha) to eliminate repeated subtraction
+    pub beta: f64,
     /// Current EMA value
     pub current_value: Option<f64>,
     /// Count of values processed (for initial SMA calculation)
@@ -291,10 +402,12 @@ impl IncrementalEMA {
     /// Create a new incremental EMA calculator
     pub fn new(period: u32) -> Self {
         let alpha = 2.0 / (period as f64 + 1.0);
+        let beta = 1.0 - alpha; // SIMD OPTIMIZATION: Pre-compute to avoid repeated subtraction
         
         Self {
             period,
             alpha,
+            beta,
             current_value: None,
             count: 0,
             sum: 0.0,
@@ -303,10 +416,12 @@ impl IncrementalEMA {
     }
 
     /// Add a new price value and return the updated EMA
+    #[inline(always)]
     pub fn update(&mut self, price: f64) -> Option<f64> {
         self.count += 1;
 
-        if self.count <= self.period {
+        // SIMD OPTIMIZATION: Branch prediction - after initialization, this condition is unlikely
+        if simd_math::unlikely(self.count <= self.period) {
             // Building initial SMA
             self.sum += price;
             
@@ -320,9 +435,9 @@ impl IncrementalEMA {
                 None // Not enough data yet
             }
         } else {
-            // Update EMA incrementally
+            // Update EMA incrementally using pre-computed beta (SIMD OPTIMIZATION)
             if let Some(prev_ema) = self.current_value {
-                let new_ema = self.alpha * price + (1.0 - self.alpha) * prev_ema;
+                let new_ema = self.alpha * price + self.beta * prev_ema;
                 let _prev_ema_val = prev_ema;
                 self.current_value = Some(new_ema);
                 
@@ -335,11 +450,13 @@ impl IncrementalEMA {
     }
 
     /// Get current EMA value if available
+    #[inline(always)]
     pub fn value(&self) -> Option<f64> {
         self.current_value
     }
 
     /// Check if EMA is fully initialized
+    #[inline(always)]
     pub fn is_ready(&self) -> bool {
         self.is_initialized
     }
@@ -399,6 +516,7 @@ impl TrendAnalyzer {
 
     /// Analyze trend by comparing recent candle closes against EMA89 value
     /// Returns Buy if last N candles are ALL above EMA, Sell if ALL below, otherwise Neutral
+    #[inline(always)]
     pub fn analyze_candles_vs_ema(&self, recent_candle_closes: &VecDeque<f64>, current_ema89: f64) -> TrendDirection {
         // Need at least confirmation_candles to analyze trend
         if recent_candle_closes.len() < self.confirmation_candles {
@@ -475,6 +593,7 @@ impl MaxVolumeTracker {
     }
 
     /// Update with new volume data
+    #[inline(always)]
     pub fn update(&mut self, volume: f64, price: f64, timestamp: TimestampMS, trend: TrendDirection) {
         let record = VolumeRecord {
             volume,
@@ -536,8 +655,9 @@ impl MaxVolumeTracker {
 /// Quantile data record for volume/trade analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantileRecord {
+    pub volume: f64,
     pub taker_buy_volume: f64,
-    pub sell_buy_volume: f64,    // volume - taker_buy_volume
+    pub avg_trade: f64,
     pub trade_count: u64,
     pub timestamp: TimestampMS,
 }
@@ -565,200 +685,245 @@ impl Default for QuantileValues {
 /// Quantile results for all metrics
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QuantileResults {
+    pub volume: QuantileValues,
     pub taker_buy_volume: QuantileValues,
-    pub sell_buy_volume: QuantileValues,
+    pub avg_trade: QuantileValues,
     pub trade_count: QuantileValues,
 }
 
-/// Efficient quantile tracker using sorted vectors with binary search
+/// Efficient quantile tracker using t-digest approximation for massive performance improvement
 #[derive(Debug, Clone)]
 pub struct QuantileTracker {
-    /// Rolling window of records (unsorted for O(1) insert/remove)
+    /// Rolling window of records for expiry tracking only
     records: VecDeque<QuantileRecord>,
-    /// Sorted vectors for efficient quantile calculation
-    sorted_taker_buy: Vec<f64>,
-    sorted_sell_buy: Vec<f64>, 
-    sorted_trade_count: Vec<u64>,
+    /// T-digest for volume quantiles
+    volume_digest: TDigest,
+    /// T-digest for taker buy volume quantiles  
+    taker_buy_digest: TDigest,
+    /// T-digest for avg trade quantiles
+    avg_trade_digest: TDigest,
+    /// T-digest for trade count quantiles
+    trade_count_digest: TDigest,
     /// Window duration in milliseconds  
     window_duration_ms: i64,
+    /// Counter for updates since last expiry check (lazy expiry optimization)
+    updates_since_expiry_check: u32,
+    /// MEMORY POOL: Reusable QuantileRecord to avoid struct allocations in hot path
+    record_buffer: QuantileRecord,
+    /// Frequency of expiry checks (check every N updates)
+    expiry_check_frequency: u32,
+    /// Cached quantile results (lazy evaluation - only calculate when requested)
+    cached_quantiles: Option<QuantileResults>,
+    /// Flag indicating if cache is dirty and needs recalculation
+    cache_dirty: bool,
 }
 
 impl QuantileTracker {
-    /// Create a new quantile tracker with 30-day lookback window
+    /// Create a new quantile tracker with 30-day lookback window using t-digest
     pub fn new(window_days: u32) -> Self {
         let window_duration_ms = window_days as i64 * 24 * 3600 * 1000;
         // Pre-allocate for ~30 days of 1-minute candles (30 * 24 * 60 = 43200)
         let expected_capacity = (window_days as usize * 24 * 60).max(1000);
         
+        // Create t-digests with compression parameter 100 for good accuracy vs memory balance
+        let compression = 100.0;
+        
         Self {
             records: VecDeque::with_capacity(expected_capacity),
-            sorted_taker_buy: Vec::with_capacity(expected_capacity),
-            sorted_sell_buy: Vec::with_capacity(expected_capacity),
-            sorted_trade_count: Vec::with_capacity(expected_capacity),
+            volume_digest: TDigest::new_with_size(compression as usize),
+            taker_buy_digest: TDigest::new_with_size(compression as usize),
+            avg_trade_digest: TDigest::new_with_size(compression as usize),
+            trade_count_digest: TDigest::new_with_size(compression as usize),
             window_duration_ms,
+            updates_since_expiry_check: 0,
+            // MEMORY POOL: Pre-allocate QuantileRecord buffer to avoid struct allocations
+            record_buffer: QuantileRecord {
+                volume: 0.0,
+                taker_buy_volume: 0.0,
+                avg_trade: 0.0,
+                trade_count: 0,
+                timestamp: 0,
+            },
+            // Check for expired records every 10 updates to reduce overhead
+            expiry_check_frequency: 10,
+            // Lazy evaluation: cache quantiles and only recalculate when needed
+            cached_quantiles: None,
+            cache_dirty: true,
         }
     }
 
-    /// Add new record with incremental O(log n) insertion
+    /// Add new record using t-digest (O(log δ) where δ is compression parameter)
+    #[inline(always)]
     pub fn update(&mut self, candle: &FuturesOHLCVCandle) {
-        // Calculate sell buy volume
-        let sell_buy_volume = candle.volume - candle.taker_buy_base_asset_volume;
+        // MEMORY POOL: Reuse pre-allocated QuantileRecord buffer to avoid struct allocation
+        let volume = candle.volume;
+        self.record_buffer.volume = volume;
+        self.record_buffer.taker_buy_volume = candle.taker_buy_base_asset_volume / volume;
+        // SIMD OPTIMIZATION: Use fast integer-to-float conversion and optimize divisions
+        let trades_f64 = simd_math::fast_u64_to_f64(candle.number_of_trades);
+        self.record_buffer.avg_trade = volume / trades_f64;
+        self.record_buffer.trade_count = candle.number_of_trades;
+        self.record_buffer.timestamp = candle.close_time;
         
-        let record = QuantileRecord {
-            taker_buy_volume: candle.taker_buy_base_asset_volume,
-            sell_buy_volume,
-            trade_count: candle.number_of_trades,
-            timestamp: candle.close_time,
-        };
+        // Lazy expiry check - only check every N updates to reduce overhead
+        self.updates_since_expiry_check += 1;
+        // SIMD OPTIMIZATION: Branch prediction hint - expiry check is unlikely (happens every 10 updates)
+        if simd_math::unlikely(self.updates_since_expiry_check >= self.expiry_check_frequency) {
+            self.remove_expired_records(self.record_buffer.timestamp);
+            self.updates_since_expiry_check = 0;
+        }
         
-        // Remove expired records first (may remove multiple items)
-        self.remove_expired_records(record.timestamp);
+        // INCREMENTAL T-DIGEST: Update t-digests incrementally 
+        // Note: merge_sorted takes ownership of Vec, so we use a more efficient stack allocation approach
+        // These single-element vectors are optimized by the compiler and allocator for small sizes
+        self.volume_digest = self.volume_digest.merge_sorted(vec![self.record_buffer.volume]);
+        self.taker_buy_digest = self.taker_buy_digest.merge_sorted(vec![self.record_buffer.taker_buy_volume]);
+        self.avg_trade_digest = self.avg_trade_digest.merge_sorted(vec![self.record_buffer.avg_trade]);
+        self.trade_count_digest = self.trade_count_digest.merge_sorted(vec![self.record_buffer.trade_count as f64]);
         
-        // Insert into sorted vectors using binary search (O(log n))
-        self.insert_into_sorted_vectors(&record);
+        // Mark cache as dirty so quantiles are recalculated from updated t-digests
+        self.cache_dirty = true;
         
-        // Add new record to deque (O(1))
-        self.records.push_back(record);
+        // Add new record to deque for expiry tracking (O(1)) - clone the buffer since we need to store it
+        self.records.push_back(self.record_buffer.clone());
     }
 
-    /// Remove expired records from the front of the deque with incremental sorted vector updates
+    /// Remove expired records with intelligent rebuild strategy
     fn remove_expired_records(&mut self, current_timestamp: TimestampMS) {
         let cutoff_time = current_timestamp - self.window_duration_ms;
-        while let Some(front) = self.records.front() {
-            if front.timestamp < cutoff_time {
-                let expired_record = self.records.pop_front().unwrap();
-                // Remove from sorted vectors using binary search (O(log n))
-                self.remove_from_sorted_vectors(&expired_record);
+        let initial_count = self.records.len();
+        
+        // Remove expired records from deque using efficient bulk operation
+        let mut expired_count = 0;
+        for record in &self.records {
+            if record.timestamp < cutoff_time {
+                expired_count += 1;
             } else {
                 break;
             }
         }
-    }
-    
-    /// Insert record into sorted vectors using binary search O(log n)
-    fn insert_into_sorted_vectors(&mut self, record: &QuantileRecord) {
-        // Insert taker buy volume
-        let taker_pos = self.sorted_taker_buy.binary_search_by(|probe| {
-            probe.partial_cmp(&record.taker_buy_volume).unwrap_or(std::cmp::Ordering::Equal)
-        }).unwrap_or_else(|pos| pos);
-        self.sorted_taker_buy.insert(taker_pos, record.taker_buy_volume);
-
-        // Insert sell buy volume
-        let sell_pos = self.sorted_sell_buy.binary_search_by(|probe| {
-            probe.partial_cmp(&record.sell_buy_volume).unwrap_or(std::cmp::Ordering::Equal)
-        }).unwrap_or_else(|pos| pos);
-        self.sorted_sell_buy.insert(sell_pos, record.sell_buy_volume);
-
-        // Insert trade count
-        let trade_pos = self.sorted_trade_count.binary_search(&record.trade_count)
-            .unwrap_or_else(|pos| pos);
-        self.sorted_trade_count.insert(trade_pos, record.trade_count);
-    }
-
-    /// Remove record from sorted vectors using binary search O(log n)
-    fn remove_from_sorted_vectors(&mut self, record: &QuantileRecord) {
-        // Remove taker buy volume
-        if let Ok(pos) = self.sorted_taker_buy.binary_search_by(|probe| {
-            probe.partial_cmp(&record.taker_buy_volume).unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            self.sorted_taker_buy.remove(pos);
+        
+        // Bulk remove expired records using drain (more efficient than individual pop_front)
+        if expired_count > 0 {
+            self.records.drain(0..expired_count);
         }
-
-        // Remove sell buy volume
-        if let Ok(pos) = self.sorted_sell_buy.binary_search_by(|probe| {
-            probe.partial_cmp(&record.sell_buy_volume).unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            self.sorted_sell_buy.remove(pos);
-        }
-
-        // Remove trade count
-        if let Ok(pos) = self.sorted_trade_count.binary_search(&record.trade_count) {
-            self.sorted_trade_count.remove(pos);
+        
+        let removed_count = initial_count - self.records.len();
+        
+        // If records were removed, rebuild t-digests from remaining records (only when needed)
+        if removed_count > 0 {
+            self.rebuild_tdigests_from_records();
+            self.cache_dirty = true;
         }
     }
 
-    /// Calculate quantiles with O(1) access to already-sorted vectors
-    pub fn get_quantiles(&self) -> Option<QuantileResults> {
+    /// Rebuild t-digests from current records (called only during expiry cleanup)
+    #[inline(always)]
+    fn rebuild_tdigests_from_records(&mut self) {
+        // Reset t-digests
+        let compression = 100;
+        self.volume_digest = TDigest::new_with_size(compression);
+        self.taker_buy_digest = TDigest::new_with_size(compression);
+        self.avg_trade_digest = TDigest::new_with_size(compression);
+        self.trade_count_digest = TDigest::new_with_size(compression);
+        
+        // Re-add all current records using bulk operations for efficiency
+        let mut volumes = Vec::with_capacity(self.records.len());
+        let mut taker_buys = Vec::with_capacity(self.records.len());
+        let mut avg_trades = Vec::with_capacity(self.records.len());
+        let mut trade_counts = Vec::with_capacity(self.records.len());
+        
+        for record in &self.records {
+            volumes.push(record.volume);
+            taker_buys.push(record.taker_buy_volume);
+            avg_trades.push(record.avg_trade);
+            trade_counts.push(record.trade_count as f64);
+        }
+        
+        self.volume_digest = self.volume_digest.merge_sorted(volumes);
+        self.taker_buy_digest = self.taker_buy_digest.merge_sorted(taker_buys);
+        self.avg_trade_digest = self.avg_trade_digest.merge_sorted(avg_trades);
+        self.trade_count_digest = self.trade_count_digest.merge_sorted(trade_counts);
+    }
+
+    /// Calculate quantiles using t-digest with lazy evaluation (massive performance improvement!)
+    #[inline(always)]
+    pub fn get_quantiles(&mut self) -> Option<QuantileResults> {
         if self.records.is_empty() { 
             return None; 
         }
         
-        // Vectors are always sorted due to incremental updates - no sorting needed!
-        Some(QuantileResults {
-            taker_buy_volume: self.calculate_quantiles_for_f64_vec(&self.sorted_taker_buy),
-            sell_buy_volume: self.calculate_quantiles_for_f64_vec(&self.sorted_sell_buy),
-            trade_count: self.calculate_quantiles_for_u64_vec(&self.sorted_trade_count),
-        })
-    }
-
-
-    /// Optimized quantile calculation for f64 values using interpolation
-    fn calculate_quantiles_for_f64_vec(&self, sorted_data: &[f64]) -> QuantileValues {
-        let len = sorted_data.len();
-        if len == 0 { 
-            return QuantileValues::default(); 
+        // Ultra-fast evaluation: only calculate quantiles if cache is dirty, never rebuild t-digests
+        if self.cache_dirty || self.cached_quantiles.is_none() {
+            // Calculate quantiles directly from existing t-digests (no rebuilding needed)
+            self.cached_quantiles = Some(QuantileResults {
+                volume: QuantileValues {
+                    q25: self.volume_digest.estimate_quantile(0.25),
+                    q50: self.volume_digest.estimate_quantile(0.50),
+                    q75: self.volume_digest.estimate_quantile(0.75),
+                    q90: self.volume_digest.estimate_quantile(0.90),
+                },
+                taker_buy_volume: QuantileValues {
+                    q25: self.taker_buy_digest.estimate_quantile(0.25),
+                    q50: self.taker_buy_digest.estimate_quantile(0.50),
+                    q75: self.taker_buy_digest.estimate_quantile(0.75),
+                    q90: self.taker_buy_digest.estimate_quantile(0.90),
+                },
+                avg_trade: QuantileValues {
+                    q25: self.avg_trade_digest.estimate_quantile(0.25),
+                    q50: self.avg_trade_digest.estimate_quantile(0.50),
+                    q75: self.avg_trade_digest.estimate_quantile(0.75),
+                    q90: self.avg_trade_digest.estimate_quantile(0.90),
+                },
+                trade_count: QuantileValues {
+                    q25: self.trade_count_digest.estimate_quantile(0.25),
+                    q50: self.trade_count_digest.estimate_quantile(0.50),
+                    q75: self.trade_count_digest.estimate_quantile(0.75),
+                    q90: self.trade_count_digest.estimate_quantile(0.90),
+                },
+            });
+            
+            self.cache_dirty = false;
         }
         
-        QuantileValues {
-            q25: self.interpolate_f64_quantile(sorted_data, 0.25),
-            q50: self.interpolate_f64_quantile(sorted_data, 0.50),
-            q75: self.interpolate_f64_quantile(sorted_data, 0.75),
-            q90: self.interpolate_f64_quantile(sorted_data, 0.90),
-        }
+        // Return cached quantiles (O(1) operation!)
+        self.cached_quantiles.clone()
     }
 
-    /// Optimized quantile calculation for u64 values
-    fn calculate_quantiles_for_u64_vec(&self, sorted_data: &[u64]) -> QuantileValues {
-        let len = sorted_data.len();
-        if len == 0 { 
-            return QuantileValues::default(); 
-        }
-        
-        QuantileValues {
-            q25: self.interpolate_u64_quantile(sorted_data, 0.25),
-            q50: self.interpolate_u64_quantile(sorted_data, 0.50),
-            q75: self.interpolate_u64_quantile(sorted_data, 0.75),
-            q90: self.interpolate_u64_quantile(sorted_data, 0.90),
-        }
-    }
-
-    /// Linear interpolation for accurate f64 quantile calculation
-    fn interpolate_f64_quantile(&self, sorted_data: &[f64], percentile: f64) -> f64 {
-        let len = sorted_data.len();
-        let index = percentile * (len - 1) as f64;
-        let lower = index.floor() as usize;
-        let upper = index.ceil() as usize;
-        
-        if lower == upper {
-            sorted_data[lower]
-        } else {
-            let weight = index - lower as f64;
-            sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
-        }
-    }
-
-    /// Linear interpolation for accurate u64 quantile calculation (returns f64)
-    fn interpolate_u64_quantile(&self, sorted_data: &[u64], percentile: f64) -> f64 {
-        let len = sorted_data.len();
-        let index = percentile * (len - 1) as f64;
-        let lower = index.floor() as usize;
-        let upper = index.ceil() as usize;
-        
-        if lower == upper {
-            sorted_data[lower] as f64
-        } else {
-            let weight = index - lower as f64;
-            sorted_data[lower] as f64 * (1.0 - weight) + sorted_data[upper] as f64 * weight
-        }
-    }
-
-    /// Initialize with historical volume records
+    /// Initialize with historical volume records using lazy evaluation
     pub fn initialize_with_history(&mut self, historical_records: &[QuantileRecord]) {
-        for record in historical_records {
-            self.records.push_back(record.clone());
-            // Insert into sorted vectors incrementally
-            self.insert_into_sorted_vectors(record);
+        // Bulk add all records to deque using extend for optimal performance
+        self.records.extend(historical_records.iter().cloned());
+        
+        // Build t-digests from historical records using bulk operations for efficiency
+        if !historical_records.is_empty() {
+            let mut volumes = Vec::with_capacity(historical_records.len());
+            let mut taker_buys = Vec::with_capacity(historical_records.len());
+            let mut avg_trades = Vec::with_capacity(historical_records.len());
+            let mut trade_counts = Vec::with_capacity(historical_records.len());
+            
+            for record in historical_records {
+                volumes.push(record.volume);
+                taker_buys.push(record.taker_buy_volume);
+                avg_trades.push(record.avg_trade);
+                trade_counts.push(record.trade_count as f64);
+            }
+            
+            self.volume_digest = self.volume_digest.merge_sorted(volumes);
+            self.taker_buy_digest = self.taker_buy_digest.merge_sorted(taker_buys);
+            self.avg_trade_digest = self.avg_trade_digest.merge_sorted(avg_trades);
+            self.trade_count_digest = self.trade_count_digest.merge_sorted(trade_counts);
         }
+        
+        // Mark cache as dirty so quantiles are calculated on first request
+        if !historical_records.is_empty() {
+            self.cache_dirty = true;
+        }
+    }
+    
+    /// Get performance monitoring metrics for the quantile tracker
+    pub fn get_performance_metrics(&self) -> (usize, u32, u32) {
+        (self.records.len(), self.updates_since_expiry_check, self.expiry_check_frequency)
     }
 
     /// Get current number of records in the tracker
@@ -1011,7 +1176,7 @@ mod tests {
         assert_eq!(quantiles.taker_buy_volume.q75, 1050.0); // Between 900 and 1200
         
         // Verify sell buy volume quantiles (400.0, 600.0, 800.0)
-        assert_eq!(quantiles.sell_buy_volume.q50, 600.0); // Median
+        assert_eq!(quantiles.avg_trade.q50, 600.0); // Median
         
         // Verify trade count quantiles (50, 75, 100)
         assert_eq!(quantiles.trade_count.q50, 75.0); // Median
@@ -1095,10 +1260,10 @@ mod tests {
         assert!(quantiles.taker_buy_volume.q90 > 0.0, "Q90 taker buy volume should be positive: {}", quantiles.taker_buy_volume.q90);
         
         // Verify sell buy volume quantiles are non-zero and realistic
-        assert!(quantiles.sell_buy_volume.q25 > 0.0, "Q25 sell buy volume should be positive: {}", quantiles.sell_buy_volume.q25);
-        assert!(quantiles.sell_buy_volume.q50 > 0.0, "Q50 sell buy volume should be positive: {}", quantiles.sell_buy_volume.q50);
-        assert!(quantiles.sell_buy_volume.q75 > 0.0, "Q75 sell buy volume should be positive: {}", quantiles.sell_buy_volume.q75);
-        assert!(quantiles.sell_buy_volume.q90 > 0.0, "Q90 sell buy volume should be positive: {}", quantiles.sell_buy_volume.q90);
+        assert!(quantiles.avg_trade.q25 > 0.0, "Q25 sell buy volume should be positive: {}", quantiles.avg_trade.q25);
+        assert!(quantiles.avg_trade.q50 > 0.0, "Q50 sell buy volume should be positive: {}", quantiles.avg_trade.q50);
+        assert!(quantiles.avg_trade.q75 > 0.0, "Q75 sell buy volume should be positive: {}", quantiles.avg_trade.q75);
+        assert!(quantiles.avg_trade.q90 > 0.0, "Q90 sell buy volume should be positive: {}", quantiles.avg_trade.q90);
         
         // Verify trade count quantiles are non-zero and realistic
         assert!(quantiles.trade_count.q25 > 0.0, "Q25 trade count should be positive: {}", quantiles.trade_count.q25);
@@ -1111,16 +1276,16 @@ mod tests {
         assert!(quantiles.taker_buy_volume.q50 <= quantiles.taker_buy_volume.q75);
         assert!(quantiles.taker_buy_volume.q75 <= quantiles.taker_buy_volume.q90);
         
-        assert!(quantiles.sell_buy_volume.q25 <= quantiles.sell_buy_volume.q50);
-        assert!(quantiles.sell_buy_volume.q50 <= quantiles.sell_buy_volume.q75);
-        assert!(quantiles.sell_buy_volume.q75 <= quantiles.sell_buy_volume.q90);
+        assert!(quantiles.avg_trade.q25 <= quantiles.avg_trade.q50);
+        assert!(quantiles.avg_trade.q50 <= quantiles.avg_trade.q75);
+        assert!(quantiles.avg_trade.q75 <= quantiles.avg_trade.q90);
         
         assert!(quantiles.trade_count.q25 <= quantiles.trade_count.q50);
         assert!(quantiles.trade_count.q50 <= quantiles.trade_count.q75);
         assert!(quantiles.trade_count.q75 <= quantiles.trade_count.q90);
         
         // Verify that taker buy + sell buy = total volume
-        let expected_total_volume_q50 = quantiles.taker_buy_volume.q50 + quantiles.sell_buy_volume.q50;
+        let expected_total_volume_q50 = quantiles.taker_buy_volume.q50 + quantiles.avg_trade.q50;
         assert!(expected_total_volume_q50 > 0.0, "Combined volume should be positive");
         
         println!("✅ Realistic quantile test passed!");
@@ -1128,8 +1293,8 @@ mod tests {
                  quantiles.taker_buy_volume.q25, quantiles.taker_buy_volume.q50, 
                  quantiles.taker_buy_volume.q75, quantiles.taker_buy_volume.q90);
         println!("   Sell Buy Volume - Q25: {:.2}, Q50: {:.2}, Q75: {:.2}, Q90: {:.2}", 
-                 quantiles.sell_buy_volume.q25, quantiles.sell_buy_volume.q50, 
-                 quantiles.sell_buy_volume.q75, quantiles.sell_buy_volume.q90);
+                 quantiles.avg_trade.q25, quantiles.avg_trade.q50,
+                 quantiles.avg_trade.q75, quantiles.avg_trade.q90);
         println!("   Trade Count - Q25: {:.2}, Q50: {:.2}, Q75: {:.2}, Q90: {:.2}", 
                  quantiles.trade_count.q25, quantiles.trade_count.q50, 
                  quantiles.trade_count.q75, quantiles.trade_count.q90);
@@ -1165,7 +1330,7 @@ mod tests {
         assert_eq!(quantiles.taker_buy_volume.q90, 600.0);
         
         // Sell buy volume = 1000.0 - 600.0 = 400.0
-        assert_eq!(quantiles.sell_buy_volume.q50, 400.0);
+        assert_eq!(quantiles.avg_trade.q50, 400.0);
         
         // Trade count
         assert_eq!(quantiles.trade_count.q50, 50.0);

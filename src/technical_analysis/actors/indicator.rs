@@ -13,7 +13,8 @@ use tracing::{debug, error, info, warn};
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
 use crate::technical_analysis::structs::{
     TechnicalAnalysisConfig, IncrementalEMA, TrendAnalyzer, TrendDirection, 
-    MaxVolumeTracker, IndicatorOutput, QuantileTracker
+    MaxVolumeTracker, IndicatorOutput, QuantileTracker,
+    TimeFrameIndex, EmaPeriodIndex, TIMEFRAME_COUNT, EMA_PERIOD_COUNT
 };
 use crate::technical_analysis::utils::{
     extract_close_prices, create_volume_records_from_candles, 
@@ -73,12 +74,11 @@ pub enum IndicatorReply {
 /// Symbol-specific indicator state
 #[derive(Debug)]
 struct SymbolIndicatorState {
-    /// EMA calculators for each timeframe and period
-    /// Key: (timeframe_seconds, ema_period)
-    emas: HashMap<(u64, u32), IncrementalEMA>,
+    /// EMA calculators using fixed arrays for O(1) access [timeframe][period]  
+    emas: [[Option<IncrementalEMA>; EMA_PERIOD_COUNT]; TIMEFRAME_COUNT],
     
-    /// Trend analyzers for each timeframe
-    trend_analyzers: HashMap<u64, TrendAnalyzer>,
+    /// Trend analyzers using fixed array for O(1) access [timeframe]
+    trend_analyzers: [Option<TrendAnalyzer>; TIMEFRAME_COUNT],
     
     /// Volume tracker for maximum volume analysis
     volume_tracker: MaxVolumeTracker,
@@ -86,14 +86,14 @@ struct SymbolIndicatorState {
     /// Quantile tracker for volume/trade analysis
     quantile_tracker: QuantileTracker,
     
-    /// Current multi-timeframe close prices (including live candles)
-    current_closes: HashMap<u64, f64>,
+    /// Current multi-timeframe close prices using fixed array [timeframe]
+    current_closes: [Option<f64>; TIMEFRAME_COUNT],
     
-    /// Last completed candle close prices for each timeframe (for API output)
-    completed_closes: HashMap<u64, f64>,
+    /// Last completed candle close prices using fixed array [timeframe] 
+    completed_closes: [Option<f64>; TIMEFRAME_COUNT],
     
-    /// Recent candle close prices for trend analysis (last 5 closes per timeframe)
-    recent_candle_closes: HashMap<u64, VecDeque<f64>>,
+    /// Recent candle close prices using fixed array [timeframe]
+    recent_candle_closes: [Option<VecDeque<f64>>; TIMEFRAME_COUNT],
     
     /// Whether this symbol is initialized
     is_initialized: bool,
@@ -105,47 +105,120 @@ struct SymbolIndicatorState {
 
 impl SymbolIndicatorState {
     fn new(config: &TechnicalAnalysisConfig) -> Self {
-        let mut emas = HashMap::new();
-        let mut trend_analyzers = HashMap::new();
+        // Initialize EMA arrays using array initialization without Copy requirement
+        let mut emas = std::array::from_fn(|_| std::array::from_fn(|_| None));
+        let mut trend_analyzers = std::array::from_fn(|_| None);
         
-        // Create EMA calculators for each timeframe and period combination
-        for &timeframe in &config.timeframes {
-            // Add 1-minute timeframe if not already included
-            let timeframes = if timeframe != 60 {
-                let mut tf = vec![60]; // Always include 1-minute
-                tf.push(timeframe);
-                tf
-            } else {
-                vec![timeframe]
-            };
+        // Initialize EMAs for all timeframe/period combinations
+        for tf_idx in 0..TIMEFRAME_COUNT {
+            let _timeframe_seconds = TimeFrameIndex::from_index(tf_idx).to_seconds();
             
-            for tf in timeframes {
-                for &period in &config.ema_periods {
-                    emas.insert((tf, period), IncrementalEMA::new(period));
-                }
-                
-                // Create trend analyzer for this timeframe
-                trend_analyzers.insert(tf, TrendAnalyzer::new(2)); // 2 candles for confirmation
+            // Initialize EMAs for this timeframe
+            for period_idx in 0..EMA_PERIOD_COUNT {
+                let period = EmaPeriodIndex::from_index(period_idx).to_period();
+                emas[tf_idx][period_idx] = Some(IncrementalEMA::new(period));
             }
+            
+            // Initialize trend analyzer for this timeframe
+            trend_analyzers[tf_idx] = Some(TrendAnalyzer::new(2)); // 2 candles for confirmation
         }
-        
-        // Always ensure we have 1-minute EMA and trend analyzers
-        for &period in &config.ema_periods {
-            emas.insert((60, period), IncrementalEMA::new(period));
-        }
-        trend_analyzers.insert(60, TrendAnalyzer::new(2));
 
         Self {
             emas,
             trend_analyzers,
             volume_tracker: MaxVolumeTracker::new(config.volume_lookback_days),
             quantile_tracker: QuantileTracker::new(config.volume_lookback_days),
-            current_closes: HashMap::new(),
-            completed_closes: HashMap::new(),
-            recent_candle_closes: HashMap::new(),
+            current_closes: std::array::from_fn(|_| None),
+            completed_closes: std::array::from_fn(|_| None),
+            recent_candle_closes: std::array::from_fn(|_| None),
             is_initialized: false,
             last_update_time: None
         }
+    }
+    
+    /// Helper method to get EMA by timeframe and period (O(1) array access)
+    #[inline(always)]
+    fn get_ema(&self, timeframe_seconds: u64, period: u32) -> Option<&IncrementalEMA> {
+        let tf_idx = TimeFrameIndex::from_seconds(timeframe_seconds)?.to_index();
+        let period_idx = EmaPeriodIndex::from_period(period)?.to_index();
+        self.emas[tf_idx][period_idx].as_ref()
+    }
+    
+    /// Helper method to get mutable EMA by timeframe and period (O(1) array access)
+    #[inline(always)]
+    fn get_ema_mut(&mut self, timeframe_seconds: u64, period: u32) -> Option<&mut IncrementalEMA> {
+        let tf_idx = TimeFrameIndex::from_seconds(timeframe_seconds)?.to_index();
+        let period_idx = EmaPeriodIndex::from_period(period)?.to_index();
+        self.emas[tf_idx][period_idx].as_mut()
+    }
+    
+    /// Helper method to get trend analyzer by timeframe (O(1) array access)
+    #[inline(always)]
+    fn get_trend_analyzer(&self, timeframe_seconds: u64) -> Option<&TrendAnalyzer> {
+        let tf_idx = TimeFrameIndex::from_seconds(timeframe_seconds)?.to_index();
+        self.trend_analyzers[tf_idx].as_ref()
+    }
+    
+    /// Helper method to get mutable trend analyzer by timeframe (O(1) array access)
+    #[inline(always)]
+    fn get_trend_analyzer_mut(&mut self, timeframe_seconds: u64) -> Option<&mut TrendAnalyzer> {
+        let tf_idx = TimeFrameIndex::from_seconds(timeframe_seconds)?.to_index();
+        self.trend_analyzers[tf_idx].as_mut()
+    }
+    
+    /// Helper method to get current close by timeframe (O(1) array access)
+    #[inline(always)]
+    fn get_current_close(&self, timeframe_seconds: u64) -> Option<f64> {
+        let tf_idx = TimeFrameIndex::from_seconds(timeframe_seconds)?.to_index();
+        self.current_closes[tf_idx]
+    }
+    
+    /// Helper method to set current close by timeframe (O(1) array access)
+    #[inline(always)]
+    fn set_current_close(&mut self, timeframe_seconds: u64, close: f64) {
+        if let Some(tf_idx) = TimeFrameIndex::from_seconds(timeframe_seconds).map(|tf| tf.to_index()) {
+            self.current_closes[tf_idx] = Some(close);
+        }
+    }
+    
+    /// Helper method to get completed close by timeframe (O(1) array access)
+    #[inline(always)]
+    fn get_completed_close(&self, timeframe_seconds: u64) -> Option<f64> {
+        let tf_idx = TimeFrameIndex::from_seconds(timeframe_seconds)?.to_index();
+        self.completed_closes[tf_idx]
+    }
+    
+    /// Helper method to set completed close by timeframe (O(1) array access)
+    #[inline(always)]
+    fn set_completed_close(&mut self, timeframe_seconds: u64, close: f64) {
+        if let Some(tf_idx) = TimeFrameIndex::from_seconds(timeframe_seconds).map(|tf| tf.to_index()) {
+            self.completed_closes[tf_idx] = Some(close);
+        }
+    }
+    
+    /// Helper method to get recent candle closes by timeframe (O(1) array access)
+    #[inline(always)]
+    fn get_recent_closes(&self, timeframe_seconds: u64) -> Option<&VecDeque<f64>> {
+        let tf_idx = TimeFrameIndex::from_seconds(timeframe_seconds)?.to_index();
+        self.recent_candle_closes[tf_idx].as_ref()
+    }
+    
+    /// Helper method to set recent candle closes by timeframe (O(1) array access)
+    #[inline(always)]
+    fn set_recent_closes(&mut self, timeframe_seconds: u64, closes: VecDeque<f64>) {
+        if let Some(tf_idx) = TimeFrameIndex::from_seconds(timeframe_seconds).map(|tf| tf.to_index()) {
+            self.recent_candle_closes[tf_idx] = Some(closes);
+        }
+    }
+    
+    /// Helper method to get or create recent candle closes by timeframe (O(1) array access)
+    #[inline(always)]
+    fn get_recent_closes_mut(&mut self, timeframe_seconds: u64) -> Option<&mut VecDeque<f64>> {
+        let tf_idx = TimeFrameIndex::from_seconds(timeframe_seconds)?.to_index();
+        if self.recent_candle_closes[tf_idx].is_none() {
+            self.recent_candle_closes[tf_idx] = Some(VecDeque::new());
+        }
+        self.recent_candle_closes[tf_idx].as_mut()
     }
 
     /// Initialize with historical aggregated candles
@@ -162,8 +235,8 @@ impl SymbolIndicatorState {
             let close_prices = extract_close_prices(candles);
             
             // Initialize EMAs for this timeframe
-            for &period in [21, 89].iter() { // Common EMA periods
-                if let Some(ema) = self.emas.get_mut(&(timeframe, period)) {
+            for &period in &[21, 89] { // Common EMA periods - direct array access
+                if let Some(ema) = self.get_ema_mut(timeframe, period) {
                     let initial_value = ema.initialize_with_history(&close_prices);
                     if ema.is_ready() {
                         info!("📊 Initialized EMA{} for {} {}s: {:.8} (from {} candles)", 
@@ -179,14 +252,16 @@ impl SymbolIndicatorState {
                 .rev()
                 .cloned()
                 .collect();
-            self.recent_candle_closes.insert(timeframe, recent_closes_deque);
+            self.set_recent_closes(timeframe, recent_closes_deque);
             info!("📊 Initialized recent closes for {} {}s: {} candles", 
                   symbol, timeframe, close_prices.len().min(5));
 
             // Initialize trend analyzers with actual historical EMA progression
-            if let Some(trend_analyzer) = self.trend_analyzers.get_mut(&timeframe) {
-                if let Some(ema89) = self.emas.get(&(timeframe, 89)) {
-                    if ema89.is_ready() {
+            // First check if EMA89 is ready to avoid borrow checker issues
+            let ema89_ready = self.get_ema(timeframe, 89).map(|ema| ema.is_ready()).unwrap_or(false);
+            
+            if ema89_ready {
+                if let Some(trend_analyzer) = self.get_trend_analyzer_mut(timeframe) {
                         // Calculate EMA89 progression using the last 10 historical candles
                         let num_trend_points = close_prices.len().clamp(3, 10);
                         let trend_closes: Vec<f64> = close_prices.iter().rev().take(num_trend_points).rev().cloned().collect();
@@ -214,22 +289,21 @@ impl SymbolIndicatorState {
                             info!("📈 Initialized trend analyzer for {} {}s with EMA progression: {:?}", 
                                   symbol, timeframe, final_trend_data);
                         }
-                    }
                 }
             }
 
 
 
             if let Some(last_candle) = candles.last() {
-                self.current_closes.insert(timeframe, last_candle.close);
+                self.set_current_close(timeframe, last_candle.close);
                 if last_candle.closed {
                     // Historical candles are always completed
-                    self.completed_closes.insert(timeframe, last_candle.close);
+                    self.set_completed_close(timeframe, last_candle.close);
                     info!("📊 Historical initialization for {}s: last_close={:.2} @ {}",
               timeframe, last_candle.close, last_candle.close_time);
                 } else if let Some(second_last_candle) = candles.get(candles.len().saturating_sub(2)) {
                     if second_last_candle.closed {
-                        self.completed_closes.insert(timeframe, second_last_candle.close);
+                        self.set_completed_close(timeframe, second_last_candle.close);
                         info!("📊 Historical initialization for {}s: last_close={:.2} @ {}",
                       timeframe, last_candle.close, last_candle.close_time);
                     }
@@ -264,7 +338,11 @@ impl SymbolIndicatorState {
         self.is_initialized = true;
         
         // Log initialization status
-        let ready_emas = self.emas.values().filter(|ema| ema.is_ready()).count();
+        let ready_emas = self.emas.iter()
+            .flat_map(|timeframe_emas| timeframe_emas.iter())
+            .filter_map(|ema_opt| ema_opt.as_ref())
+            .filter(|ema| ema.is_ready())
+            .count();
         info!("✅ Initialized indicators for {}: {}/{} EMAs ready", 
               symbol, ready_emas, self.emas.len());
     }
@@ -275,22 +353,24 @@ impl SymbolIndicatorState {
         self.last_update_time = Some(candle.close_time);
         
         // Update current close price for this timeframe (includes live candles)
-        self.current_closes.insert(timeframe_seconds, close_price);
+        self.set_current_close(timeframe_seconds, close_price);
         
         // Store recent candle closes for trend analysis (keep last 5 closes) and completed closes
         if candle.closed {
             // Update completed close price (only for closed candles)
-            self.completed_closes.insert(timeframe_seconds, close_price);
+            self.set_completed_close(timeframe_seconds, close_price);
             info!("✅ COMPLETED candle for {}s: {:.2} @ {} (stored as completed close)", 
                   timeframe_seconds, close_price, candle.close_time);
             
-            let recent_closes = self.recent_candle_closes.entry(timeframe_seconds).or_default();
-            // Keep only last 5 closes
-            while recent_closes.len() > 5 {
-                recent_closes.pop_front();
+            if let Some(recent_closes) = self.get_recent_closes_mut(timeframe_seconds) {
+                recent_closes.push_back(close_price);
+                // Keep only last 5 closes
+                while recent_closes.len() > 5 {
+                    recent_closes.pop_front();
+                }
+                debug!("📊 Stored recent close for {}s: {:.2} (history: {} candles)", 
+                       timeframe_seconds, close_price, recent_closes.len());
             }
-            debug!("📊 Stored recent close for {}s: {:.2} (history: {} candles)", 
-                   timeframe_seconds, close_price, recent_closes.len());
         } else {
             info!("📈 LIVE candle for {}s: {:.2} @ {} (not stored as completed)", 
                   timeframe_seconds, close_price, candle.close_time);
@@ -300,8 +380,9 @@ impl SymbolIndicatorState {
         // Since TimeFrame actor now only sends closed candles, we can process all received candles
         // But keep the closed check as a safety net for historical compatibility
         if candle.closed {
-            for &period in [21, 89].iter() {
-                if let Some(ema) = self.emas.get_mut(&(timeframe_seconds, period)) {
+            // MEMORY POOL: Use direct array access instead of iterator to avoid allocation
+            for &period in &[21, 89] {
+                if let Some(ema) = self.get_ema_mut(timeframe_seconds, period) {
                     let new_ema = ema.update(close_price);
                     if let Some(ema_val) = new_ema {
                         debug!("📊 Updated EMA{} for {}s: {:.8} (from close: {:.2})", 
@@ -315,14 +396,16 @@ impl SymbolIndicatorState {
 
         // Update trend analysis using candle closes vs EMA89 - ONLY for closed candles
         if candle.closed {
-            if let Some(trend_analyzer) = self.trend_analyzers.get(&timeframe_seconds) {
-                if let Some(ema89) = self.emas.get(&(timeframe_seconds, 89)) {
+            if let Some(trend_analyzer) = self.get_trend_analyzer(timeframe_seconds) {
+                if let Some(ema89) = self.get_ema(timeframe_seconds, 89) {
                     if let Some(ema89_value) = ema89.value() {
-                        if let Some(recent_closes) = self.recent_candle_closes.get(&timeframe_seconds) {
-                            let trend = trend_analyzer.analyze_candles_vs_ema(recent_closes, ema89_value);
-                            // Only log trend changes, not every analysis
-                            debug!("📈 TREND ANALYSIS for {}s: {} | EMA89: {:.2}", 
-                                   timeframe_seconds, trend, ema89_value);
+                        if let Some(tf_idx) = TimeFrameIndex::from_seconds(timeframe_seconds).map(|tf| tf.to_index()) {
+                            if let Some(recent_closes) = &self.recent_candle_closes[tf_idx] {
+                                let trend = trend_analyzer.analyze_candles_vs_ema(recent_closes, ema89_value);
+                                // Only log trend changes, not every analysis
+                                debug!("📈 TREND ANALYSIS for {}s: {} | EMA89: {:.2}", 
+                                       timeframe_seconds, trend, ema89_value);
+                            }
                         }
                     }
                 }
@@ -332,7 +415,7 @@ impl SymbolIndicatorState {
         // Update volume tracker for 5-minute candles - ONLY for closed candles
         if timeframe_seconds == 300 && candle.closed {
             // Get current trend for this timeframe
-            let current_trend = self.trend_analyzers.get(&300)
+            let current_trend = self.get_trend_analyzer(300)
                 .map(|ta| ta.analyze_trend())
                 .unwrap_or(TrendDirection::Neutral);
             
@@ -352,10 +435,10 @@ impl SymbolIndicatorState {
 
     /// Get trend for a specific timeframe using candles vs EMA89 comparison
     fn get_trend_for_timeframe(&self, timeframe_seconds: u64) -> TrendDirection {
-        if let Some(trend_analyzer) = self.trend_analyzers.get(&timeframe_seconds) {
-            if let Some(ema89) = self.emas.get(&(timeframe_seconds, 89)) {
+        if let Some(trend_analyzer) = self.get_trend_analyzer(timeframe_seconds) {
+            if let Some(ema89) = self.get_ema(timeframe_seconds, 89) {
                 if let Some(ema89_value) = ema89.value() {
-                    if let Some(recent_closes) = self.recent_candle_closes.get(&timeframe_seconds) {
+                    if let Some(recent_closes) = self.get_recent_closes(timeframe_seconds) {
                         return trend_analyzer.analyze_candles_vs_ema(recent_closes, ema89_value);
                     }
                 }
@@ -367,7 +450,7 @@ impl SymbolIndicatorState {
     /// Calculate max_volume_trend using 3 4h candles vs max_volume_price (same rule as other trends)
     fn calculate_max_volume_trend(&self, max_volume_price: f64) -> Option<TrendDirection> {
         // Get last 3 completed 4h candle closes
-        if let Some(recent_4h_closes) = self.recent_candle_closes.get(&14400) {
+        if let Some(recent_4h_closes) = self.get_recent_closes(14400) {
             if recent_4h_closes.len() >= 3 {
                 let last_3_closes: Vec<f64> = recent_4h_closes.iter()
                     .rev()
@@ -403,23 +486,22 @@ impl SymbolIndicatorState {
         };
 
         // Multi-timeframe close prices (from last COMPLETED candles)
-        output.close_5m = self.completed_closes.get(&300).cloned();
-        output.close_15m = self.completed_closes.get(&900).cloned();
-        output.close_60m = self.completed_closes.get(&3600).cloned();
-        output.close_4h = self.completed_closes.get(&14400).cloned();
+        output.close_5m = self.get_completed_close(300);
+        output.close_15m = self.get_completed_close(900);
+        output.close_60m = self.get_completed_close(3600);
+        output.close_4h = self.get_completed_close(14400);
         
         // Debug completed closes vs current closes
         info!("🔍 COMPLETED closes: 5m={:?}, 15m={:?}, 1h={:?}, 4h={:?}", 
-               self.completed_closes.get(&300), self.completed_closes.get(&900),
-               self.completed_closes.get(&3600), self.completed_closes.get(&14400));
+               self.get_completed_close(300), self.get_completed_close(900),
+               self.get_completed_close(3600), self.get_completed_close(14400));
         info!("🔍 CURRENT closes: 5m={:?}, 15m={:?}, 1h={:?}, 4h={:?}",
-               self.current_closes.get(&300), self.current_closes.get(&900),
-               self.current_closes.get(&3600), self.current_closes.get(&14400));
+               self.get_current_close(300), self.get_current_close(900),
+               self.get_current_close(3600), self.get_current_close(14400));
                
         // Check if all completed closes are identical and explain why
-        let completed_values: Vec<f64> = [&300, &900, &3600, &14400].iter()
-            .filter_map(|&tf| self.completed_closes.get(tf))
-            .cloned()
+        let completed_values: Vec<f64> = [300, 900, 3600, 14400].iter()
+            .filter_map(|&tf| self.get_completed_close(tf))
             .collect();
         let unique_completed: std::collections::HashSet<_> = completed_values.iter()
             .map(|&f| (f * 100.0) as i64).collect();
@@ -430,12 +512,12 @@ impl SymbolIndicatorState {
         }
 
         // EMA values
-        output.ema21_1min = self.emas.get(&(60, 21)).and_then(|ema| ema.value());
-        output.ema89_1min = self.emas.get(&(60, 89)).and_then(|ema| ema.value());
-        output.ema89_5min = self.emas.get(&(300, 89)).and_then(|ema| ema.value());
-        output.ema89_15min = self.emas.get(&(900, 89)).and_then(|ema| ema.value());
-        output.ema89_1h = self.emas.get(&(3600, 89)).and_then(|ema| ema.value());
-        output.ema89_4h = self.emas.get(&(14400, 89)).and_then(|ema| ema.value());
+        output.ema21_1min = self.get_ema(60, 21).and_then(|ema| ema.value());
+        output.ema89_1min = self.get_ema(60, 89).and_then(|ema| ema.value());
+        output.ema89_5min = self.get_ema(300, 89).and_then(|ema| ema.value());
+        output.ema89_15min = self.get_ema(900, 89).and_then(|ema| ema.value());
+        output.ema89_1h = self.get_ema(3600, 89).and_then(|ema| ema.value());
+        output.ema89_4h = self.get_ema(14400, 89).and_then(|ema| ema.value());
 
         // Trend analysis using candles vs EMA89 comparison
         output.trend_1min = self.get_trend_for_timeframe(60);
@@ -590,7 +672,11 @@ impl Actor for IndicatorActor {
         
         // Log final statistics
         for (symbol, state) in &self.symbol_states {
-            let ready_emas = state.emas.values().filter(|ema| ema.is_ready()).count();
+            let ready_emas = state.emas.iter()
+                .flat_map(|timeframe_emas| timeframe_emas.iter())
+                .filter_map(|ema_opt| ema_opt.as_ref())
+                .filter(|ema| ema.is_ready())
+                .count();
             info!("📊 Final state for {}: {}/{} EMAs ready, last_update: {:?}", 
                   symbol, ready_emas, state.emas.len(), state.last_update_time);
         }

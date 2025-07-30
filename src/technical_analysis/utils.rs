@@ -344,10 +344,10 @@ pub fn create_quantile_records_from_candles(
     candles_5m: &[FuturesOHLCVCandle],
 ) -> Vec<QuantileRecord> {
     candles_5m.iter().map(|candle| {
-        let sell_buy_volume = candle.volume - candle.taker_buy_base_asset_volume;
         QuantileRecord {
-            taker_buy_volume: candle.taker_buy_base_asset_volume,
-            sell_buy_volume,
+            volume: candle.volume,
+            taker_buy_volume: candle.taker_buy_base_asset_volume / candle.volume,
+            avg_trade: candle.volume / candle.number_of_trades as f64,
             trade_count: candle.number_of_trades,
             timestamp: candle.close_time,
         }
