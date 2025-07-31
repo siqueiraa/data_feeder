@@ -97,10 +97,13 @@ pub struct PostgresActor {
     last_error: Option<String>,
     candle_batch: Vec<(String, FuturesOHLCVCandle)>,
     last_batch_time: Option<std::time::Instant>,
+    last_activity_time: std::time::Instant,
 }
 
 impl PostgresActor {
-    /// SQL statement for upserting candle data
+
+    /// SQL statement for upserting candle data (kept for potential future real-time use)
+    #[allow(dead_code)]
     const UPSERT_CANDLE_SQL: &'static str = r#"
         INSERT INTO candles_1m (time, open, high, low, close, volume, symbol, time_frame, trade_count, taker_buy_volume)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -122,6 +125,7 @@ impl PostgresActor {
             last_error: None,
             candle_batch: Vec::new(),
             last_batch_time: None,
+            last_activity_time: std::time::Instant::now(),
         })
     }
 
@@ -256,6 +260,7 @@ impl PostgresActor {
         Ok(())
     }
 
+
     /// Convert milliseconds timestamp to PostgreSQL timestamp with time zone
     fn millis_to_timestamp(&self, millis: i64) -> Result<chrono::DateTime<chrono::FixedOffset>, PostgresError> {
         chrono::DateTime::from_timestamp_millis(millis)
@@ -264,9 +269,12 @@ impl PostgresActor {
     }
 
 
-    /// Store multiple candles in batch
+    /// Store multiple candles using ultra-high performance multi-row INSERT
     async fn store_batch(&mut self, candles: Vec<(String, FuturesOHLCVCandle)>, source: &str) -> Result<(), PostgresError> {
+        info!("🚀 [PostgresActor] Starting ULTRA-HIGH PERFORMANCE store_batch from {}: {} candles", source, candles.len());
+        
         if candles.is_empty() {
+            info!("📭 [PostgresActor] Empty candles batch, skipping");
             return Ok(());
         }
 
@@ -279,53 +287,189 @@ impl PostgresActor {
                 return Ok(());
             }
         };
+
+        // Optimized batch size - balance performance vs PostgreSQL message limits
+        // PostgreSQL message size limit ~1MB, so use smaller batches to stay within limits
+        const ULTRA_BATCH_SIZE: usize = 1000;
+        let total_candles = candles.len();
+        let num_batches = total_candles.div_ceil(ULTRA_BATCH_SIZE);
         
+        info!("⚡ [PostgresActor] Using MULTI-ROW UPSERT: {} candles in {} ultra-batches of ~{} candles each", 
+              total_candles, num_batches, ULTRA_BATCH_SIZE);
+        
+        let mut total_rows_affected = 0;
+        let batch_start_time = std::time::Instant::now();
+        
+        // Process candles in ultra-high performance batches
+        for (batch_idx, batch_candles) in candles.chunks(ULTRA_BATCH_SIZE).enumerate() {
+            let batch_num = batch_idx + 1;
+            let batch_size = batch_candles.len();
+            let batch_start = std::time::Instant::now();
+            
+            info!("🚀 [PostgresActor] Processing ultra-batch {}/{}: {} candles with MULTI-ROW UPSERT", 
+                  batch_num, num_batches, batch_size);
+            
+            // Get fresh connection for each batch to avoid connection timeouts
+            let mut client = match pool.get().await {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("❌ [PostgresActor] Failed to acquire database client for ultra-batch {}/{}: {}", batch_num, num_batches, e);
+                    return Err(e.into());
+                }
+            };
+            
+            // Start transaction for this batch
+            let transaction = match client.transaction().await {
+                Ok(transaction) => transaction,
+                Err(e) => {
+                    error!("❌ [PostgresActor] Failed to start transaction for ultra-batch {}/{}: {}", batch_num, num_batches, e);
+                    return Err(e.into());
+                }
+            };
 
-        let mut client = pool.get().await?;
-        let transaction = client.transaction().await?;
+            // Execute ultra-high performance multi-row UPSERT
+            let batch_rows_affected = match self.execute_multi_row_upsert(&transaction, batch_candles, batch_num, num_batches).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    error!("❌ [PostgresActor] Multi-row UPSERT failed for ultra-batch {}/{}: {}", batch_num, num_batches, e);
+                    return Err(e);
+                }
+            };
 
-        let stmt = transaction.prepare(Self::UPSERT_CANDLE_SQL).await?;
-
-        let mut rows_affected = 0;
-        let candles_len = candles.len();
-        for (symbol, candle) in candles {
-            let timestamp = self.millis_to_timestamp(candle.close_time)?;
-            let result = transaction.execute(
-                &stmt,
-                &[
-                    &timestamp,
-                    &candle.open,
-                    &candle.high,
-                    &candle.low,
-                    &candle.close,
-                    &candle.volume,
-                    &symbol,
-                    &"1m",
-                    &(candle.number_of_trades as i32),
-                    &candle.taker_buy_base_asset_volume,
-                ],
-            ).await?;
-            rows_affected += result;
+            // Commit this batch
+            match transaction.commit().await {
+                Ok(()) => {
+                    let batch_elapsed = batch_start.elapsed();
+                    let candles_per_sec = batch_size as f64 / batch_elapsed.as_secs_f64();
+                    info!("✅ [PostgresActor] Committed ultra-batch {}/{} with {} rows in {:?} ({:.0} candles/sec)", 
+                          batch_num, num_batches, batch_rows_affected, batch_elapsed, candles_per_sec);
+                }
+                Err(e) => {
+                    error!("❌ [PostgresActor] Failed to commit ultra-batch {}/{}: {}", batch_num, num_batches, e);
+                    return Err(e.into());
+                }
+            }
+            
+            total_rows_affected += batch_rows_affected;
         }
-
-        transaction.commit().await?;
-        info!("📊 [{}] Batch stored {} candles (rows affected: {})", source, candles_len, rows_affected);
+        
+        let total_elapsed = batch_start_time.elapsed();
+        let total_candles_per_sec = total_candles as f64 / total_elapsed.as_secs_f64();
+        
+        info!("🎯 [{}] ULTRA-HIGH PERFORMANCE COMPLETED: {} candles in {} ultra-batches, {} total rows", 
+              source, total_candles, num_batches, total_rows_affected);
+        info!("⚡ [{}] PERFORMANCE: {:?} total time, {:.0} candles/sec throughput (TARGET: 20,000+)", 
+              source, total_elapsed, total_candles_per_sec);
         
         // Log warning if rows_affected doesn't match expected count
-        if rows_affected as usize != candles_len {
-            warn!("⚠️  Expected {} rows but affected {} rows - potential duplicates or UPSERT conflicts", 
-                  candles_len, rows_affected);
+        if total_rows_affected as usize != total_candles {
+            warn!("⚠️  Expected {} rows but affected {} rows - potential duplicates", 
+                  total_candles, total_rows_affected);
         }
         
         Ok(())
     }
 
+    /// Execute ultra-high performance multi-row UPSERT with dynamic SQL generation
+    async fn execute_multi_row_upsert(
+        &self,
+        transaction: &tokio_postgres::Transaction<'_>,
+        batch_candles: &[(String, FuturesOHLCVCandle)],
+        batch_num: usize,
+        total_batches: usize,
+    ) -> Result<u64, PostgresError> {
+        let batch_size = batch_candles.len();
+        
+        info!("🏗️  [PostgresActor] Building multi-row UPSERT SQL for {} candles in batch {}/{}", 
+              batch_size, batch_num, total_batches);
+        
+        // Build dynamic multi-row UPSERT statement to handle duplicate data
+        let mut sql = String::with_capacity(batch_size * 120); // Pre-allocate for performance (~120 chars per row with UPSERT)
+        sql.push_str("INSERT INTO candles_1m (time, open, high, low, close, volume, symbol, time_frame, trade_count, taker_buy_volume) VALUES ");
+        
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::with_capacity(batch_size * 10);
+        let mut timestamps: Vec<chrono::DateTime<chrono::FixedOffset>> = Vec::with_capacity(batch_size);
+        let mut trade_counts: Vec<i32> = Vec::with_capacity(batch_size);
+        
+        // Pre-process all data for performance
+        for (i, (_symbol, candle)) in batch_candles.iter().enumerate() {
+            let timestamp = self.millis_to_timestamp(candle.open_time)
+                .map_err(|e| {
+                    error!("❌ [PostgresActor] Failed to convert timestamp for candle {} in batch {}: {}", i + 1, batch_num, e);
+                    e
+                })?;
+            timestamps.push(timestamp);
+            trade_counts.push(candle.number_of_trades as i32);
+        }
+        
+        // Build VALUES clause with parameter placeholders
+        for i in 0..batch_size {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            
+            let base_param = i * 10 + 1;
+            sql.push_str(&format!("(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})", 
+                base_param, base_param + 1, base_param + 2, base_param + 3, base_param + 4,
+                base_param + 5, base_param + 6, base_param + 7, base_param + 8, base_param + 9));
+        }
+        
+        // Flatten all parameters in correct order
+        for (i, (symbol, candle)) in batch_candles.iter().enumerate() {
+            params.push(&timestamps[i]);           // time
+            params.push(&candle.open);             // open
+            params.push(&candle.high);             // high
+            params.push(&candle.low);              // low
+            params.push(&candle.close);            // close
+            params.push(&candle.volume);           // volume
+            params.push(symbol);                   // symbol
+            params.push(&"1m");                    // time_frame
+            params.push(&trade_counts[i]);         // trade_count
+            params.push(&candle.taker_buy_base_asset_volume); // taker_buy_volume
+        }
+        
+        // Add UPSERT clause to handle duplicates efficiently
+        sql.push_str(" ON CONFLICT (time, symbol, time_frame) DO UPDATE SET ");
+        sql.push_str("open = EXCLUDED.open, ");
+        sql.push_str("high = EXCLUDED.high, ");
+        sql.push_str("low = EXCLUDED.low, ");
+        sql.push_str("close = EXCLUDED.close, ");
+        sql.push_str("volume = EXCLUDED.volume, ");
+        sql.push_str("trade_count = EXCLUDED.trade_count, ");
+        sql.push_str("taker_buy_volume = EXCLUDED.taker_buy_volume");
+        
+        info!("📝 [PostgresActor] Generated UPSERT SQL with {} parameters for {} candles in batch {}/{}", 
+              params.len(), batch_size, batch_num, total_batches);
+        
+        // Execute the ultra-high performance multi-row INSERT
+        let sql_start = std::time::Instant::now();
+        let rows_affected = match transaction.execute(&sql, &params).await {
+            Ok(rows) => {
+                let sql_elapsed = sql_start.elapsed();
+                info!("⚡ [PostgresActor] Multi-row UPSERT completed: {} candles in {:?} ({:.0} candles/sec)", 
+                      batch_size, sql_elapsed, batch_size as f64 / sql_elapsed.as_secs_f64());
+                rows
+            }
+            Err(e) => {
+                error!("❌ [PostgresActor] Multi-row UPSERT failed for batch {}/{}: {}", batch_num, total_batches, e);
+                error!("🔍 [PostgresActor] SQL length: {} chars, Parameters: {}", sql.len(), params.len());
+                if batch_size > 0 {
+                    let first_candle = &batch_candles[0];
+                    error!("🔍 [PostgresActor] First candle: {} at {}", first_candle.0, first_candle.1.open_time);
+                }
+                return Err(e.into());
+            }
+        };
+        
+        Ok(rows_affected)
+    }
+
     /// Add candle to batch and flush if needed
     async fn add_to_batch(&mut self, symbol: String, candle: FuturesOHLCVCandle, source: &str) -> Result<(), PostgresError> {
         // Log individual candle addition
-        let timestamp = chrono::DateTime::from_timestamp_millis(candle.close_time)
+        let timestamp = chrono::DateTime::from_timestamp_millis(candle.open_time)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| format!("INVALID_TIME({})", candle.close_time));
+            .unwrap_or_else(|| format!("INVALID_TIME({})", candle.open_time));
         info!("➕ [{}] Adding candle to batch: {} - {} (close: {})", source, symbol, timestamp, candle.close);
         
         self.candle_batch.push((symbol, candle));
@@ -425,21 +569,55 @@ impl Message<PostgresTell> for PostgresActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: PostgresTell, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+        // Update activity time for all messages
+        self.last_activity_time = std::time::Instant::now();
+        
         match msg {
             PostgresTell::StoreCandle { symbol, candle, source } => {
+                info!("📥 [PostgresActor] Received StoreCandle message from {}: {} candle", source, symbol);
                 if let Err(e) = self.add_to_batch(symbol, candle, &source).await {
                     error!("Failed to add candle to batch: {}", e);
                 }
             }
             PostgresTell::StoreBatch { candles, source } => {
-                if let Err(e) = self.store_batch(candles, &source).await {
-                    error!("Failed to store batch: {}", e);
+                info!("📦 [PostgresActor] Received StoreBatch message from {}: {} candles", source, candles.len());
+                let batch_start = std::time::Instant::now();
+                match self.store_batch(candles.clone(), &source).await {
+                    Ok(()) => {
+                        let batch_elapsed = batch_start.elapsed();
+                        info!("✅ [PostgresActor] Successfully processed StoreBatch from {} in {:?}", source, batch_elapsed);
+                    }
+                    Err(e) => {
+                        let batch_elapsed = batch_start.elapsed();
+                        error!("❌ [PostgresActor] Failed to store batch from {} after {:?}: {}", source, batch_elapsed, e);
+                        error!("🔍 [PostgresActor] Batch details - {} candles from {}", candles.len(), source);
+                        if !candles.is_empty() {
+                            let first_candle = &candles[0];
+                            let last_candle = &candles[candles.len() - 1];
+                            error!("🔍 [PostgresActor] Batch range - first: {} at {}, last: {} at {}", 
+                                   first_candle.0, first_candle.1.open_time, 
+                                   last_candle.0, last_candle.1.open_time);
+                        }
+                        error!("🔍 [PostgresActor] Check PostgreSQL connection, table schema, and data validity");
+                    }
                 }
             }
             PostgresTell::HealthCheck => {
+                let elapsed_since_activity = self.last_activity_time.elapsed();
+                info!("🏥 [PostgresActor] Received HealthCheck message - alive and responsive (last activity: {:?} ago)", elapsed_since_activity);
+                
+                // Log health status
+                let health_status = self.get_health_status();
+                if let PostgresReply::HealthStatus { is_healthy, connection_count, last_error } = health_status {
+                    info!("💊 [PostgresActor] Health Status: healthy={}, connections={}, last_error={:?}", 
+                          is_healthy, connection_count, last_error);
+                }
+                
                 // Periodic health check - flush batch if needed
                 if let Err(e) = self.flush_batch("HealthCheck").await {
                     error!("Health check batch flush failed: {}", e);
+                } else {
+                    info!("✅ [PostgresActor] HealthCheck completed successfully");
                 }
             }
         }

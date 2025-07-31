@@ -6,7 +6,7 @@ use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 
 
 /// Load recent candles from LMDB using LmdbActor (prevents environment conflicts)
-/// Returns candles sorted by close_time (oldest first)
+/// Returns candles sorted by open_time (oldest first)
 pub async fn load_recent_candles_from_db(
     symbol: &str,
     timeframe_seconds: u64,
@@ -49,9 +49,9 @@ pub async fn load_recent_candles_from_db(
         }
     };
 
-    // Sort by close_time (oldest first) - should already be sorted but ensure it
+    // Sort by open_time (oldest first) - should already be sorted but ensure it
     let mut sorted_candles = candles;
-    sorted_candles.sort_by_key(|c| c.close_time);
+    sorted_candles.sort_by_key(|c| c.open_time);
 
     if !sorted_candles.is_empty() {
         let first_time = sorted_candles[0].open_time;
@@ -334,7 +334,7 @@ pub fn create_volume_records_from_candles(
             volume: candle.volume,
             price: candle.close,
             timestamp: candle.close_time,
-            trend: trend_direction.clone(),
+            trend: trend_direction,
         }
     }).collect()
 }

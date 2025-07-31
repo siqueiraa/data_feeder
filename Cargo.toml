@@ -48,11 +48,27 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "performance_benchmark"
 harness = false
 
-# PHASE 11 OPTIMIZATION: Maximum performance compiler settings
+[[bin]]
+name = "performance_test"
+path = "performance_test.rs"
+
+# PHASE 11 + SIMD OPTIMIZATION: Maximum performance compiler settings
 [profile.release]
 lto = "fat"                    # Full Link Time Optimization
 codegen-units = 1              # Single codegen unit for better optimization
 panic = "abort"                # Remove panic handling overhead
 opt-level = 3                  # Maximum optimization level
 
-# Target native CPU for maximum SIMD utilization (use RUSTFLAGS="--cfg target-cpu=native" cargo build --release)
+# PHASE 4: Native CPU target for maximum SIMD utilization
+# ARM64/AArch64 optimizations (Apple Silicon):
+# Enable with: RUSTFLAGS="-C target-cpu=native -C target-feature=+neon,+fp16,+dotprod" cargo build --release
+# Intel x86_64 optimizations:
+# Enable with: RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2,+fma" cargo build --release
+# 
+# Profile-Guided Optimization (PGO) setup:
+# 1. cargo build --release
+# 2. ./target/release/data_feeder  # Run with representative workload
+# 3. RUSTFLAGS="-C profile-use=/path/to/profile" cargo build --release
+#
+# Alternative: Use bolt for post-link optimization:
+# llvm-bolt ./target/release/data_feeder -data=profile.fdata -reorder-functions -o data_feeder_bolt

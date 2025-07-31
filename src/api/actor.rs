@@ -140,6 +140,7 @@ impl ApiActor {
 
     /// Store candles through LmdbActor
     async fn store_candles(&self, symbol: &str, interval: &str, candles: Vec<FuturesOHLCVCandle>) -> Result<(), ApiError> {
+        info!("🎯 [ApiActor] store_candles called for {}: {} candles", symbol, candles.len());
         if candles.is_empty() {
             return Ok(());
         }
@@ -200,6 +201,13 @@ impl ApiActor {
                     
                 info!("🔄 [ApiActor] Sending batch of {} candles to PostgreSQL for {} {} (range: {} - {})", 
                       candles_len, symbol, interval, start_timestamp, end_timestamp);
+                
+                // First send a health check to verify the PostgreSQL actor is responsive
+                info!("🏥 [ApiActor] Sending health check to PostgreSQL actor first");
+                if let Err(e) = postgres_actor.tell(PostgresTell::HealthCheck).send().await {
+                    error!("❌ [ApiActor] PostgreSQL health check failed: {}", e);
+                    return Err(ApiError::Network(format!("PostgreSQL health check failed: {}", e)));
+                }
                 
                 let postgres_msg = PostgresTell::StoreBatch {
                     candles: candles_vec,

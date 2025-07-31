@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -10,7 +10,7 @@ use kameo::message::{Context, Message};
 use kameo::request::MessageSend;
 use kameo::{Actor, mailbox::unbounded::UnboundedMailbox};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 use crate::common::shared_data::{
     SharedCandle, SharedSymbol, shared_candle, intern_symbol
@@ -57,6 +57,10 @@ pub enum WebSocketTell {
     SetLmdbActor {
         lmdb_actor: ActorRef<crate::lmdb::LmdbActor>,
     },
+    /// Set the PostgreSQL actor reference for dual storage
+    SetPostgresActor {
+        postgres_actor: ActorRef<crate::postgres::PostgresActor>,
+    },
     /// Flush pending batches to prevent candles from getting stuck
     FlushBatches,
 }
@@ -97,6 +101,13 @@ pub enum WebSocketReply {
     Error(String),
 }
 
+/// Cache entry with timestamp for LRU eviction
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    candles: VecDeque<SharedCandle>,
+    last_access: Instant,
+}
+
 /// WebSocket actor for real-time data streaming
 pub struct WebSocketActor {
     /// Connection manager
@@ -107,16 +118,20 @@ pub struct WebSocketActor {
     lmdb_actor: Option<ActorRef<crate::lmdb::LmdbActor>>,
     /// Base path for LMDB storage (for reference only)
     base_path: PathBuf,
-    /// Recent candles cache (symbol -> candles) - using DashMap + VecDeque for concurrent O(1) operations
-    recent_candles: DashMap<String, VecDeque<SharedCandle>>,
-    /// Maximum recent candles to keep in memory
+    /// Recent candles cache with LRU eviction (symbol -> cache entry)
+    recent_candles: DashMap<String, CacheEntry>,
+    /// Maximum recent candles to keep in memory per symbol
     max_recent_candles: usize,
+    /// Maximum number of symbols to cache
+    max_cached_symbols: usize,
     /// Maximum idle time before marking connection as unhealthy (in seconds)
     max_idle_time: u64,
     /// Pending candles for batch processing (symbol -> pending candles)
     pending_batch_candles: DashMap<String, Vec<(SharedCandle, bool)>>,
-    /// Last batch process time for rate limiting
-    pub last_batch_time: Option<std::time::Instant>,
+    /// Last batch process time for adaptive batching
+    pub last_batch_time: Option<Instant>,
+    /// Performance metrics for adaptive batching
+    batch_processing_times: Vec<Duration>,
     /// Handle to the current connection task (for proper termination)
     connection_task: Option<tokio::task::JoinHandle<()>>,
     /// Last activity timestamp (when we last processed a message) - for health checks
@@ -132,6 +147,14 @@ pub struct WebSocketActor {
     /// Gap detection configuration
     gap_threshold_minutes: u32,
     gap_check_delay_seconds: u32,
+    /// Last cache cleanup timestamp
+    last_cache_cleanup: Instant,
+    /// Cache cleanup interval (in seconds)
+    cache_cleanup_interval: u64,
+    /// Semaphore for backpressure control on LMDB operations
+    lmdb_semaphore: Arc<Semaphore>,
+    /// Semaphore for backpressure control on PostgreSQL operations
+    postgres_semaphore: Arc<Semaphore>,
 }
 
 impl WebSocketActor {
@@ -169,16 +192,19 @@ impl WebSocketActor {
                 .map_err(|e| WebSocketError::Unknown(format!("Failed to create base path: {}", e)))?;
         }
 
+        let now = Instant::now();
         Ok(Self {
             connection_manager,
             subscriptions: Arc::new(RwLock::new(Vec::new())),
             lmdb_actor: None,
             base_path,
             recent_candles: DashMap::new(),
-            max_recent_candles: 1000,
+            max_recent_candles: 500, // Reduced from 1000 for better memory efficiency
+            max_cached_symbols: 50,  // Limit total number of cached symbols
             max_idle_time: max_idle_secs,
             pending_batch_candles: DashMap::new(),
             last_batch_time: None,
+            batch_processing_times: Vec::with_capacity(100), // Track last 100 batch processing times
             connection_task: None,
             last_activity_time: None,
             last_processed_candle_time: None,
@@ -187,6 +213,10 @@ impl WebSocketActor {
             timeframe_actor: None,
             gap_threshold_minutes,
             gap_check_delay_seconds,
+            last_cache_cleanup: now,
+            cache_cleanup_interval: 300, // Cleanup every 5 minutes
+            lmdb_semaphore: Arc::new(Semaphore::new(10)), // Max 10 concurrent LMDB operations
+            postgres_semaphore: Arc::new(Semaphore::new(5)), // Max 5 concurrent PostgreSQL operations
         })
     }
 
@@ -197,8 +227,12 @@ impl WebSocketActor {
 
     /// Initialize database for a symbol via LmdbActor (non-blocking)
     fn init_symbol_db(&mut self, symbol: &str) -> Result<(), WebSocketError> {
-        // Initialize recent candles cache immediately
-        self.recent_candles.insert(symbol.to_string(), VecDeque::with_capacity(self.max_recent_candles));
+        // Initialize recent candles cache immediately with LRU entry
+        let cache_entry = CacheEntry {
+            candles: VecDeque::with_capacity(self.max_recent_candles),
+            last_access: Instant::now(),
+        };
+        self.recent_candles.insert(symbol.to_string(), cache_entry);
         
         // Send database initialization to background (non-blocking)
         if let Some(lmdb_actor) = &self.lmdb_actor {
@@ -232,15 +266,116 @@ impl WebSocketActor {
         Ok(())
     }
 
+    /// Perform intelligent cache cleanup with LRU eviction
+    fn cleanup_cache(&mut self) {
+        let now = Instant::now();
+        
+        // Check if cleanup is needed (time-based or size-based)
+        let should_cleanup = now.duration_since(self.last_cache_cleanup).as_secs() >= self.cache_cleanup_interval
+            || self.recent_candles.len() > self.max_cached_symbols;
+        
+        if !should_cleanup {
+            return;
+        }
+        
+        debug!("🧹 Starting cache cleanup: {} symbols cached", self.recent_candles.len());
+        
+        // If over symbol limit, remove least recently used symbols
+        if self.recent_candles.len() > self.max_cached_symbols {
+            // Collect symbols with their last access times
+            let mut symbol_access_times: Vec<(String, Instant)> = self.recent_candles
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().last_access))
+                .collect();
+            
+            // Sort by access time (oldest first)
+            symbol_access_times.sort_by_key(|(_, last_access)| *last_access);
+            
+            // Remove oldest symbols to get back to limit
+            let symbols_to_remove = self.recent_candles.len() - self.max_cached_symbols;
+            for (symbol, _) in symbol_access_times.iter().take(symbols_to_remove) {
+                if let Some((_, cache_entry)) = self.recent_candles.remove(symbol) {
+                    info!("🗑️ Evicted symbol from cache: {} ({} candles)", symbol, cache_entry.candles.len());
+                }
+            }
+        }
+        
+        // Clean up old candles within each symbol's cache
+        let cleanup_threshold = Duration::from_secs(3600); // 1 hour
+        let mut cleaned_symbols = 0;
+        let mut cleaned_candles = 0;
+        
+        self.recent_candles.iter_mut().for_each(|mut entry| {
+            let symbol_key = entry.key().clone(); // Clone the key to avoid borrowing conflicts
+            let cache_entry = entry.value_mut();
+            
+            // Clean old candles if not accessed recently
+            if now.duration_since(cache_entry.last_access) > cleanup_threshold {
+                let _original_count = cache_entry.candles.len();
+                // Keep only the most recent candles (half of max)
+                let keep_count = self.max_recent_candles / 2;
+                if cache_entry.candles.len() > keep_count {
+                    let drain_count = cache_entry.candles.len() - keep_count;
+                    cache_entry.candles.drain(0..drain_count);
+                    cleaned_candles += drain_count;
+                    cleaned_symbols += 1;
+                    debug!("🧹 Cleaned {} old candles for {}", drain_count, symbol_key);
+                }
+            }
+        });
+        
+        self.last_cache_cleanup = now;
+        info!("✅ Cache cleanup completed: {} symbols, {} candles cleaned", cleaned_symbols, cleaned_candles);
+    }
+
+    /// Calculate adaptive batch threshold based on recent performance
+    fn calculate_adaptive_batch_threshold(&mut self) -> (Duration, usize) {
+        // If we have performance history, use it to adapt
+        if self.batch_processing_times.len() >= 10 {
+            let avg_processing_time: Duration = self.batch_processing_times
+                .iter()
+                .sum::<Duration>() / self.batch_processing_times.len() as u32;
+            
+            // Target: keep processing time under 5ms
+            let target_time = Duration::from_millis(5);
+            
+            let (time_threshold, count_threshold) = if avg_processing_time > target_time {
+                // Processing is slow, use smaller batches and shorter time windows
+                (Duration::from_millis(50), 3)
+            } else if avg_processing_time < Duration::from_millis(1) {
+                // Processing is fast, allow larger batches and longer time windows
+                (Duration::from_millis(200), 10)
+            } else {
+                // Balanced performance
+                (Duration::from_millis(100), 5)
+            };
+            
+            debug!("📊 Adaptive batching: avg_time={:?}, threshold=({:?}, {})", 
+                   avg_processing_time, time_threshold, count_threshold);
+            
+            (time_threshold, count_threshold)
+        } else {
+            // Default conservative thresholds until we have performance data
+            (Duration::from_millis(100), 5)
+        }
+    }
+
     /// Store a candle in LMDB and update recent cache - handles both live and closed candles
     pub async fn store_candle(&mut self, symbol: &str, candle: &SharedCandle, is_closed: bool) -> Result<(), WebSocketError> {
         // Always update recent cache for both live and closed candles (for real-time access)
-        if let Some(mut recent) = self.recent_candles.get_mut(symbol) {
-            recent.push_back(Arc::clone(candle));
-            if recent.len() > self.max_recent_candles {
-                recent.pop_front(); // O(1) operation with VecDeque
+        if let Some(mut cache_entry) = self.recent_candles.get_mut(symbol) {
+            // Update access time for LRU
+            cache_entry.last_access = Instant::now();
+            cache_entry.candles.push_back(Arc::clone(candle));
+            
+            // Maintain cache size limit
+            if cache_entry.candles.len() > self.max_recent_candles {
+                cache_entry.candles.pop_front(); // O(1) operation with VecDeque
             }
         }
+        
+        // Perform periodic cache cleanup
+        self.cleanup_cache();
         
         // Only store closed candles to LMDB to avoid partial data
         if !is_closed {
@@ -252,8 +387,11 @@ impl WebSocketActor {
         self.add_to_batch(symbol, candle, is_closed).await
     }
     
-    /// Add a candle to the batch processing queue
+    /// Add a candle to the batch processing queue with adaptive thresholds
     async fn add_to_batch(&mut self, symbol: &str, candle: &SharedCandle, is_closed: bool) -> Result<(), WebSocketError> {
+        // Calculate adaptive thresholds based on recent performance
+        let (time_threshold, count_threshold) = self.calculate_adaptive_batch_threshold();
+        
         // Add to batch queue and determine if we should process
         let (should_process, batch_len, total_pending) = {
             let mut batch = self.pending_batch_candles.entry(symbol.to_string()).or_default();
@@ -262,10 +400,10 @@ impl WebSocketActor {
             let total_pending: usize = self.pending_batch_candles.iter().map(|entry| entry.value().len()).sum();
             
             let should_process = match self.last_batch_time {
-                Some(last_time) => last_time.elapsed() > Duration::from_millis(100),
+                Some(last_time) => last_time.elapsed() > time_threshold,
                 None => true, // Always process immediately if this is the first candle
-            } || batch.len() >= 5 // Reduced threshold for faster processing
-            || total_pending >= 10; // Process if total pending gets large
+            } || batch.len() >= count_threshold // Use adaptive count threshold
+            || total_pending >= (count_threshold * 3); // Process if total pending gets large
             
             (should_process, batch.len(), total_pending)
         }; // Release the borrow here
@@ -275,8 +413,18 @@ impl WebSocketActor {
         
         if should_process {
             info!("🔄 Processing batches: {} total pending candles", total_pending);
+            let start_time = Instant::now();
             self.process_batches().await?;
-            self.last_batch_time = Some(std::time::Instant::now());
+            let processing_time = start_time.elapsed();
+            
+            // Track processing time for adaptive batching
+            self.batch_processing_times.push(processing_time);
+            if self.batch_processing_times.len() > 100 {
+                self.batch_processing_times.remove(0); // Keep only last 100 measurements
+            }
+            
+            self.last_batch_time = Some(start_time);
+            debug!("⚡ Batch processing completed in {:?}", processing_time);
         }
         
         Ok(())
@@ -291,8 +439,8 @@ impl WebSocketActor {
         
         for symbol in symbols_to_process {
             if let Some((_, mut candles)) = self.pending_batch_candles.remove(&symbol) {
-                // Sort by close_time to ensure proper ordering
-                candles.sort_by_key(|(candle, _)| candle.close_time);
+                // Sort by open_time to ensure proper chronological ordering
+                candles.sort_by_key(|(candle, _)| candle.open_time);
                 
                 // Process the batch for this symbol
                 self.process_candle_batch(&symbol, candles).await?;
@@ -526,11 +674,14 @@ impl WebSocketActor {
         Ok(())
     }
 
-    /// Get recent candles for a symbol
+    /// Get recent candles for a symbol with LRU update
     pub fn get_recent_candles(&self, symbol: &str, limit: usize) -> Vec<FuturesOHLCVCandle> {
-        if let Some(recent) = self.recent_candles.get(symbol) {
-            let take_count = std::cmp::min(limit, recent.len());
-            recent.iter()
+        if let Some(mut cache_entry) = self.recent_candles.get_mut(symbol) {
+            // Update access time for LRU
+            cache_entry.last_access = Instant::now();
+            
+            let take_count = std::cmp::min(limit, cache_entry.candles.len());
+            cache_entry.candles.iter()
                 .rev() // Get most recent first
                 .take(take_count)
                 .map(|candle| (**candle).clone())
@@ -569,28 +720,69 @@ impl Actor for WebSocketActor {
         info!("📁 LMDB storage path: {}", self.base_path.display());
         info!("🌐 Target exchange: Binance Futures");
 
-        // Start health check task
+        // Start adaptive health check task
         let actor_ref_clone = actor_ref.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let base_interval = Duration::from_secs(60);
+            let mut current_interval = base_interval;
+            let mut consecutive_healthy_checks = 0u32;
+            
             loop {
-                interval.tick().await;
+                tokio::time::sleep(current_interval).await;
+                
                 if let Err(e) = actor_ref_clone.tell(WebSocketTell::HealthCheck).send().await {
                     warn!("Failed to send health check: {}", e);
                     break;
                 }
+                
+                // Adaptive interval: increase check frequency when connection seems healthy
+                consecutive_healthy_checks += 1;
+                current_interval = if consecutive_healthy_checks > 10 {
+                    // Connection is stable, reduce frequency
+                    Duration::from_secs(120) // 2 minutes
+                } else if consecutive_healthy_checks > 5 {
+                    // Connection is becoming stable
+                    Duration::from_secs(90) // 1.5 minutes
+                } else {
+                    // Connection might be unstable, check more frequently
+                    Duration::from_secs(30) // 30 seconds
+                };
+                
+                debug!("📡 Health check interval adapted to {:?} (healthy checks: {})", 
+                       current_interval, consecutive_healthy_checks);
             }
         });
         
-        // Start periodic batch flush task to prevent stuck candles
+        // Start adaptive batch flush task to prevent stuck candles
         let batch_flush_ref = actor_ref.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(200)); // Flush every 200ms
+            let mut flush_interval = Duration::from_millis(500); // Start conservative
+            let mut empty_flush_count = 0u32;
+            
             loop {
-                interval.tick().await;
+                tokio::time::sleep(flush_interval).await;
+                
                 if let Err(e) = batch_flush_ref.tell(WebSocketTell::FlushBatches).send().await {
                     warn!("Failed to send batch flush: {}", e);
                     break;
+                }
+                
+                // Adaptive flushing: reduce frequency if no work is being done
+                empty_flush_count += 1;
+                flush_interval = if empty_flush_count > 20 {
+                    // No batches to flush for a while, reduce frequency
+                    Duration::from_millis(1000) // 1 second
+                } else if empty_flush_count > 10 {
+                    // Some idle time, moderate frequency
+                    Duration::from_millis(750) // 750ms
+                } else {
+                    // Active processing, maintain high frequency
+                    Duration::from_millis(200) // 200ms
+                };
+                
+                // Reset counter periodically to detect activity changes
+                if empty_flush_count > 30 {
+                    empty_flush_count = 10; // Reset but keep some history
                 }
             }
         });
@@ -642,51 +834,87 @@ impl Message<WebSocketTell> for WebSocketActor {
                     debug!("📝 Updated last processed candle time for {}: {}", symbol, candle.close_time);
                 }
                 
-                // Add to recent cache immediately (synchronous, fast operation)
-                let mut recent_candles = self.recent_candles.entry(symbol.to_string()).or_insert_with(|| VecDeque::with_capacity(self.max_recent_candles));
-                recent_candles.push_back(candle.clone());
-                if recent_candles.len() > self.max_recent_candles {
-                    recent_candles.pop_front();
-                }
+                // Add to recent cache immediately with optimized LRU (synchronous, fast operation)
+                let now = Instant::now();
+                {
+                    let mut cache_entry = self.recent_candles.entry(symbol.to_string()).or_insert_with(|| {
+                        CacheEntry {
+                            candles: VecDeque::with_capacity(self.max_recent_candles),
+                            last_access: now,
+                        }
+                    });
+                    cache_entry.last_access = now;
+                    cache_entry.candles.push_back(candle.clone());
+                    if cache_entry.candles.len() > self.max_recent_candles {
+                        cache_entry.candles.pop_front();
+                    }
+                } // Drop the borrow here
                 
-                // Spawn background task for all heavy operations (non-blocking)
+                // Perform lightweight cache maintenance (now that borrow is dropped)
+                self.cleanup_cache();
+                
+                // Spawn background task for all heavy operations with backpressure control
                 let lmdb_actor = self.lmdb_actor.clone();
                 let postgres_actor = self.postgres_actor.clone();
                 let timeframe_actor = self.timeframe_actor.clone();
+                let lmdb_semaphore = Arc::clone(&self.lmdb_semaphore);
+                let postgres_semaphore = Arc::clone(&self.postgres_semaphore);
                 let symbol_owned = symbol.to_string();
                 let candle_arc = Arc::clone(&candle); // Clone the Arc (cheap)
                 
                 tokio::spawn(async move {
-                    // Background storage operations (LMDB)
+                    // Background storage operations with backpressure control
                     if is_closed {
+                        // LMDB storage with semaphore-based backpressure
                         if let Some(lmdb_actor) = lmdb_actor {
-                            let msg = LmdbActorTell::StoreCandlesAsync {
-                                symbol: symbol_owned.clone(),
-                                timeframe: 60,
-                                candles: vec![(*candle_arc).clone()], // Dereference Arc and clone candle data
-                            };
-                            
-                            if let Err(e) = lmdb_actor.tell(msg).send().await {
-                                error!("❌ Background LMDB storage failed for {}: {}", symbol_owned, e);
+                            // Try to acquire semaphore permit (non-blocking check)
+                            match lmdb_semaphore.try_acquire() {
+                                Ok(_permit) => {
+                                    let msg = LmdbActorTell::StoreCandlesAsync {
+                                        symbol: symbol_owned.clone(),
+                                        timeframe: 60,
+                                        candles: vec![(*candle_arc).clone()], // Dereference Arc and clone candle data
+                                    };
+                                    
+                                    if let Err(e) = lmdb_actor.tell(msg).send().await {
+                                        error!("❌ Background LMDB storage failed for {}: {}", symbol_owned, e);
+                                    } else {
+                                        debug!("✅ LMDB storage completed for {}", symbol_owned);
+                                    }
+                                    // Permit is automatically dropped here
+                                }
+                                Err(_) => {
+                                    // Backpressure activated - skip this operation
+                                    warn!("⚠️ LMDB backpressure: skipping storage for {} (queue full)", symbol_owned);
+                                }
                             }
                         }
                         
-                        // Background PostgreSQL storage
+                        // PostgreSQL storage with semaphore-based backpressure
                         if let Some(postgres_actor) = postgres_actor {
-                            let timestamp = chrono::DateTime::from_timestamp_millis(candle_arc.close_time)
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                                .unwrap_or_else(|| format!("INVALID_TIME({})", candle_arc.close_time));
-                            
-                            let postgres_msg = PostgresTell::StoreCandle {
-                                symbol: symbol_owned.clone(),
-                                candle: (*candle_arc).clone(), // Dereference Arc and clone candle data
-                                source: "WebSocketActor".to_string(),
-                            };
-                            
-                            if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
-                                warn!("❌ Background PostgreSQL storage failed for {}: {}", symbol_owned, e);
-                            } else {
-                                debug!("✅ Background PostgreSQL storage completed: {} @ {}", symbol_owned, timestamp);
+                            match postgres_semaphore.try_acquire() {
+                                Ok(_permit) => {
+                                    let timestamp = chrono::DateTime::from_timestamp_millis(candle_arc.close_time)
+                                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                                        .unwrap_or_else(|| format!("INVALID_TIME({})", candle_arc.close_time));
+                                    
+                                    let postgres_msg = PostgresTell::StoreCandle {
+                                        symbol: symbol_owned.clone(),
+                                        candle: (*candle_arc).clone(), // Dereference Arc and clone candle data
+                                        source: "WebSocketActor".to_string(),
+                                    };
+                                    
+                                    if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
+                                        warn!("❌ PostgreSQL storage failed for {}: {}", symbol_owned, e);
+                                    } else {
+                                        debug!("✅ PostgreSQL storage completed: {} @ {}", symbol_owned, timestamp);
+                                    }
+                                    // Permit is automatically dropped here
+                                }
+                                Err(_) => {
+                                    // Backpressure activated - skip this operation
+                                    warn!("⚠️ PostgreSQL backpressure: skipping storage for {} (queue full)", symbol_owned);
+                                }
                             }
                         }
                     }
@@ -802,16 +1030,33 @@ impl Message<WebSocketTell> for WebSocketActor {
                 self.lmdb_actor = Some(lmdb_actor);
                 info!("✅ LMDB actor reference successfully set in WebSocketActor - centralized storage enabled");
             }
+            WebSocketTell::SetPostgresActor { postgres_actor } => {
+                info!("📨 Setting PostgreSQL actor reference for WebSocketActor");
+                self.postgres_actor = Some(postgres_actor);
+                info!("✅ PostgreSQL actor reference successfully set in WebSocketActor - dual storage enabled");
+            }
             WebSocketTell::FlushBatches => {
                 // Force flush any pending batches to prevent stuck candles
                 let pending_count: usize = self.pending_batch_candles.iter().map(|entry| entry.value().len()).sum();
                 if pending_count > 0 {
                     debug!("🔄 Periodic batch flush: {} pending candles", pending_count);
+                    let start_time = Instant::now();
                     if let Err(e) = self.process_batches().await {
                         warn!("Failed to flush batches: {}", e);
                     } else {
-                        self.last_batch_time = Some(std::time::Instant::now());
+                        let processing_time = start_time.elapsed();
+                        
+                        // Track processing time for adaptive batching
+                        self.batch_processing_times.push(processing_time);
+                        if self.batch_processing_times.len() > 100 {
+                            self.batch_processing_times.remove(0);
+                        }
+                        
+                        self.last_batch_time = Some(start_time);
+                        debug!("⚡ Periodic flush completed in {:?}", processing_time);
                     }
+                } else {
+                    debug!("🔄 Periodic flush: no pending candles");
                 }
             }
         }

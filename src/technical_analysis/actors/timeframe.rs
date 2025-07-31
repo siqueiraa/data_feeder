@@ -482,14 +482,14 @@ impl TimeFrameActor {
             if let Some(day_candles) = daily_groups.get(day) {
                 // Sort candles for this day
                 let mut sorted_candles = day_candles.clone();
-                sorted_candles.sort_by_key(|c| c.close_time);
+                sorted_candles.sort_by_key(|c| c.open_time);
                 
                 // Check gaps only within this specific day
                 for window in sorted_candles.windows(2) {
-                    let time_diff = window[1].close_time - window[0].close_time;
+                    let time_diff = window[1].open_time - window[0].open_time;
                     if time_diff > 3_600_000 { // Gap > 1 hour
                         let gap_mins = time_diff / 60_000;
-                        large_gaps.push((window[0].close_time, window[1].close_time, gap_mins));
+                        large_gaps.push((window[0].open_time, window[1].open_time, gap_mins));
                     }
                 }
             }

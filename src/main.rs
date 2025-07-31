@@ -9,8 +9,10 @@ use data_feeder::technical_analysis::{
 };
 use data_feeder::postgres::{PostgresActor, PostgresConfig};
 use data_feeder::kafka::{KafkaActor, KafkaConfig};
-use data_feeder::health::{start_health_server, HealthConfig, HealthDependencies};
+use data_feeder::health::HealthDependencies;
 use data_feeder::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
+use data_feeder::metrics::{init_metrics};
+use data_feeder::metrics_server::start_metrics_server;
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
@@ -385,6 +387,17 @@ async fn main() {
         .with_env_filter("info,data_feeder=info")
         .init();
 
+    // Initialize Prometheus metrics
+    match init_metrics() {
+        Ok(_) => info!("📊 Prometheus metrics initialized successfully"),
+        Err(e) => {
+            error!("❌ Failed to initialize metrics: {}", e);
+            return;
+        }
+    }
+
+    // Metrics server will be started after actors are launched
+
     info!("🚀 Starting Data Feeder - Production Mode");
     
     // Try to load configuration from config.toml, fallback to default if not found
@@ -692,21 +705,34 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         info!("✅ Connected WebSocketActor to LmdbActor");
     }
     
+    // 🐘 Connect WebSocket actor to PostgreSQL actor for dual storage
+    if let Some(ref postgres_ref) = postgres_actor {
+        info!("🔗 Connecting WebSocketActor to PostgreSQL for dual storage...");
+        let set_postgres_msg = WebSocketTell::SetPostgresActor {
+            postgres_actor: postgres_ref.clone(),
+        };
+        if let Err(e) = ws_actor.tell(set_postgres_msg).send().await {
+            error!("Failed to set PostgreSQL actor on WebSocketActor: {}", e);
+        } else {
+            info!("✅ Connected WebSocketActor to PostgreSQL");
+        }
+    } else {
+        warn!("⚠️  PostgreSQL actor not available for WebSocket dual storage");
+    }
+    
     // Allow actors to initialize
     sleep(Duration::from_millis(500)).await;
     
-    // Start health check server
-    info!("🏥 Starting health check server...");
-    let health_config = HealthConfig::default();
+    // Start consolidated metrics and health server with actual actor dependencies
+    info!("🏥📊 Starting consolidated metrics and health server...");
     let health_dependencies = HealthDependencies {
         kafka_actor: kafka_actor.clone(),
         postgres_actor: postgres_actor.clone(),
     };
     
-    // Start health server as background task
     tokio::spawn(async move {
-        if let Err(e) = start_health_server(health_config, health_dependencies).await {
-            error!("💥 Health server failed: {}", e);
+        if let Err(e) = start_metrics_server(9876, health_dependencies).await {
+            error!("💥 Consolidated metrics/health server failed: {}", e);
         }
     });
     
@@ -846,8 +872,8 @@ async fn start_realtime_streaming(
 /// Main continuous monitoring loop (WebSocket already running)
 async fn run_continuous_monitoring(
     config: DataFeederConfig,
-    _lmdb_actor: ActorRef<LmdbActor>,
-    _historical_actor: ActorRef<HistoricalActor>,
+    lmdb_actor: ActorRef<LmdbActor>,
+    historical_actor: ActorRef<HistoricalActor>,
     api_actor: ActorRef<ApiActor>,
     ws_actor: ActorRef<WebSocketActor>,
     _postgres_actor: Option<ActorRef<PostgresActor>>,
@@ -885,7 +911,7 @@ async fn run_continuous_monitoring(
             _ = health_check_interval.tick() => {
                 let health_check_start = std::time::Instant::now();
                 info!("💓 Performing health check...");
-                perform_health_check(&config, &api_actor, &ws_actor, &ta_actors).await;
+                perform_health_check(&config, &api_actor, &ws_actor, &lmdb_actor, &historical_actor, &ta_actors).await;
                 let health_check_elapsed = health_check_start.elapsed();
                 info!("✅ Health check completed in {:?}", health_check_elapsed);
             }
@@ -905,6 +931,8 @@ async fn perform_health_check(
     config: &DataFeederConfig,
     api_actor: &ActorRef<ApiActor>,
     ws_actor: &ActorRef<WebSocketActor>,
+    lmdb_actor: &ActorRef<LmdbActor>,
+    historical_actor: &ActorRef<HistoricalActor>,
     ta_actors: &Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>
 ) {
     let health_check_start = std::time::Instant::now();
@@ -1037,6 +1065,8 @@ async fn perform_health_check(
                     timeframe_seconds,
                     window_start,
                     now,
+                    lmdb_actor,
+                    historical_actor,
                     api_actor
                 );
                 
@@ -1065,12 +1095,14 @@ async fn perform_health_check(
     info!("🎯 Health check completed in {:?}", health_check_total_elapsed);
 }
 
-/// Check for gaps in recent data and trigger filling if needed
+/// Check for gaps in recent data using comprehensive LmdbActor validation (same as startup)
 async fn check_for_recent_gaps(
     symbol: &str,
     timeframe_seconds: u64,
-    _start_time: i64,
+    start_time: i64,
     end_time: i64,
+    lmdb_actor: &ActorRef<LmdbActor>,
+    historical_actor: &ActorRef<HistoricalActor>,
     api_actor: &ActorRef<ApiActor>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let interval = match timeframe_seconds {
@@ -1081,52 +1113,82 @@ async fn check_for_recent_gaps(
         _ => return Err(format!("Unsupported timeframe: {}s", timeframe_seconds).into()),
     };
     
-    // Get current data range to check for gaps
-    debug!("🔍 Starting gap check for {} {} (window: {} minutes)", symbol, interval, (end_time - _start_time) / (60 * 1000));
-    let range_start = std::time::Instant::now();
+    info!("🔍 Periodic gap detection for {} {} (window: {} minutes)", 
+          symbol, interval, (end_time - start_time) / (60 * 1000));
     
-    match api_actor.ask(ApiAsk::GetDataRange {
+    // Use the SAME comprehensive gap detection as startup
+    let gaps = match lmdb_actor.ask(LmdbActorMessage::ValidateDataRange {
         symbol: symbol.to_string(),
-        interval: interval.to_string(),
-    }).await {
-        Ok(ApiReply::DataRange { earliest, latest, count, .. }) => {
-            let range_elapsed = range_start.elapsed();
-            debug!("📊 {} {} data check completed in {:?}: earliest={:?}, latest={:?}, count={}", 
-                   symbol, interval, range_elapsed, earliest, latest, count);
-            
-            // Check if we have recent data
-            if let Some(latest_data) = latest {
-                let gap_duration_ms = end_time - latest_data;
-                let gap_minutes = gap_duration_ms / (60 * 1000);
-                
-                // If gap is > 2 minutes (allows for normal 1-minute delay), fill it
-                if gap_minutes > 2 {
-                    info!("🕳️ Found {} minute gap in {} {} - triggering fill", gap_minutes, symbol, interval);
-                    
-                    let gap_fill_msg = ApiTell::FillGap {
-                        symbol: symbol.to_string(),
-                        interval: interval.to_string(),
-                        start_time: latest_data + (timeframe_seconds * 1000) as i64, // Start from next candle
-                        end_time: end_time - (timeframe_seconds * 1000) as i64, // End at previous candle
-                    };
-                    
-                    if let Err(e) = api_actor.tell(gap_fill_msg).send().await {
-                        warn!("⚠️ Failed to trigger gap fill for {} {}: {}", symbol, interval, e);
-                    } else {
-                        info!("✅ Triggered gap fill for {} {} ({} minutes)", symbol, interval, gap_minutes);
-                    }
-                } else {
-                    debug!("✅ {} {} data is current (gap: {} minutes)", symbol, interval, gap_minutes);
-                }
-            } else {
-                warn!("⚠️ No data found for {} {} - may need historical backfill", symbol, interval);
+        timeframe: timeframe_seconds,
+        start: start_time,
+        end: end_time,
+    }).send().await {
+        Ok(LmdbActorResponse::ValidationResult { gaps }) => {
+            if gaps.is_empty() {
+                debug!("✅ Periodic check: No gaps found for {} {}", symbol, interval);
+                return Ok(());
             }
+            info!("🕳️ Periodic check: Found {} gaps for {} {}", gaps.len(), symbol, interval);
+            gaps
         }
-        Ok(_) => {
-            warn!("⚠️ Unexpected reply type for GetDataRange");
+        Ok(LmdbActorResponse::ErrorResponse(e)) => {
+            return Err(format!("LmdbActor validation failed: {}", e).into());
         }
-        Err(e) => {
-            warn!("⚠️ Failed to get data range for {} {}: {}", symbol, interval, e);
+        Ok(_) => return Err("Unexpected response from LmdbActor".into()),
+        Err(e) => return Err(format!("Failed to communicate with LmdbActor: {}", e).into()),
+    };
+    
+    // Process each gap found (same logic as startup)
+    for &(gap_start, gap_end) in &gaps {
+        let gap_duration_hours = (gap_end - gap_start) / (1000 * 3600);
+        
+        // Convert timestamps to human-readable format
+        let gap_start_str = chrono::DateTime::from_timestamp_millis(gap_start)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| format!("INVALID_TIME({})", gap_start));
+        let gap_end_str = chrono::DateTime::from_timestamp_millis(gap_end)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| format!("INVALID_TIME({})", gap_end));
+        
+        warn!("🕳️ [Periodic] Gap detected for {}: {} to {} ({} hours)", 
+              symbol, gap_start_str, gap_end_str, gap_duration_hours);
+        
+        // Smart gap filling: use appropriate actor based on gap size
+        if gap_duration_hours > 24 {
+            // Large gap → HistoricalActor (S3 bulk download)
+            info!("🏛️ [Periodic] Assigning large gap to HistoricalActor (S3 bulk download)");
+            
+            match historical_actor.ask(HistoricalAsk::GetCandles {
+                symbol: symbol.to_string(),
+                timeframe: timeframe_seconds,
+                start_time: gap_start,
+                end_time: gap_end,
+            }).await {
+                Ok(_) => {
+                    info!("✅ [Periodic] HistoricalActor completed gap filling: {} to {}", gap_start_str, gap_end_str);
+                },
+                Err(e) => {
+                    warn!("⚠️ [Periodic] HistoricalActor failed: {}. Falling back to ApiActor", e);
+                    // Fallback to API actor for smaller chunks
+                }
+            }
+        } else {
+            // Small gap (≤24h) → ApiActor (targeted API calls)
+            info!("⚡ [Periodic] Assigning small gap to ApiActor (targeted API)");
+            
+            let gap_fill_msg = ApiTell::FillGap {
+                symbol: symbol.to_string(),
+                interval: interval.to_string(),
+                start_time: gap_start,
+                end_time: gap_end,
+            };
+            
+            if let Err(e) = api_actor.tell(gap_fill_msg).send().await {
+                warn!("⚠️ [Periodic] Failed to trigger gap fill for {} {}: {}", symbol, interval, e);
+            } else {
+                info!("✅ [Periodic] Triggered gap fill: {} {} from {} to {}", 
+                      symbol, interval, gap_start_str, gap_end_str);
+            }
         }
     }
     

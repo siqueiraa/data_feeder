@@ -250,12 +250,15 @@ impl HistoricalActor {
             
             let postgres_ref = postgres_actor.clone();
             let symbol_for_log = symbol_owned.clone();
+            let start_log = start_timestamp.clone();
+            let end_log = end_timestamp.clone();
             tokio::spawn(async move {
+                info!("🚀 [HistoricalActor] Spawned task sending {} candles to PostgreSQL for {}", candles_len, symbol_for_log);
                 if let Err(e) = postgres_ref.tell(postgres_msg).send().await {
-                    warn!("❌ [HistoricalActor] Failed to store historical batch to PostgreSQL for {}: {}", symbol_owned, e);
+                    error!("❌ [HistoricalActor] Failed to store historical batch to PostgreSQL for {}: {}", symbol_owned, e);
                 } else {
                     info!("✅ [HistoricalActor] Successfully sent {} historical candles to PostgreSQL for {} (range: {} - {})", 
-                          candles_len, symbol_for_log, start_timestamp, end_timestamp);
+                          candles_len, symbol_for_log, start_log, end_log);
                 }
             });
         } else {
