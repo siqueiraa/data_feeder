@@ -1,0 +1,92 @@
+use heed::{Database, Env};
+use heed::types::{SerdeBincode, Str};
+use rustc_hash::FxHashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::historical::errors::HistoricalDataError;
+use crate::historical::structs::{FuturesOHLCVCandle, TimeRange, Seconds};
+use super::constants::*;
+use super::error_utils::ErrorContext;
+use super::shared_data::{intern_symbol};
+use super::lmdb_config::open_lmdb_environment;
+
+/// Database manager for handling LMDB operations
+pub struct DatabaseManager {
+    pub envs: FxHashMap<(Arc<str>, Seconds), Env>,
+    pub candle_dbs: FxHashMap<(Arc<str>, Seconds), Database<Str, SerdeBincode<FuturesOHLCVCandle>>>,
+    pub certified_range_dbs: FxHashMap<(Arc<str>, Seconds), Database<Str, SerdeBincode<TimeRange>>>,
+}
+
+impl Default for DatabaseManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DatabaseManager {
+    pub fn new() -> Self {
+        Self {
+            envs: FxHashMap::default(),
+            candle_dbs: FxHashMap::default(),
+            certified_range_dbs: FxHashMap::default(),
+        }
+    }
+
+    /// Initialize database for a symbol-timeframe combination
+    pub fn initialize_database(
+        &mut self,
+        symbol: &str,
+        timeframe: Seconds,
+        base_path: &Path,
+    ) -> Result<(), HistoricalDataError> {
+        let db_name = format!("{}_{}", symbol, timeframe);
+        let symbol_tf_path = base_path.join(db_name);
+        
+        // Create directory
+        std::fs::create_dir_all(&symbol_tf_path)
+            .with_io_context("Failed to create symbol-timeframe database directory")?;
+
+        // Create LMDB environment using shared configuration
+        let env = open_lmdb_environment(&symbol_tf_path)?;
+
+        // Create transaction and databases
+        let mut wtxn = env.write_txn()
+            .with_db_context(&format!("Failed to create initial LMDB write transaction for {} {}", symbol, timeframe))?;
+
+        let candle_db = env
+            .create_database::<Str, SerdeBincode<FuturesOHLCVCandle>>(&mut wtxn, Some(CANDLES_DB_NAME))
+            .with_db_context(&format!("Failed to create candle database for {} {}", symbol, timeframe))?;
+
+        let certified_range_db = env
+            .create_database(&mut wtxn, Some(CERTIFIED_RANGE_DB_NAME))
+            .with_db_context(&format!("Failed to create certified range database for {} {}", symbol, timeframe))?;
+
+        wtxn.commit()
+            .with_db_context(&format!("Failed to commit creation transaction for {} {}", symbol, timeframe))?;
+
+        // Store references using interned symbol
+        let interned_symbol = intern_symbol(symbol);
+        let key = (interned_symbol, timeframe);
+        self.envs.insert(key.clone(), env);
+        self.candle_dbs.insert(key.clone(), candle_db);
+        self.certified_range_dbs.insert(key, certified_range_db);
+
+        Ok(())
+    }
+
+    /// Initialize databases for multiple symbols and timeframes
+    pub fn initialize_all(
+        &mut self,
+        symbols: &[String],
+        timeframes: &[Seconds],
+        base_path: &Path,
+    ) -> Result<(), HistoricalDataError> {
+        for symbol in symbols {
+            for &timeframe in timeframes {
+                self.initialize_database(symbol, timeframe, base_path)?;
+            }
+        }
+        Ok(())
+    }
+}

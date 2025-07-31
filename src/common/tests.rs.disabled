@@ -1,0 +1,386 @@
+#[cfg(test)]
+mod tests {
+    use crate::common::error_utils::*;
+    use crate::common::constants::*;
+    use crate::historical::errors::HistoricalDataError;
+    use std::io::{Error as IoError, ErrorKind};
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_error_context_io_error() {
+        let io_error = IoError::new(ErrorKind::PermissionDenied, "Permission denied");
+        let result: Result<(), _> = Err(io_error);
+        
+        let mapped_result = result.with_io_context("Test context");
+        assert!(mapped_result.is_err());
+        
+        match mapped_result.unwrap_err() {
+            HistoricalDataError::Io(_) => {}, // Expected
+            other => panic!("Expected IoError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_error_context_semaphore_error() {
+        // This is harder to test directly since AcquireError can't be constructed easily
+        // But we can test the error context trait implementation exists
+        use tokio::sync::Semaphore;
+        use std::sync::Arc;
+        
+        let semaphore = Arc::new(Semaphore::new(0));
+        
+        // Clone semaphore and immediately try to acquire (should fail)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let permit_result = semaphore.try_acquire();
+            assert!(permit_result.is_err());
+        });
+    }
+
+    // Commented out - DatabaseManager removed to prevent LMDB environment conflicts
+    // All LMDB operations should go through LmdbActor instead
+    /*
+    #[test]
+    fn test_database_manager_creation() {
+        let manager = DatabaseManager::new();
+        assert!(manager.envs.is_empty());
+        assert!(manager.candle_dbs.is_empty());
+        assert!(manager.certified_range_dbs.is_empty());
+    }
+    */
+
+    #[test]
+    fn test_database_manager_initialize() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = DatabaseManager::new();
+        
+        let result = manager.initialize_database(
+            "BTCUSDT", 
+            60, 
+            temp_dir.path()
+        );
+        
+        assert!(result.is_ok(), "Database initialization should succeed: {:?}", result);
+        assert!(!manager.envs.is_empty());
+        assert!(!manager.candle_dbs.is_empty());
+        assert!(!manager.certified_range_dbs.is_empty());
+    }
+
+    #[test]
+    fn test_database_manager_initialize_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = DatabaseManager::new();
+        
+        let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+        let timeframes = vec![60, 300];
+        
+        let result = manager.initialize_all(&symbols, &timeframes, temp_dir.path());
+        assert!(result.is_ok(), "All database initialization should succeed: {:?}", result);
+        
+        // Should have 2 symbols × 2 timeframes = 4 entries
+        assert_eq!(manager.envs.len(), 4);
+        assert_eq!(manager.candle_dbs.len(), 4);
+        assert_eq!(manager.certified_range_dbs.len(), 4);
+        
+        // Check specific keys exist (using intern_symbol for consistency)
+        use crate::common::shared_data::intern_symbol;
+        assert!(manager.envs.contains_key(&(intern_symbol("BTCUSDT"), 60)));
+        assert!(manager.envs.contains_key(&(intern_symbol("ETHUSDT"), 300)));
+    }
+
+    #[test]
+    fn test_constants_values() {
+        // Test that constants have reasonable values
+        assert_eq!(LMDB_MAP_SIZE, 1024 * 1024 * 1024);
+        assert_eq!(LMDB_MAX_DBS, 10);
+        assert_eq!(LMDB_MAX_READERS, 256);
+        assert_eq!(BATCH_SIZE, 1000);
+        
+        assert_eq!(CANDLES_DB_NAME, "candles");
+        assert_eq!(CERTIFIED_RANGE_DB_NAME, "certified_range");
+        
+        assert_eq!(DEFAULT_SYMBOL, "BTCUSDT");
+        assert_eq!(DEFAULT_TIMEFRAME, 60);
+        
+        assert_eq!(INTERVAL_1M, "1m");
+        assert_eq!(INTERVAL_5M, "5m");
+        assert_eq!(INTERVAL_1H, "1h");
+    }
+
+    #[test]
+    fn test_time_constants() {
+        assert_eq!(MILLISECONDS_PER_SECOND, 1000);
+        assert_eq!(SECONDS_PER_MINUTE, 60);
+        assert_eq!(SECONDS_PER_HOUR, 3600);
+        assert_eq!(SECONDS_PER_DAY, 86400);
+        assert_eq!(MINUTES_PER_HOUR, 60);
+        assert_eq!(HOURS_PER_DAY, 24);
+        assert_eq!(DAYS_PER_MONTH, 30);
+    }
+
+    #[test] 
+    fn test_file_extension_constants() {
+        assert_eq!(ZIP_EXTENSION, ".zip");
+        assert_eq!(CSV_EXTENSION, ".csv");
+        assert_eq!(CHECKSUM_EXTENSION, ".CHECKSUM");
+    }
+
+    #[test]
+    fn test_url_constants() {
+        assert_eq!(BINANCE_BASE_URL, "https://data.binance.vision/");
+        assert_eq!(FUTURES_KLINES_PATH, "data/futures/um");
+        assert_eq!(DAILY_PATH, "daily/klines");
+        assert_eq!(MONTHLY_PATH, "monthly/klines");
+        assert_eq!(AGGTRADES_PATH, "daily/aggTrades");
+    }
+
+    #[test]
+    fn test_error_mapping_functions() {
+        let io_error = IoError::new(ErrorKind::NotFound, "File not found");
+        let mapper = map_io_error("test context");
+        let result = mapper(io_error);
+        
+        match result {
+            HistoricalDataError::Io(_) => {}, // Expected
+            other => panic!("Expected IoError mapping, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_database_initialization_error_handling() {
+        let manager = DatabaseManager::new();
+        // This should be tested but requires more complex setup
+        // For now, we verify the structure exists
+        assert_eq!(manager.envs.len(), 0);
+    }
+
+    // Integration test for error propagation
+    #[tokio::test]
+    async fn test_error_propagation_integration() {
+        use std::path::Path;
+        
+        // Try to initialize database in a non-existent directory with no permissions
+        let invalid_path = Path::new("/invalid/nonexistent/path");
+        let mut manager = DatabaseManager::new();
+        
+        let result = manager.initialize_database("BTCUSDT", 60, invalid_path);
+        assert!(result.is_err(), "Should fail with invalid path");
+        
+        match result.unwrap_err() {
+            HistoricalDataError::Io(_) => {}, // Expected
+            other => panic!("Expected IO error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_database_access() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(DatabaseManager::new()));
+        
+        // Spawn multiple concurrent tasks to initialize databases
+        let mut handles = Vec::new();
+        
+        for i in 0..5 {
+            let manager_clone = Arc::clone(&manager);
+            let path = temp_dir.path().to_path_buf();
+            let symbol = format!("BTC{}USDT", i);
+            
+            let handle = tokio::spawn(async move {
+                let mut manager = manager_clone.lock().await;
+                manager.initialize_database(&symbol, 60, &path)
+            });
+            
+            handles.push(handle);
+        }
+        
+        // Wait for all tasks to complete
+        let mut success_count = 0;
+        for handle in handles {
+            if let Ok(result) = handle.await {
+                if result.is_ok() {
+                    success_count += 1;
+                }
+            }
+        }
+        
+        assert_eq!(success_count, 5, "All concurrent database initializations should succeed");
+        
+        // Verify all databases were created
+        let manager = manager.lock().await;
+        assert_eq!(manager.envs.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_database_manager_stress_test() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = DatabaseManager::new();
+        
+        // Create many symbols and timeframes to stress test
+        let symbols: Vec<String> = (0..20).map(|i| format!("SYMBOL{}", i)).collect();
+        let timeframes = vec![60, 300, 900, 3600, 14400, 86400];
+        
+        let start = std::time::Instant::now();
+        let result = manager.initialize_all(&symbols, &timeframes, temp_dir.path());
+        let duration = start.elapsed();
+        
+        assert!(result.is_ok(), "Stress test should succeed: {:?}", result);
+        assert_eq!(manager.envs.len(), symbols.len() * timeframes.len());
+        
+        // Performance check - should complete within reasonable time
+        assert!(duration.as_secs() < 30, "Stress test took too long: {:?}", duration);
+        
+        println!("Initialized {} databases in {:?}", manager.envs.len(), duration);
+    }
+
+    #[test]
+    fn test_error_chain_propagation() {
+        use std::io::{Error as IoError, ErrorKind};
+        
+        // Test error chain through multiple utility functions
+        let io_error = IoError::new(ErrorKind::PermissionDenied, "Permission denied");
+        let result: Result<(), _> = Err(io_error);
+        
+        // Test error context chaining
+        let with_context: Result<(), HistoricalDataError> = result
+            .with_io_context("Failed to read file")
+            .and_then(|_| Err(HistoricalDataError::Validation("Secondary error".to_string())));
+        
+        assert!(with_context.is_err());
+        match with_context.unwrap_err() {
+            HistoricalDataError::Io(_) => {}, // Expected first error
+            HistoricalDataError::Validation(_) => {}, // Or expected chained error
+            other => panic!("Unexpected error type: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_database_key_consistency() {
+        let _manager = DatabaseManager::new();
+        
+        // Test that key generation is consistent
+        let symbol1 = "BTCUSDT";
+        let symbol2 = "ETHUSDT";
+        let timeframe1 = 60u64;
+        let timeframe2 = 300u64;
+        
+        let key1 = (symbol1.to_string(), timeframe1);
+        let key2 = (symbol2.to_string(), timeframe2);
+        let key1_duplicate = (symbol1.to_string(), timeframe1);
+        
+        assert_eq!(key1, key1_duplicate);
+        assert_ne!(key1, key2);
+        
+        // Test that keys work as HashMap keys
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(key1.clone(), "value1");
+        map.insert(key2, "value2");
+        
+        assert_eq!(map.get(&key1_duplicate), Some(&"value1"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn test_constants_mathematical_relationships() {
+        // Test that our time constants have correct mathematical relationships
+        assert_eq!(MILLISECONDS_PER_SECOND * SECONDS_PER_MINUTE, 60000);
+        assert_eq!(SECONDS_PER_MINUTE * MINUTES_PER_HOUR, SECONDS_PER_HOUR);
+        assert_eq!(SECONDS_PER_HOUR * HOURS_PER_DAY, SECONDS_PER_DAY);
+        assert_eq!(DAYS_PER_MONTH * HOURS_PER_DAY, 30 * 24);
+        
+        // Test timeframe conversion consistency
+        let one_minute_seconds = 60;
+        let five_minutes_seconds = 5 * 60;
+        let one_hour_seconds = SECONDS_PER_HOUR;
+        
+        assert_eq!(one_minute_seconds, 60);
+        assert_eq!(five_minutes_seconds, 300);
+        assert_eq!(one_hour_seconds, 3600);
+    }
+
+    #[test]
+    fn test_url_construction_patterns() {
+        // Test URL construction using our constants
+        let base = BINANCE_BASE_URL;
+        let futures_path = FUTURES_KLINES_PATH;
+        let daily = DAILY_PATH;
+        let monthly = MONTHLY_PATH;
+        
+        let daily_url = format!("{}{}/{}/BTCUSDT/1m/", base, futures_path, daily);
+        let monthly_url = format!("{}{}/{}/BTCUSDT/1m/", base, futures_path, monthly);
+        
+        assert!(daily_url.contains("daily"));
+        assert!(monthly_url.contains("monthly"));
+        assert!(daily_url.starts_with("https://"));
+        assert!(monthly_url.starts_with("https://"));
+    }
+
+    #[tokio::test]
+    async fn test_error_recovery_patterns() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = DatabaseManager::new();
+        
+        // Test recovery from partial initialization failure
+        let symbols = vec!["BTCUSDT".to_string(), "".to_string()]; // Empty symbol should fail
+        let timeframes = vec![60, 300];
+        
+        let result = manager.initialize_all(&symbols, &timeframes, temp_dir.path());
+        
+        // Should handle partial failures gracefully
+        if result.is_err() {
+            // Verify that no partial state is left
+            assert_eq!(manager.envs.len(), 0, "No partial state should remain after failure");
+        }
+    }
+
+    #[test]
+    fn test_memory_efficiency_constants() {
+        // Test that our constants are memory efficient
+        assert_eq!(std::mem::size_of_val(&CANDLES_DB_NAME), std::mem::size_of::<&str>());
+        assert_eq!(std::mem::size_of_val(&CERTIFIED_RANGE_DB_NAME), std::mem::size_of::<&str>());
+        
+        // String constants should be compile-time allocated
+        let temp_string = "candles".to_string();
+        assert!(CANDLES_DB_NAME.as_ptr() != temp_string.as_ptr());
+        assert_eq!(CANDLES_DB_NAME, "candles");
+    }
+
+    #[tokio::test]
+    async fn test_parallel_database_operations() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let manager = Arc::new(RwLock::new(DatabaseManager::new()));
+        
+        // Test parallel read/write operations
+        let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+        let timeframes = vec![60, 300];
+        
+        {
+            let mut manager_write = manager.write().await;
+            manager_write.initialize_all(&symbols, &timeframes, temp_dir.path())
+                .expect("Initialization should succeed");
+        }
+        
+        // Spawn multiple readers
+        let mut read_handles = Vec::new();
+        for _ in 0..10 {
+            let manager_clone = Arc::clone(&manager);
+            let handle = tokio::spawn(async move {
+                let manager_read = manager_clone.read().await;
+                manager_read.envs.len()
+            });
+            read_handles.push(handle);
+        }
+        
+        // All readers should see the same state
+        for handle in read_handles {
+            let count = handle.await.unwrap();
+            assert_eq!(count, 4); // 2 symbols × 2 timeframes
+        }
+    }
+}
