@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use crate::queue::{TaskQueue, DatabaseQueue};
+use crate::queue::types::QueueConfig;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::message::{Context, Message};
@@ -155,6 +157,11 @@ pub struct WebSocketActor {
     lmdb_semaphore: Arc<Semaphore>,
     /// Semaphore for backpressure control on PostgreSQL operations
     postgres_semaphore: Arc<Semaphore>,
+    /// Queue system for non-blocking operations
+    #[allow(dead_code)] // Future architecture component
+    task_queue: TaskQueue,
+    #[allow(dead_code)] // Future architecture component
+    db_queue: DatabaseQueue,
 }
 
 impl WebSocketActor {
@@ -192,6 +199,21 @@ impl WebSocketActor {
                 .map_err(|e| WebSocketError::Unknown(format!("Failed to create base path: {}", e)))?;
         }
 
+        // Initialize queue system for non-blocking operations
+        let task_config = QueueConfig {
+            max_workers: 4,
+            ..QueueConfig::default()
+        };
+        let db_config = QueueConfig {
+            max_workers: 2,
+            batch_size: 10, // Batch candles for better performance
+            batch_timeout: Duration::from_millis(100),
+            ..QueueConfig::default()
+        };
+        
+        let task_queue = TaskQueue::new(task_config);
+        let db_queue = DatabaseQueue::new(db_config, None); // No direct LMDB access - use LmdbActor instead
+        
         let now = Instant::now();
         Ok(Self {
             connection_manager,
@@ -217,6 +239,8 @@ impl WebSocketActor {
             cache_cleanup_interval: 300, // Cleanup every 5 minutes
             lmdb_semaphore: Arc::new(Semaphore::new(10)), // Max 10 concurrent LMDB operations
             postgres_semaphore: Arc::new(Semaphore::new(5)), // Max 5 concurrent PostgreSQL operations
+            task_queue,
+            db_queue,
         })
     }
 

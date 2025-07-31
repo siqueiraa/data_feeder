@@ -10,6 +10,7 @@ use super::types::{Priority, QueueTask, QueueConfig, QueueStats, CpuTask, Blocki
 use super::metrics::QueueMetrics;
 
 /// Priority-based task queue with non-blocking execution
+#[derive(Debug)]
 pub struct TaskQueue {
     config: QueueConfig,
     task_sender: mpsc::UnboundedSender<CpuTask>,
@@ -360,7 +361,7 @@ mod tests {
             max_workers: 1, // Force serialization
             ..Default::default()
         };
-        let queue = TaskQueue::new(config);
+        let queue = Arc::new(TaskQueue::new(config));
         let execution_order = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let mut handles = Vec::new();
@@ -369,20 +370,18 @@ mod tests {
         for (i, priority) in [(0, Priority::Low), (1, Priority::High), (2, Priority::Critical)].iter() {
             let order = execution_order.clone();
             let task_id = *i;
+            let queue = queue.clone();
             
-            let handle = tokio::spawn({
-                let queue = &queue;
-                async move {
-                    queue.submit_blocking(
-                        Box::new(move || {
-                            let mut order = order.lock().unwrap();
-                            order.push(task_id);
-                            Ok(())
-                        }),
-                        *priority,
-                        Some(Duration::from_secs(5)),
-                    ).await
-                }
+            let handle = tokio::spawn(async move {
+                queue.submit_blocking(
+                    Box::new(move || {
+                        let mut order = order.lock().unwrap();
+                        order.push(task_id);
+                        Ok(())
+                    }),
+                    *priority,
+                    Some(Duration::from_secs(5)),
+                ).await
             });
             handles.push(handle);
         }
@@ -424,24 +423,22 @@ mod tests {
             max_workers: 4,
             ..Default::default()
         };
-        let queue = TaskQueue::new(config);
+        let queue = Arc::new(TaskQueue::new(config));
         let counter = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::new();
         for _ in 0..10 {
             let counter = counter.clone();
-            let handle = tokio::spawn({
-                let queue = &queue;
-                async move {
-                    queue.submit_blocking(
-                        Box::new(move || {
-                            counter.fetch_add(1, Ordering::SeqCst);
-                            Ok(())
-                        }),
-                        Priority::Normal,
-                        Some(Duration::from_secs(1)),
-                    ).await
-                }
+            let queue = queue.clone();
+            let handle = tokio::spawn(async move {
+                queue.submit_blocking(
+                    Box::new(move || {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                    Priority::Normal,
+                    Some(Duration::from_secs(1)),
+                ).await
             });
             handles.push(handle);
         }

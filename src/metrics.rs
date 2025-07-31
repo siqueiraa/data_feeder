@@ -38,6 +38,8 @@ pub struct MetricsRegistry {
     pub simd_operations_total: IntCounterVec,
     pub memory_pool_allocations_total: IntCounterVec,
     pub t_digest_updates_total: IntCounterVec,
+    pub t_digest_size_gauge: IntGaugeVec,
+    pub t_digest_memory_bytes: IntGaugeVec,
     
     // Error Tracking
     pub error_count_by_type: IntCounterVec,
@@ -152,6 +154,16 @@ impl MetricsRegistry {
             &["symbol", "quantile_type"]
         )?;
         
+        let t_digest_size_gauge = IntGaugeVec::new(
+            Opts::new("t_digest_size_centroids", "Number of centroids in T-Digest"),
+            &["symbol", "digest_type"]
+        )?;
+        
+        let t_digest_memory_bytes = IntGaugeVec::new(
+            Opts::new("t_digest_memory_bytes", "Estimated T-Digest memory usage in bytes"),
+            &["symbol", "digest_type"]
+        )?;
+        
         // Error Tracking
         let error_count_by_type = IntCounterVec::new(
             Opts::new("error_count_by_type", "Total errors by type"),
@@ -179,15 +191,17 @@ impl MetricsRegistry {
         registry.register(Box::new(simd_operations_total.clone()))?;
         registry.register(Box::new(memory_pool_allocations_total.clone()))?;
         registry.register(Box::new(t_digest_updates_total.clone()))?;
+        registry.register(Box::new(t_digest_size_gauge.clone()))?;
+        registry.register(Box::new(t_digest_memory_bytes.clone()))?;
         registry.register(Box::new(error_count_by_type.clone()))?;
         registry.register(Box::new(panic_count_total.clone()))?;
         
         let _total_metrics = if tokio_metrics_collector.is_some() { 
-            info!("Prometheus metrics registry initialized with {} business metrics + tokio task metrics", 17);
-            17 + 9 // 17 business metrics + 9 tokio task metrics
+            info!("Prometheus metrics registry initialized with {} business metrics + tokio task metrics", 19);
+            19 + 9 // 19 business metrics + 9 tokio task metrics
         } else {
-            info!("Prometheus metrics registry initialized with {} business metrics (tokio metrics disabled)", 17);
-            17
+            info!("Prometheus metrics registry initialized with {} business metrics (tokio metrics disabled)", 19);
+            19
         };
         
         // Add some initial test data to verify metrics are working
@@ -209,6 +223,8 @@ impl MetricsRegistry {
             simd_operations_total,
             memory_pool_allocations_total,
             t_digest_updates_total,
+            t_digest_size_gauge,
+            t_digest_memory_bytes,
             error_count_by_type,
             panic_count_total,
         };
@@ -269,6 +285,16 @@ impl MetricsRegistry {
         self.t_digest_updates_total
             .with_label_values(&[symbol, quantile_type])
             .inc();
+    }
+    
+    /// Record T-Digest size metrics for memory monitoring
+    pub fn record_t_digest_size(&self, symbol: &str, digest_type: &str, centroids: usize, estimated_bytes: usize) {
+        self.t_digest_size_gauge
+            .with_label_values(&[symbol, digest_type])
+            .set(centroids as i64);
+        self.t_digest_memory_bytes
+            .with_label_values(&[symbol, digest_type])
+            .set(estimated_bytes as i64);
     }
     
     /// Update system health metrics

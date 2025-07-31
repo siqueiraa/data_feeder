@@ -67,6 +67,7 @@ impl Clone for IoResult {
 }
 
 /// Non-blocking I/O queue with worker pool
+#[derive(Debug)]
 pub struct IoQueue {
     config: QueueConfig,
     task_sender: mpsc::UnboundedSender<IoTask<IoResult>>,
@@ -468,7 +469,7 @@ impl IoQueue {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::Duration;
 
     #[tokio::test]
     async fn test_file_operations() {
@@ -544,7 +545,7 @@ mod tests {
             max_workers: 1, // Force serialization
             ..Default::default()
         };
-        let io_queue = IoQueue::new(config);
+        let io_queue = Arc::new(IoQueue::new(config));
 
         let mut handles = Vec::new();
 
@@ -552,19 +553,15 @@ mod tests {
         for (i, priority) in [(0, Priority::Low), (1, Priority::High), (2, Priority::Critical)].iter() {
             let test_file = temp_dir.path().join(format!("test_{}.txt", i));
             let content = format!("Content {}", i).into_bytes();
+            let io_queue = io_queue.clone();
             
-            let handle = tokio::spawn({
-                let io_queue = &io_queue;
-                let test_file = test_file.clone();
-                let content = content.clone();
-                async move {
-                    io_queue.write_file(
-                        &test_file,
-                        content,
-                        *priority,
-                        Some(Duration::from_secs(5)),
-                    ).await
-                }
+            let handle = tokio::spawn(async move {
+                io_queue.write_file(
+                    &test_file,
+                    content,
+                    *priority,
+                    Some(Duration::from_secs(5)),
+                ).await
             });
             handles.push(handle);
         }
@@ -582,26 +579,22 @@ mod tests {
             max_workers: 4,
             ..Default::default()
         };
-        let io_queue = IoQueue::new(config);
+        let io_queue = Arc::new(IoQueue::new(config));
 
         let mut handles = Vec::new();
         
         for i in 0..10 {
             let test_file = temp_dir.path().join(format!("concurrent_{}.txt", i));
             let content = format!("Content {}", i).into_bytes();
+            let io_queue = io_queue.clone();
             
-            let handle = tokio::spawn({
-                let io_queue = &io_queue;
-                let test_file = test_file.clone();
-                let content = content.clone();
-                async move {
-                    io_queue.write_file(
-                        &test_file,
-                        content,
-                        Priority::Normal,
-                        Some(Duration::from_secs(1)),
-                    ).await
-                }
+            let handle = tokio::spawn(async move {
+                io_queue.write_file(
+                    &test_file,
+                    content,
+                    Priority::Normal,
+                    Some(Duration::from_secs(1)),
+                ).await
             });
             handles.push(handle);
         }

@@ -49,10 +49,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "performance_benchmark"
 harness = false
 
-[[bin]]
-name = "performance_test"
-path = "performance_test.rs"
-
 # PHASE 11 + SIMD OPTIMIZATION: Maximum performance compiler settings
 [profile.release]
 lto = "fat"                    # Full Link Time Optimization
@@ -73,3 +69,7 @@ opt-level = 3                  # Maximum optimization level
 #
 # Alternative: Use bolt for post-link optimization:
 # llvm-bolt ./target/release/data_feeder -data=profile.fdata -reorder-functions -o data_feeder_bolt
+
+[[bin]]
+name = "test_tdigest_performance"
+path = "test_tdigest_performance.rs"

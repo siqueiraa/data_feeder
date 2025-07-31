@@ -54,6 +54,7 @@ pub struct RateLimitStats {
 }
 
 /// Intelligent rate limiting queue for API calls
+#[derive(Debug)]
 pub struct RateLimitingQueue<T> {
     config: QueueConfig,
     #[allow(dead_code)] // Used in rate limiting logic, kept for API completeness
@@ -460,7 +461,7 @@ impl<T: Send + 'static> RateLimitingQueue<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::Duration;
 
     #[tokio::test]
     async fn test_rate_limiting() {
@@ -477,23 +478,21 @@ mod tests {
             ..Default::default()
         };
         
-        let queue: RateLimitingQueue<i32> = RateLimitingQueue::new(config, rate_config);
+        let queue: Arc<RateLimitingQueue<i32>> = Arc::new(RateLimitingQueue::new(config, rate_config));
 
         // Submit requests rapidly
         let mut handles = Vec::new();
         for i in 0..10 {
-            let handle = tokio::spawn({
-                let queue = &queue;
-                async move {
-                    let task = Box::pin(async move { Ok(i) });
-                    queue.submit_request(
-                        task,
-                        format!("/api/endpoint/{}", i),
-                        Priority::Normal,
-                        1,
-                        Some(Duration::from_secs(5)),
-                    ).await
-                }
+            let queue = queue.clone();
+            let handle = tokio::spawn(async move {
+                let task = Box::pin(async move { Ok(i) });
+                queue.submit_request(
+                    task,
+                    format!("/api/endpoint/{}", i),
+                    Priority::Normal,
+                    1,
+                    Some(Duration::from_secs(5)),
+                ).await
             });
             handles.push(handle);
         }
@@ -529,7 +528,7 @@ mod tests {
             ..Default::default()
         };
         
-        let queue: RateLimitingQueue<i32> = RateLimitingQueue::new(config, rate_config);
+        let queue: Arc<RateLimitingQueue<i32>> = Arc::new(RateLimitingQueue::new(config, rate_config));
         let execution_order = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
         let mut handles = Vec::new();
@@ -538,24 +537,22 @@ mod tests {
         for (i, priority) in [(0, Priority::Low), (1, Priority::High), (2, Priority::Critical)].iter() {
             let order = execution_order.clone();
             let task_id = *i;
+            let queue = queue.clone();
             
-            let handle = tokio::spawn({
-                let queue = &queue;
-                async move {
-                    let task = Box::pin(async move {
-                        let mut order = order.lock().await;
-                        order.push(task_id);
-                        Ok(task_id)
-                    });
-                    
-                    queue.submit_request(
-                        task,
-                        format!("/api/{}", task_id),
-                        *priority,
-                        1,
-                        Some(Duration::from_secs(10)),
-                    ).await
-                }
+            let handle = tokio::spawn(async move {
+                let task = Box::pin(async move {
+                    let mut order = order.lock().await;
+                    order.push(task_id);
+                    Ok(task_id)
+                });
+                
+                queue.submit_request(
+                    task,
+                    format!("/api/{}", task_id),
+                    *priority,
+                    1,
+                    Some(Duration::from_secs(10)),
+                ).await
             });
             handles.push(handle);
         }

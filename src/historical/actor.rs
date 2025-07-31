@@ -13,6 +13,8 @@ use rustc_hash::FxHashMap;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use rayon::prelude::*;
+use crate::queue::{TaskQueue, IoQueue, DatabaseQueue, RateLimitingQueue, Priority};
+use crate::queue::types::QueueConfig;
 
 use super::errors::HistoricalDataError;
 use super::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS, Seconds, FuturesExchangeTrade};
@@ -27,11 +29,17 @@ use super::utils::{
 
 // Moved to common::constants
 
-#[derive(Debug)]
 pub struct HistoricalActor {
     csv_path: PathBuf,
     postgres_actor: Option<ActorRef<PostgresActor>>,
     lmdb_actor: Option<ActorRef<LmdbActor>>,
+    // Queue system for non-blocking operations
+    task_queue: TaskQueue,
+    io_queue: IoQueue,
+    #[allow(dead_code)] // Future architecture component
+    db_queue: DatabaseQueue,
+    #[allow(dead_code)] // Future architecture component  
+    rate_limiter: RateLimitingQueue<String>,
 }
 
 impl HistoricalActor {
@@ -43,12 +51,45 @@ impl HistoricalActor {
                 .with_io_context("Failed to create CSV directory")?;
         }
 
+        // Initialize queue system for non-blocking operations
+        let task_config = QueueConfig {
+            max_workers: 8,
+            ..QueueConfig::default()
+        };
+        let io_config = QueueConfig {
+            max_workers: 4,
+            ..QueueConfig::default()
+        };
+        let db_config = QueueConfig {
+            max_workers: 2,
+            ..QueueConfig::default()
+        };
+        
+        let task_queue = TaskQueue::new(task_config);
+        let io_queue = IoQueue::new(io_config);
+        let db_queue = DatabaseQueue::new(db_config, None); // No direct LMDB access - use LmdbActor instead
+        
+        // Configure rate limiter for Binance API
+        let rate_config = crate::queue::rate_limiter::RateLimitConfig {
+            max_requests: 1200,
+            window_duration: std::time::Duration::from_secs(60),
+            burst_allowance: 100,
+            min_delay: std::time::Duration::from_millis(50),
+            adaptive: true,
+        };
+        let rate_limiter = RateLimitingQueue::new(QueueConfig::default(), rate_config);
+
         info!("HistoricalActor initialized - LMDB operations will be delegated to LmdbActor");
+        info!("🚀 Queue system initialized: 8 CPU workers, 4 I/O workers, 2 DB workers, 1200 req/min rate limit");
 
         Ok(Self { 
             csv_path: csv_path.to_path_buf(),
             postgres_actor: None,
             lmdb_actor: None,
+            task_queue,
+            io_queue,
+            db_queue,
+            rate_limiter,
         })
     }
 
@@ -142,7 +183,7 @@ impl HistoricalActor {
             format_timestamp(end_time)
         );
 
-        // Delegate storage to LmdbActor
+        // Delegate storage to LmdbActor (LmdbActor already handles non-blocking operations)
         if let Some(lmdb_actor) = &self.lmdb_actor {
             let message = LmdbActorMessage::StoreCandles {
                 symbol: symbol.to_string(),
@@ -541,7 +582,7 @@ impl HistoricalActor {
             .collect()
     }
 
-    /// Download and parse a single trade file for a specific date
+    /// Download and parse a single trade file for a specific date (using queues for non-blocking I/O)
     async fn fetch_single_trade_file(
         &self,
         zip_url: String,
@@ -557,7 +598,9 @@ impl HistoricalActor {
         let checksum_local_path = self.csv_path.join(
             checksum_url.rsplit('/').next().unwrap_or("unknown_checksum"));
 
-        let file_exists = tokio::fs::try_exists(&csv_local_path).await.unwrap_or(false);
+        // Use I/O queue for file existence check (non-blocking)
+        let file_exists = self.io_queue.file_exists(&csv_local_path, Priority::Normal, None)
+            .await.map_err(|e| HistoricalDataError::StorageError(format!("File existence check failed: {}", e)))?;
 
         if file_exists {
             self.load_existing_trade_file(&csv_local_path, &semaphore).await
@@ -569,30 +612,35 @@ impl HistoricalActor {
         }
     }
 
-    /// Load an existing CSV trade file
+    /// Load an existing CSV trade file (using queues for non-blocking I/O and parsing)
     async fn load_existing_trade_file(
         &self,
         csv_local_path: &std::path::Path,
-        semaphore: &Arc<Semaphore>,
+        _semaphore: &Arc<Semaphore>, // No longer needed - queue handles concurrency control
     ) -> Result<Vec<FuturesExchangeTrade>, HistoricalDataError> {
         info!("📂 CSV file exists: {}", csv_local_path.display());
 
-        let csv_data = {
-            let _permit = semaphore.acquire().await
-                .map_err(|e| HistoricalDataError::SemaphoreAcquisition(format!("Failed to acquire semaphore: {}", e)))?;
-            Arc::new(
-                tokio::fs::read(csv_local_path)
-                    .await
-                    .map_err(HistoricalDataError::Io)?,
-            )
-        };
+        // Use I/O queue for file reading (non-blocking with built-in concurrency control)
+        let csv_data = self.io_queue.read_file(csv_local_path, Priority::Normal, None)
+            .await
+            .map_err(|e| HistoricalDataError::StorageError(format!("Failed to read CSV file: {}", e)))?;
 
-        tokio::task::spawn_blocking({
-            let csv_data = Arc::clone(&csv_data);
-            move || parse_csv_to_trade(&csv_data)
-        })
+        // Use task queue for CPU-intensive CSV parsing (non-blocking)
+        let csv_data_arc = Arc::new(csv_data);
+        let parsed_trades = self.task_queue.submit_blocking(
+            {
+                let csv_data = Arc::clone(&csv_data_arc);
+                Box::new(move || {
+                    parse_csv_to_trade(&csv_data).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                })
+            },
+            Priority::Normal,
+            None
+        )
         .await
-        .map_err(|e| HistoricalDataError::StorageError(format!("Failed to parse CSV: {}", e)))?
+        .map_err(|e| HistoricalDataError::StorageError(format!("Failed to parse CSV: {}", e)))?;
+        
+        Ok(parsed_trades)
     }
 
     /// Download and parse a trade file from remote source

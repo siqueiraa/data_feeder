@@ -812,15 +812,22 @@ impl SymbolIndicatorState {
     /// PHASE 3: Optimized output generation using pre-allocated structures and SIMD data collection
     #[inline(always)]
     fn generate_output_optimized(&mut self, symbol: &str) -> IndicatorOutput {
+        use tracing::info;
+        use std::time::Instant;
+        
+        let start_total = Instant::now();
         
         // HOT PATH OPTIMIZATION: Pre-allocate output structure with better memory layout
+        let start_alloc = Instant::now();
         let mut output = IndicatorOutput {
             symbol: symbol.to_string(),
             timestamp: self.last_update_time.unwrap_or(0),
             ..Default::default()
         };
+        let alloc_time = start_alloc.elapsed();
 
         // PHASE 3 OPTIMIZATION: CPU cache-friendly timeframe processing
+        let start_data_collection = Instant::now();
         const TIMEFRAMES: [u64; 5] = [60, 300, 900, 3600, 14400]; // 1m, 5m, 15m, 1h, 4h
         let mut completed_closes = Vec::with_capacity(TIMEFRAMES.len());
         let mut ema89_values = Vec::with_capacity(TIMEFRAMES.len());
@@ -834,8 +841,10 @@ impl SymbolIndicatorState {
             ema89_values.push(self.get_ema(tf, 89).and_then(|ema| ema.value()));
             trend_values.push(self.get_trend_for_timeframe(tf));
         }
+        let data_collection_time = start_data_collection.elapsed();
         
         // Fast assignment using pre-collected data
+        let start_assignment = Instant::now();
         output.close_5m = completed_closes[1];     // 300s
         output.close_15m = completed_closes[2];    // 900s  
         output.close_60m = completed_closes[3];    // 3600s
@@ -855,8 +864,10 @@ impl SymbolIndicatorState {
         output.trend_15min = trend_values[2];  // 900s
         output.trend_1h = trend_values[3];     // 3600s
         output.trend_4h = trend_values[4];     // 14400s
+        let assignment_time = start_assignment.elapsed();
 
         // PHASE 3: Volume analysis using fast access
+        let start_volume = Instant::now();
         if let Some(max_vol) = self.volume_tracker.get_max() {
             output.max_volume = Some(max_vol.volume);
             output.max_volume_price = Some(max_vol.price);
@@ -865,12 +876,23 @@ impl SymbolIndicatorState {
             // Calculate max_volume_trend using 3 4h candles vs max_volume_price
             output.max_volume_trend = self.calculate_max_volume_trend(max_vol.price);
         }
+        let volume_time = start_volume.elapsed();
 
-        // Volume quantile analysis
+        // Volume quantile analysis - THE CRITICAL BOTTLENECK (4.6ms)
+        let start_quantiles = Instant::now();
         output.volume_quantiles = self.quantile_tracker.get_quantiles();
+        let quantiles_time = start_quantiles.elapsed();
 
         // PHASE 3: Record optimized output generation metrics
         record_simd_op!("optimized_output_generation", 1);
+
+        let total_time = start_total.elapsed();
+        
+        // PERFORMANCE DEBUGGING: Always log detailed timing breakdown
+        if true { // Always log to verify the fix worked
+            info!("🔍 DETAILED OUTPUT TIMING BREAKDOWN: total={:?}, alloc={:?}, data_collection={:?}, assignment={:?}, volume={:?}, quantiles={:?}",
+                  total_time, alloc_time, data_collection_time, assignment_time, volume_time, quantiles_time);
+        }
 
         output
     }

@@ -360,7 +360,7 @@ impl PoolManager {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::time::{sleep, Duration};
+    use tokio::time::Duration;
 
     #[tokio::test]
     async fn test_worker_pool_basic() {
@@ -386,24 +386,22 @@ mod tests {
             max_workers: 4,
             ..Default::default()
         };
-        let pool: WorkerPool<usize> = WorkerPool::new(config, "concurrent".to_string());
+        let pool: Arc<WorkerPool<usize>> = Arc::new(WorkerPool::new(config, "concurrent".to_string()));
         let counter = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::new();
         for i in 0..10 {
             let counter = counter.clone();
-            let handle = tokio::spawn({
-                let pool = &pool;
-                async move {
-                    pool.submit(
-                        move || {
-                            counter.fetch_add(1, Ordering::SeqCst);
-                            Ok(i)
-                        },
-                        format!("task_{}", i),
-                        Some(Duration::from_secs(1)),
-                    ).await
-                }
+            let pool = pool.clone();
+            let handle = tokio::spawn(async move {
+                pool.submit(
+                    move || {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(i)
+                    },
+                    format!("task_{}", i),
+                    Some(Duration::from_secs(1)),
+                ).await
             });
             handles.push(handle);
         }

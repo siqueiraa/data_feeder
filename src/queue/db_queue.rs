@@ -610,7 +610,7 @@ impl DatabaseQueue {
 mod tests {
     use super::*;
     use crate::historical::structs::FuturesOHLCVCandle;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::Duration;
 
     fn create_test_candle(open_time: i64) -> FuturesOHLCVCandle {
         FuturesOHLCVCandle::new_from_values(
@@ -635,21 +635,19 @@ mod tests {
             batch_timeout: Duration::from_millis(100),
             ..Default::default()
         };
-        let db_queue = DatabaseQueue::new(config, None);
+        let db_queue = Arc::new(DatabaseQueue::new(config, None));
 
         // Submit multiple store operations
         let mut handles = Vec::new();
         for i in 0..5 {
-            let handle = tokio::spawn({
-                let db_queue = &db_queue;
-                async move {
-                    db_queue.store_candle(
-                        "BTCUSDT".to_string(),
-                        60,
-                        create_test_candle(i * 60000),
-                        Priority::Normal,
-                    ).await
-                }
+            let db_queue = db_queue.clone();
+            let handle = tokio::spawn(async move {
+                db_queue.store_candle(
+                    "BTCUSDT".to_string(),
+                    60,
+                    create_test_candle(i * 60000),
+                    Priority::Normal,
+                ).await
             });
             handles.push(handle);
         }
