@@ -41,6 +41,7 @@ The Cryptocurrency Data Feeder is a robust, production-ready system designed to 
 - **EMA Indicators**: 21 and 89-period exponential moving averages
 - **Trend Analysis**: Multi-timeframe trend detection using EMA crossovers
 - **Volume Analysis**: Maximum volume tracking with trend correlation
+- **Volume Profiles**: Daily volume distribution analysis with POC, VWAP, and value area calculation
 - **Real-time Alerts**: Instant indicator updates via Kafka
 
 ### 🔧 **Production Ready**
@@ -280,6 +281,19 @@ cargo test -- --nocapture
 | `min_history_days` | `60` | Minimum history for indicators |
 | `ema_periods` | `[21, 89]` | EMA periods to calculate |
 | `volume_lookback_days` | `60` | Volume analysis window |
+
+### Volume Profile Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Enable volume profile calculation |
+| `price_increment_mode` | `"Fixed"` | Price bucketing mode: "Fixed" or "Adaptive" |
+| `fixed_price_increment` | `0.01` | Fixed price increment when mode is "Fixed" |
+| `min_price_increment` | `0.001` | Minimum price increment for "Adaptive" mode |
+| `max_price_increment` | `1.0` | Maximum price increment for "Adaptive" mode |
+| `update_frequency` | `"EveryCandle"` | Update frequency: "EveryCandle", "Every5Candles", or "Every10Candles" |
+| `batch_size` | `1` | Number of profiles to batch before storage |
+| `value_area_percentage` | `70.0` | Percentage of volume to include in value area calculation |
 
 ## ❗ Troubleshooting
 

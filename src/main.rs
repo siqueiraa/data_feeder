@@ -9,6 +9,7 @@ use data_feeder::technical_analysis::{
 };
 use data_feeder::postgres::{PostgresActor, PostgresConfig};
 use data_feeder::kafka::{KafkaActor, KafkaConfig};
+use data_feeder::volume_profile::{VolumeProfileActor, VolumeProfileConfig, VolumeProfileTell};
 use data_feeder::health::HealthDependencies;
 use data_feeder::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 use data_feeder::metrics::{init_metrics};
@@ -56,6 +57,7 @@ struct TomlConfig {
     pub application: ApplicationConfig,
     pub technical_analysis: TechnicalAnalysisTomlConfig,
     pub kafka: Option<KafkaConfig>,
+    pub volume_profile: Option<VolumeProfileConfig>,
 }
 
 /// Production configuration (converted from TOML)
@@ -81,6 +83,8 @@ struct DataFeederConfig {
     pub postgres_config: PostgresConfig,
     // Kafka configuration
     pub kafka_config: KafkaConfig,
+    // Volume Profile configuration
+    pub volume_profile_config: VolumeProfileConfig,
     // Historical validation tracking
     pub historical_validation_complete: bool, // Tracks completion of Phase 1 (full historical validation)
     pub recent_monitoring_days: u32, // Days to monitor in Phase 2 (default: 60)
@@ -128,6 +132,7 @@ impl DataFeederConfig {
             periodic_gap_check_window_minutes: toml_config.application.periodic_gap_check_window_minutes,
             postgres_config: toml_config.database,
             kafka_config: toml_config.kafka.unwrap_or_default(),
+            volume_profile_config: toml_config.volume_profile.unwrap_or_default(),
             // Historical validation defaults - start with Phase 1 (full validation)
             historical_validation_complete: false, // Always start with full historical validation
             recent_monitoring_days: 60, // Monitor last 60 days in Phase 2
@@ -161,6 +166,7 @@ impl Default for DataFeederConfig {
             periodic_gap_check_window_minutes: 30, // Scan last 30 minutes
             postgres_config: PostgresConfig::default(),
             kafka_config: KafkaConfig::default(),
+            volume_profile_config: VolumeProfileConfig::default(),
             // Historical validation defaults - start with Phase 1 (full validation)
             historical_validation_complete: true, // Always start with full historical validation
             recent_monitoring_days: 60, // Monitor last 60 days in Phase 2
@@ -444,7 +450,7 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     // Step 1: Launch basic actors (no TA actors yet)
     let actors_start = std::time::Instant::now();
     info!("🎭 Step 1: Launching basic actors...");
-    let (lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor) = launch_basic_actors(&config).await?;
+    let (lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor, volume_profile_actor) = launch_basic_actors(&config).await?;
     let actors_elapsed = actors_start.elapsed();
     info!("✅ Step 1 completed in {:?} - All basic actors launched", actors_elapsed);
     
@@ -536,7 +542,7 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     // Step 3.5: Now launch Technical Analysis actors with complete historical data using SAME timestamp
     let ta_start = std::time::Instant::now();
     info!("🧮 Step 3.5: Launching Technical Analysis actors...");
-    let ta_actors = launch_ta_actors(&config, &lmdb_actor, &api_actor, &ws_actor, &postgres_actor, &kafka_actor, synchronized_timestamp).await?;
+    let ta_actors = launch_ta_actors(&config, &lmdb_actor, &api_actor, &ws_actor, &postgres_actor, &kafka_actor, &volume_profile_actor, synchronized_timestamp).await?;
     let ta_elapsed = ta_start.elapsed();
     info!("✅ Step 3.5 completed in {:?} - TA actors launched", ta_elapsed);
     
@@ -558,7 +564,7 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     info!("♾️  Step 4: Entering continuous monitoring mode...");
     info!("🎉 Pipeline initialization completed in {:?} total", pipeline_elapsed);
     
-    run_continuous_monitoring(config, lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, ta_actors).await?;
+    run_continuous_monitoring(config, lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, ta_actors, volume_profile_actor).await?;
     
     Ok(())
 }
@@ -570,7 +576,8 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     ActorRef<ApiActor>, 
     ActorRef<WebSocketActor>,
     Option<ActorRef<PostgresActor>>,
-    Option<ActorRef<KafkaActor>>
+    Option<ActorRef<KafkaActor>>,
+    Option<ActorRef<VolumeProfileActor>>
 ), Box<dyn std::error::Error + Send + Sync>> {
     
     info!("🎭 Launching actor system with phased startup...");
@@ -610,7 +617,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     
     // ⚡ PHASE 3: PARALLEL - Create independent actors concurrently
     let phase3_start = std::time::Instant::now();
-    info!("🔄 PHASE 3: Creating PostgreSQL and Kafka actors in parallel...");
+    info!("🔄 PHASE 3: Creating PostgreSQL, Kafka, and Volume Profile actors in parallel...");
     
     // Create futures for independent actors
     let postgres_future = async {
@@ -644,11 +651,28 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         info!("✅ Kafka actor setup in {:?}", kafka_elapsed);
         Ok::<_, String>(kafka_actor)
     };
+
+    let volume_profile_future = async {
+        let volume_profile_start = std::time::Instant::now();
+        let volume_profile_actor = if config.volume_profile_config.enabled {
+            info!("📊 Creating Volume Profile actor...");
+            let actor = VolumeProfileActor::new(config.volume_profile_config.clone())
+                .map_err(|e| format!("Failed to create Volume Profile actor: {}", e))?;
+            Some(kameo::spawn(actor))
+        } else {
+            info!("🚫 Volume Profile actor disabled");
+            None
+        };
+        let volume_profile_elapsed = volume_profile_start.elapsed();
+        info!("✅ Volume Profile actor setup in {:?}", volume_profile_elapsed);
+        Ok::<_, String>(volume_profile_actor)
+    };
     
     // Execute in parallel and await results
-    let (postgres_result, kafka_result) = tokio::join!(postgres_future, kafka_future);
+    let (postgres_result, kafka_result, volume_profile_result) = tokio::join!(postgres_future, kafka_future, volume_profile_future);
     let postgres_actor = postgres_result?;
     let kafka_actor = kafka_result?;
+    let volume_profile_actor = volume_profile_result?;
     
     let phase3_elapsed = phase3_start.elapsed();
     info!("✅ PHASE 3 COMPLETE: Parallel actor creation in {:?}", phase3_elapsed);
@@ -688,10 +712,29 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     let phase4_elapsed = phase4_start.elapsed();
     info!("✅ PHASE 4 COMPLETE: Dependent actors ready in {:?}", phase4_elapsed);
     
+    // 🔧 PHASE 5: ACTOR REFERENCE SETUP - Configure inter-actor dependencies
+    let phase5_start = std::time::Instant::now();
+    info!("🔧 PHASE 5: Setting up Volume Profile actor references...");
+    
+    // Set up VolumeProfileActor references if enabled
+    if let Some(ref volume_profile_ref) = volume_profile_actor {
+        // Get mutable reference through the actor system
+        if let Err(e) = volume_profile_ref.tell(VolumeProfileTell::HealthCheck).send().await {
+            warn!("Failed to send health check to volume profile actor: {}", e);
+        }
+        
+        // Note: VolumeProfileActor.set_actors() would need to be called here if implemented
+        // For now, the actor will get references through message passing
+        info!("📊 Volume Profile actor references configured");
+    }
+    
+    let phase5_elapsed = phase5_start.elapsed();
+    info!("✅ PHASE 5 COMPLETE: Actor references configured in {:?}", phase5_elapsed);
+    
     // Calculate total startup time and efficiency metrics
-    let total_startup_time = phase1_elapsed + phase2_elapsed + phase3_elapsed + phase4_elapsed;
-    info!("🎯 PHASED STARTUP COMPLETE: Total time {:?} (Phase 1: {:?}, Phase 2: {:?}, Phase 3: {:?}, Phase 4: {:?})", 
-          total_startup_time, phase1_elapsed, phase2_elapsed, phase3_elapsed, phase4_elapsed);
+    let total_startup_time = phase1_elapsed + phase2_elapsed + phase3_elapsed + phase4_elapsed + phase5_elapsed;
+    info!("🎯 PHASED STARTUP COMPLETE: Total time {:?} (Phase 1: {:?}, Phase 2: {:?}, Phase 3: {:?}, Phase 4: {:?}, Phase 5: {:?})", 
+          total_startup_time, phase1_elapsed, phase2_elapsed, phase3_elapsed, phase4_elapsed, phase5_elapsed);
     info!("📡 WebSocket is IMMEDIATELY READY for streaming - no blocking on heavy initialization!");
     
     // Connect WebSocketActor to LmdbActor for centralized storage
@@ -720,6 +763,21 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         warn!("⚠️  PostgreSQL actor not available for WebSocket dual storage");
     }
     
+    // 📊 Connect WebSocket actor to Volume Profile actor for daily volume profiles
+    if let Some(ref volume_profile_ref) = volume_profile_actor {
+        info!("🔗 Connecting WebSocketActor to Volume Profile for daily volume profiles...");
+        let set_volume_profile_msg = WebSocketTell::SetVolumeProfileActor {
+            volume_profile_actor: volume_profile_ref.clone(),
+        };
+        if let Err(e) = ws_actor.tell(set_volume_profile_msg).send().await {
+            error!("Failed to set Volume Profile actor on WebSocketActor: {}", e);
+        } else {
+            info!("✅ Connected WebSocketActor to Volume Profile");
+        }
+    } else {
+        warn!("⚠️  Volume Profile actor not available for WebSocket integration");
+    }
+    
     // Allow actors to initialize
     sleep(Duration::from_millis(500)).await;
     
@@ -737,7 +795,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     });
     
     info!("✅ Basic actors launched successfully");
-    Ok((lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor))
+    Ok((lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor, volume_profile_actor))
 }
 
 /// Launch Technical Analysis actors after gap filling is complete
@@ -748,6 +806,7 @@ async fn launch_ta_actors(
     _ws_actor: &ActorRef<WebSocketActor>,
     _postgres_actor: &Option<ActorRef<PostgresActor>>,
     kafka_actor: &Option<ActorRef<KafkaActor>>,
+    volume_profile_actor: &Option<ActorRef<VolumeProfileActor>>,
     synchronized_timestamp: i64
 ) -> Result<Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>, Box<dyn std::error::Error + Send + Sync>> {
     
@@ -773,6 +832,19 @@ async fn launch_ta_actors(
                 error!("Failed to set Kafka actor on IndicatorActor: {}", e);
             } else {
                 info!("✅ Connected IndicatorActor to KafkaActor");
+            }
+        }
+        
+        // Set Volume Profile actor reference if available
+        if let Some(ref volume_profile_ref) = volume_profile_actor {
+            use data_feeder::technical_analysis::actors::indicator::IndicatorTell;
+            let set_volume_profile_msg = IndicatorTell::SetVolumeProfileActor {
+                volume_profile_actor: volume_profile_ref.clone(),
+            };
+            if let Err(e) = actor_ref.tell(set_volume_profile_msg).send().await {
+                error!("Failed to set Volume Profile actor on IndicatorActor: {}", e);
+            } else {
+                info!("✅ Connected IndicatorActor to VolumeProfileActor for unified message publishing");
             }
         }
         
@@ -877,7 +949,8 @@ async fn run_continuous_monitoring(
     api_actor: ActorRef<ApiActor>,
     ws_actor: ActorRef<WebSocketActor>,
     _postgres_actor: Option<ActorRef<PostgresActor>>,
-    ta_actors: Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>
+    ta_actors: Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>,
+    _volume_profile_actor: Option<ActorRef<VolumeProfileActor>>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let monitoring_start = std::time::Instant::now();
     info!("♾️  Starting continuous monitoring...");

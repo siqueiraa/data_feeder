@@ -1156,6 +1156,9 @@ pub struct IndicatorOutput {
 
     // Volume quantile analysis (30-day lookback)
     pub volume_quantiles: Option<QuantileResults>,
+
+    // Daily volume profile data
+    pub volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>,
 }
 
 impl Default for IndicatorOutput {
@@ -1183,6 +1186,7 @@ impl Default for IndicatorOutput {
             max_volume_time: None,
             max_volume_trend: None,
             volume_quantiles: None,
+            volume_profile: None,
         }
     }
 }

@@ -63,10 +63,12 @@ mod error_handling_tests {
         );
         
         assert!(result.is_err(), "HistoricalActor creation should fail with invalid path");
-        match result.unwrap_err() {
-            HistoricalDataError::Io(_) => {}, // Expected
-            HistoricalDataError::DirectoryCreation(_) => {}, // Also acceptable
-            e => panic!("Expected IO or DirectoryCreation error for invalid path, got: {:?}", e),
+        if let Err(error) = result {
+            match error {
+                HistoricalDataError::Io(_) => {}, // Expected
+                HistoricalDataError::DirectoryCreation(_) => {}, // Also acceptable
+                e => panic!("Expected IO or DirectoryCreation error for invalid path, got: {:?}", e),
+            }
         }
     }
 

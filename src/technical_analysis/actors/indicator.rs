@@ -24,6 +24,7 @@ use crate::technical_analysis::utils::{
     create_quantile_records_from_candles, format_timestamp_iso
 };
 use crate::kafka::{KafkaActor, KafkaTell};
+use crate::volume_profile::{VolumeProfileAsk, VolumeProfileReply};
 
 // PHASE 3: Adaptive optimization modes based on resource pressure and production patterns
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -123,6 +124,10 @@ pub enum IndicatorTell {
     /// Set Kafka actor reference for publishing indicators
     SetKafkaActor {
         kafka_actor: ActorRef<KafkaActor>,
+    },
+    /// Set Volume Profile actor reference for including volume profile data
+    SetVolumeProfileActor {
+        volume_profile_actor: ActorRef<crate::volume_profile::VolumeProfileActor>,
     },
 }
 
@@ -804,14 +809,19 @@ impl SymbolIndicatorState {
     }
 
     /// PHASE 3: Fast output generation with optimized data collection
-    pub fn generate_output(&mut self, symbol: &str) -> IndicatorOutput {
+    pub async fn generate_output(&mut self, symbol: &str) -> IndicatorOutput {
         // Use the optimized fast output generation
-        self.generate_output_optimized(symbol)
+        self.generate_output_optimized(symbol, None).await
+    }
+    
+    /// PHASE 3: Fast output generation with optimized data collection and volume profile
+    pub async fn generate_output_with_volume_profile(&mut self, symbol: &str, volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>) -> IndicatorOutput {
+        // Use the optimized fast output generation
+        self.generate_output_optimized(symbol, volume_profile).await
     }
 
     /// PHASE 3: Optimized output generation using pre-allocated structures and SIMD data collection
-    #[inline(always)]
-    fn generate_output_optimized(&mut self, symbol: &str) -> IndicatorOutput {
+    async fn generate_output_optimized(&mut self, symbol: &str, volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>) -> IndicatorOutput {
         use tracing::info;
         use std::time::Instant;
         
@@ -883,6 +893,10 @@ impl SymbolIndicatorState {
         output.volume_quantiles = self.quantile_tracker.get_quantiles();
         let quantiles_time = start_quantiles.elapsed();
 
+        // Volume profile data assignment
+        let volume_profile_time = std::time::Duration::new(0, 0);
+        output.volume_profile = volume_profile;
+        
         // PHASE 3: Record optimized output generation metrics
         record_simd_op!("optimized_output_generation", 1);
 
@@ -890,8 +904,8 @@ impl SymbolIndicatorState {
         
         // PERFORMANCE DEBUGGING: Always log detailed timing breakdown
         if true { // Always log to verify the fix worked
-            info!("🔍 DETAILED OUTPUT TIMING BREAKDOWN: total={:?}, alloc={:?}, data_collection={:?}, assignment={:?}, volume={:?}, quantiles={:?}",
-                  total_time, alloc_time, data_collection_time, assignment_time, volume_time, quantiles_time);
+            info!("🔍 DETAILED OUTPUT TIMING BREAKDOWN: total={:?}, alloc={:?}, data_collection={:?}, assignment={:?}, volume={:?}, quantiles={:?}, volume_profile={:?}",
+                  total_time, alloc_time, data_collection_time, assignment_time, volume_time, quantiles_time, volume_profile_time);
         }
 
         output
@@ -911,6 +925,9 @@ pub struct IndicatorActor {
     
     /// Optional Kafka actor reference for publishing indicators
     kafka_actor: Option<ActorRef<KafkaActor>>,
+    
+    /// Optional Volume Profile actor reference for including volume profile data
+    volume_profile_actor: Option<ActorRef<crate::volume_profile::VolumeProfileActor>>,
 }
 
 impl IndicatorActor {
@@ -954,6 +971,7 @@ impl IndicatorActor {
             symbol_states,
             is_ready: false,
             kafka_actor: None,
+            volume_profile_actor: None,
         }
     }
 
@@ -980,7 +998,7 @@ impl IndicatorActor {
     async fn output_current_indicators(&mut self) {
         for (symbol, state) in &mut self.symbol_states {
             if state.is_initialized {
-                let output = state.generate_output(symbol);
+                let output = state.generate_output(symbol).await;
                 
                 // Log key indicators
                 info!("📈 {} Indicators: 1m_trend={}, 5m_close={:.2}, ema89_1h={:.2}, max_vol={:.0}",
@@ -1101,7 +1119,35 @@ impl Message<IndicatorTell> for IndicatorActor {
                     let _ema89_5m = state.get_ema(300, 89);
                     let _ema89_1h = state.get_ema(3600, 89);
                     
-                    let output = state.generate_output(&symbol);
+                    // Query volume profile data if volume profile actor is available
+                    let volume_profile_data = if let Some(ref volume_profile_actor) = self.volume_profile_actor {
+                        // Get current date for volume profile query
+                        let current_date = chrono::Utc::now().date_naive();
+                        let query_msg = VolumeProfileAsk::GetVolumeProfile {
+                            symbol: symbol.clone(),
+                            date: current_date,
+                        };
+                        
+                        match volume_profile_actor.ask(query_msg).await {
+                            Ok(VolumeProfileReply::VolumeProfile(profile_data)) => {
+                                debug!("📊 Retrieved volume profile for {} on {}: {:?}", 
+                                       symbol, current_date, profile_data.is_some());
+                                profile_data
+                            }
+                            Ok(_) => {
+                                warn!("⚠️ Unexpected volume profile response for {}", symbol);
+                                None
+                            }
+                            Err(e) => {
+                                warn!("⚠️ Failed to query volume profile for {}: {}", symbol, e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    let output = state.generate_output_with_volume_profile(&symbol, volume_profile_data).await;
                     output_time = output_start.elapsed();
                     
                     // Optimized real-time logging with dynamic precision based on price range
@@ -1190,6 +1236,12 @@ impl Message<IndicatorTell> for IndicatorActor {
                 self.kafka_actor = Some(kafka_actor);
                 info!("✅ Kafka actor reference successfully set in IndicatorActor");
             }
+            
+            IndicatorTell::SetVolumeProfileActor { volume_profile_actor } => {
+                info!("📊 Setting Volume Profile actor reference for volume profile data integration");
+                self.volume_profile_actor = Some(volume_profile_actor);
+                info!("✅ Volume Profile actor reference successfully set in IndicatorActor");
+            }
         }
     }
 }
@@ -1201,7 +1253,7 @@ impl Message<IndicatorAsk> for IndicatorActor {
         match msg {
             IndicatorAsk::GetIndicators { symbol } => {
                 if let Some(state) = self.symbol_states.get_mut(&symbol) {
-                    let indicators = state.generate_output(&symbol);
+                    let indicators = state.generate_output(&symbol).await;
                     Ok(IndicatorReply::Indicators(Box::new(indicators)))
                 } else {
                     Err(format!("Symbol {} not found", symbol))
@@ -1242,11 +1294,11 @@ mod tests {
         assert!(!state.is_initialized);
     }
 
-    #[test]
-    fn test_generate_output() {
+    #[tokio::test]
+    async fn test_generate_output() {
         let config = TechnicalAnalysisConfig::default();
         let mut state = SymbolIndicatorState::new(&config);
-        let output = state.generate_output("BTCUSDT");
+        let output = state.generate_output("BTCUSDT").await;
         
         assert_eq!(output.symbol, "BTCUSDT");
         assert!(matches!(output.trend_1min, TrendDirection::Neutral));

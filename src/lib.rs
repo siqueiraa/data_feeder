@@ -11,3 +11,4 @@ pub mod metrics;
 pub mod metrics_server;
 pub mod tokio_metrics;
 pub mod queue;
+pub mod volume_profile;

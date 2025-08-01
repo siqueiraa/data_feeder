@@ -1,0 +1,17 @@
+/// Volume Profile Module
+/// 
+/// This module implements daily volume profile calculation from 1-minute candle data.
+/// It provides real-time volume profile updates for every new candle and supports
+/// full day reconstruction on startup.
+pub mod actor;
+pub mod calculator;
+pub mod database;
+pub mod structs;
+
+pub use actor::{VolumeProfileActor, VolumeProfileTell, VolumeProfileAsk, VolumeProfileReply};
+pub use calculator::DailyVolumeProfile;
+pub use database::VolumeProfileDatabase;
+pub use structs::{
+    VolumeProfileConfig, VolumeProfileData, PriceLevelData, ValueArea,
+    PriceIncrementMode, UpdateFrequency
+};

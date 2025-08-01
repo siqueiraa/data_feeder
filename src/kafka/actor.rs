@@ -384,6 +384,7 @@ mod tests {
             max_volume_time: Some("2025-01-01T12:00:00Z".to_string()),
             max_volume_trend: Some(TrendDirection::Buy),
             volume_quantiles: None,
+            volume_profile: None,
         }
     }
 
