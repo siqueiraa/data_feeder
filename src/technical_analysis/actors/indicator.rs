@@ -897,6 +897,14 @@ impl SymbolIndicatorState {
         let volume_profile_time = std::time::Duration::new(0, 0);
         output.volume_profile = volume_profile;
         
+        // DEBUG: Verify volume profile assignment
+        if let Some(ref vp) = output.volume_profile {
+            debug!("🔍 VOLUME PROFILE ASSIGNMENT: Successfully assigned volume profile with {} price levels, total volume: {:.2}", 
+                   vp.price_levels.len(), vp.total_volume);
+        } else {
+            debug!("🔍 VOLUME PROFILE ASSIGNMENT: No volume profile data to assign (None)");
+        }
+        
         // PHASE 3: Record optimized output generation metrics
         record_simd_op!("optimized_output_generation", 1);
 
@@ -1121,25 +1129,38 @@ impl Message<IndicatorTell> for IndicatorActor {
                     
                     // Query volume profile data if volume profile actor is available
                     let volume_profile_data = if let Some(ref volume_profile_actor) = self.volume_profile_actor {
-                        // Get current date for volume profile query
-                        let current_date = chrono::Utc::now().date_naive();
+                        // Extract date from the most recent candle (use 1-minute candle if available, fallback to any)
+                        let candle_date = candles.get(&60) // Try 1-minute candle first
+                            .or_else(|| candles.values().next()) // Fallback to any available candle
+                            .and_then(|candle| {
+                                chrono::DateTime::from_timestamp_millis(candle.open_time)
+                                    .map(|datetime| datetime.date_naive())
+                            })
+                            .unwrap_or_else(|| chrono::Utc::now().date_naive()); // Final fallback to current date
+                        
                         let query_msg = VolumeProfileAsk::GetVolumeProfile {
                             symbol: symbol.clone(),
-                            date: current_date,
+                            date: candle_date,
                         };
+                        
+                        info!("🔍 VOLUME PROFILE QUERY: Querying for {} on date {}", symbol, candle_date);
                         
                         match volume_profile_actor.ask(query_msg).await {
                             Ok(VolumeProfileReply::VolumeProfile(profile_data)) => {
-                                debug!("📊 Retrieved volume profile for {} on {}: {:?}", 
-                                       symbol, current_date, profile_data.is_some());
+                                if let Some(ref profile) = profile_data {
+                                    info!("✅ VOLUME PROFILE QUERY: Retrieved profile for {} on {}: {} price levels, total volume: {:.2}", 
+                                          symbol, candle_date, profile.price_levels.len(), profile.total_volume);
+                                } else {
+                                    warn!("⚠️ VOLUME PROFILE QUERY: No profile data found for {} on {}", symbol, candle_date);
+                                }
                                 profile_data
                             }
                             Ok(_) => {
-                                warn!("⚠️ Unexpected volume profile response for {}", symbol);
+                                warn!("⚠️ VOLUME PROFILE QUERY: Unexpected response for {}", symbol);
                                 None
                             }
                             Err(e) => {
-                                warn!("⚠️ Failed to query volume profile for {}: {}", symbol, e);
+                                warn!("⚠️ VOLUME PROFILE QUERY: Failed to query for {}: {}", symbol, e);
                                 None
                             }
                         }
@@ -1195,9 +1216,32 @@ impl Message<IndicatorTell> for IndicatorActor {
                         let symbol_owned = symbol.clone();
                         
                         tokio::spawn(async move {
+                            let output_data = &*output_arc;
+                            
+                            // DEBUG: Log the volume profile data being sent to Kafka
+                            if let Some(ref volume_profile) = output_data.volume_profile {
+                                info!("🎯 KAFKA DEBUG: Sending volume profile for {} on {}: {} price levels, total volume: {:.2}, VWAP: {:.2}, POC: {:.2}", 
+                                      symbol_owned, volume_profile.date, volume_profile.price_levels.len(), 
+                                      volume_profile.total_volume, volume_profile.vwap, volume_profile.poc);
+                                info!("🎯 KAFKA DEBUG: Value area: high={:.2}, low={:.2}, volume_percentage={:.2}%", 
+                                      volume_profile.value_area.high, volume_profile.value_area.low, volume_profile.value_area.volume_percentage);
+                            } else {
+                                warn!("🚨 KAFKA DEBUG: NO VOLUME PROFILE DATA for {} - volume_profile is None!", symbol_owned);
+                            }
+                            
                             debug!("📤 Background Kafka publishing for {}", symbol_owned);
+                            let cloned_output = (*output_arc).clone();
+                            
+                            // DEBUG: Verify volume profile data survives cloning
+                            if let Some(ref vp) = cloned_output.volume_profile {
+                                debug!("🔍 KAFKA CLONE DEBUG: Volume profile data survived cloning - {} price levels, total volume: {:.2}", 
+                                       vp.price_levels.len(), vp.total_volume);
+                            } else {
+                                debug!("🔍 KAFKA CLONE DEBUG: Volume profile data LOST during cloning!");
+                            }
+                            
                             let publish_msg = KafkaTell::PublishIndicators {
-                                indicators: Box::new((*output_arc).clone()),
+                                indicators: Box::new(cloned_output),
                             };
                             if let Err(e) = kafka_actor.tell(publish_msg).send().await {
                                 error!("❌ Background Kafka publish failed for {}: {}", symbol_owned, e);

@@ -509,6 +509,23 @@ impl WebSocketActor {
                 } else {
                     debug!("📤 Sent {} candles for async storage to LmdbActor for {}", closed_candles.len(), symbol);
                 }
+
+                // Forward closed candles to VolumeProfileActor for real-time volume profile calculation
+                if let Some(volume_profile_actor) = &self.volume_profile_actor {
+                    for candle in &closed_candles {
+                        let volume_profile_msg = VolumeProfileTell::ProcessCandle {
+                            symbol: symbol.to_string(),
+                            candle: candle.clone(),
+                        };
+
+                        if let Err(e) = volume_profile_actor.tell(volume_profile_msg).send().await {
+                            warn!("⚠️ Failed to send candle to VolumeProfileActor for {}: {}", symbol, e);
+                        } else {
+                            info!("📊 WEBSOCKET DEBUG: Forwarded candle to VolumeProfileActor for {} - timestamp: {}, volume: {:.2}", 
+                                  symbol, candle.open_time, candle.volume);
+                        }
+                    }
+                }
             }
         } else {
             warn!("LmdbActor not available, skipping candle storage for {}", symbol);

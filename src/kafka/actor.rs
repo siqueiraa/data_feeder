@@ -218,6 +218,15 @@ impl KafkaActor {
             .map_err(|e| KafkaProducerError::SerializationError(format!("UTF-8 error: {}", e)))?
             .to_string(); // Convert to owned String for rdkafka
         
+        // VALIDATION: Check for missing fields to prevent silent data loss
+        if let Err(missing_fields) = self.serialization_buffer.validate_completeness(&indicators, &payload) {
+            let error_msg = format!("Serialization validation failed for {}: missing fields: {:?}", 
+                                   indicators.symbol, missing_fields);
+            error!("🚨 SERIALIZATION ERROR: {}", error_msg);
+            self.messages_failed += 1;
+            return Err(KafkaProducerError::SerializationError(error_msg));
+        }
+        
         // Use symbol as key for partitioning
         let key = &indicators.symbol;
         

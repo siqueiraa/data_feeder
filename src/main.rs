@@ -542,7 +542,14 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     // Step 3.5: Now launch Technical Analysis actors with complete historical data using SAME timestamp
     let ta_start = std::time::Instant::now();
     info!("🧮 Step 3.5: Launching Technical Analysis actors...");
-    let ta_actors = launch_ta_actors(&config, &lmdb_actor, &api_actor, &ws_actor, &postgres_actor, &kafka_actor, &volume_profile_actor, synchronized_timestamp).await?;
+    let ta_actors = launch_ta_actors(&config, TaActorReferences {
+        lmdb_actor: &lmdb_actor,
+        api_actor: &api_actor,
+        _ws_actor: &ws_actor,
+        _postgres_actor: &postgres_actor,
+        kafka_actor: &kafka_actor,
+        volume_profile_actor: &volume_profile_actor,
+    }, synchronized_timestamp).await?;
     let ta_elapsed = ta_start.elapsed();
     info!("✅ Step 3.5 completed in {:?} - TA actors launched", ta_elapsed);
     
@@ -564,7 +571,15 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     info!("♾️  Step 4: Entering continuous monitoring mode...");
     info!("🎉 Pipeline initialization completed in {:?} total", pipeline_elapsed);
     
-    run_continuous_monitoring(config, lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, ta_actors, volume_profile_actor).await?;
+    run_continuous_monitoring(config, MonitoringActorReferences {
+        lmdb_actor,
+        historical_actor,
+        api_actor,
+        ws_actor,
+        _postgres_actor: postgres_actor,
+        ta_actors,
+        _volume_profile_actor: volume_profile_actor,
+    }).await?;
     
     Ok(())
 }
@@ -723,9 +738,16 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
             warn!("Failed to send health check to volume profile actor: {}", e);
         }
         
-        // Note: VolumeProfileActor.set_actors() would need to be called here if implemented
-        // For now, the actor will get references through message passing
-        info!("📊 Volume Profile actor references configured");
+        // CRITICAL FIX: Send SetActorReferences message to enable LMDB access for historical data reconstruction
+        let set_references_msg = VolumeProfileTell::SetActorReferences {
+            postgres_actor: postgres_actor.clone(),
+            lmdb_actor: lmdb_actor.clone(),
+        };
+        if let Err(e) = volume_profile_ref.tell(set_references_msg).send().await {
+            error!("❌ CRITICAL: Failed to set actor references on VolumeProfileActor: {}", e);
+        } else {
+            info!("✅ CRITICAL FIX: VolumeProfileActor references set - LMDB access enabled for historical data reconstruction");
+        }
     }
     
     let phase5_elapsed = phase5_start.elapsed();
@@ -798,15 +820,20 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     Ok((lmdb_actor, historical_actor, api_actor, ws_actor, postgres_actor, kafka_actor, volume_profile_actor))
 }
 
+/// Actor references for technical analysis operations
+struct TaActorReferences<'a> {
+    lmdb_actor: &'a ActorRef<LmdbActor>,
+    api_actor: &'a ActorRef<ApiActor>,
+    _ws_actor: &'a ActorRef<WebSocketActor>,
+    _postgres_actor: &'a Option<ActorRef<PostgresActor>>,
+    kafka_actor: &'a Option<ActorRef<KafkaActor>>,
+    volume_profile_actor: &'a Option<ActorRef<VolumeProfileActor>>,
+}
+
 /// Launch Technical Analysis actors after gap filling is complete
 async fn launch_ta_actors(
     config: &DataFeederConfig,
-    lmdb_actor: &ActorRef<LmdbActor>,
-    api_actor: &ActorRef<ApiActor>,
-    _ws_actor: &ActorRef<WebSocketActor>,
-    _postgres_actor: &Option<ActorRef<PostgresActor>>,
-    kafka_actor: &Option<ActorRef<KafkaActor>>,
-    volume_profile_actor: &Option<ActorRef<VolumeProfileActor>>,
+    actors: TaActorReferences<'_>,
     synchronized_timestamp: i64
 ) -> Result<Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>, Box<dyn std::error::Error + Send + Sync>> {
     
@@ -823,7 +850,7 @@ async fn launch_ta_actors(
         let actor_ref = kameo::spawn(actor);
         
         // Set Kafka actor reference if available
-        if let Some(ref kafka_ref) = kafka_actor {
+        if let Some(ref kafka_ref) = actors.kafka_actor {
             use data_feeder::technical_analysis::actors::indicator::IndicatorTell;
             let set_kafka_msg = IndicatorTell::SetKafkaActor {
                 kafka_actor: kafka_ref.clone(),
@@ -836,7 +863,7 @@ async fn launch_ta_actors(
         }
         
         // Set Volume Profile actor reference if available
-        if let Some(ref volume_profile_ref) = volume_profile_actor {
+        if let Some(ref volume_profile_ref) = actors.volume_profile_actor {
             use data_feeder::technical_analysis::actors::indicator::IndicatorTell;
             let set_volume_profile_msg = IndicatorTell::SetVolumeProfileActor {
                 volume_profile_actor: volume_profile_ref.clone(),
@@ -855,8 +882,8 @@ async fn launch_ta_actors(
     let timeframe_actor = {
         let mut actor = TimeFrameActor::new(config.ta_config.clone());
         actor.set_indicator_actor(indicator_actor.clone());
-        actor.set_api_actor(api_actor.clone());
-        actor.set_lmdb_actor(lmdb_actor.clone());
+        actor.set_api_actor(actors.api_actor.clone());
+        actor.set_lmdb_actor(actors.lmdb_actor.clone());
         let actor_ref = kameo::spawn(actor);
         
         // Send synchronized timestamp before initialization
@@ -941,23 +968,28 @@ async fn start_realtime_streaming(
     Ok(())
 }
 
-/// Main continuous monitoring loop (WebSocket already running)
-async fn run_continuous_monitoring(
-    config: DataFeederConfig,
+/// Actor references for continuous monitoring operations
+struct MonitoringActorReferences {
     lmdb_actor: ActorRef<LmdbActor>,
     historical_actor: ActorRef<HistoricalActor>,
     api_actor: ActorRef<ApiActor>,
     ws_actor: ActorRef<WebSocketActor>,
     _postgres_actor: Option<ActorRef<PostgresActor>>,
     ta_actors: Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>,
-    _volume_profile_actor: Option<ActorRef<VolumeProfileActor>>
+    _volume_profile_actor: Option<ActorRef<VolumeProfileActor>>,
+}
+
+/// Main continuous monitoring loop (WebSocket already running)
+async fn run_continuous_monitoring(
+    config: DataFeederConfig,
+    actors: MonitoringActorReferences
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let monitoring_start = std::time::Instant::now();
     info!("♾️  Starting continuous monitoring...");
     
     let setup_start = std::time::Instant::now();
     info!("📝 Real-time data is streaming and being stored automatically");
-    if ta_actors.is_some() {
+    if actors.ta_actors.is_some() {
         info!("🧮 Technical analysis is running and processing indicators");
     }
     let health_check_interval_secs = if config.periodic_gap_detection_enabled {
@@ -984,7 +1016,7 @@ async fn run_continuous_monitoring(
             _ = health_check_interval.tick() => {
                 let health_check_start = std::time::Instant::now();
                 info!("💓 Performing health check...");
-                perform_health_check(&config, &api_actor, &ws_actor, &lmdb_actor, &historical_actor, &ta_actors).await;
+                perform_health_check(&config, &actors.api_actor, &actors.ws_actor, &actors.lmdb_actor, &actors.historical_actor, &actors.ta_actors).await;
                 let health_check_elapsed = health_check_start.elapsed();
                 info!("✅ Health check completed in {:?}", health_check_elapsed);
             }

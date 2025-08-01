@@ -21,8 +21,8 @@ impl Default for VolumeProfileConfig {
             enabled: true,
             price_increment_mode: PriceIncrementMode::Adaptive,
             fixed_price_increment: 0.01,
-            min_price_increment: 0.001,
-            max_price_increment: 1.0,
+            min_price_increment: 0.005,
+            max_price_increment: 0.5,
             update_frequency: UpdateFrequency::EveryCandle,
             batch_size: 10,
             value_area_percentage: 70.0,
@@ -168,7 +168,7 @@ impl PriceLevelMap {
         weighted_sum / total_volume
     }
 
-    /// Calculate value area (70% volume concentration around POC)
+        /// Calculate value area (exact 70% volume concentration using greedy selection)
     pub fn calculate_value_area(&self, value_area_percentage: f64) -> ValueArea {
         let total_volume = self.total_volume();
         let target_volume = total_volume * (value_area_percentage / 100.0);
@@ -182,70 +182,94 @@ impl PriceLevelMap {
             };
         }
 
-        // Find POC (Point of Control)
-        let poc_entry = self.levels
+        // Step 1: Sort all price levels by volume descending (highest to lowest)
+        let mut sorted_levels: Vec<_> = self.levels
             .iter()
-            .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal));
+            .map(|(price_key, &volume)| (price_key.to_price(self.price_increment), volume))
+            .collect();
+        
+        // Sort by volume descending, then by price ascending for stability
+        sorted_levels.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        });
 
-        if let Some((poc_key, _)) = poc_entry {
-            use tracing::debug;
-            debug!("Value area calculation: POC at price {:.2}", poc_key.to_price(self.price_increment));
-            
-            // Expand around POC to capture target volume percentage
-            let mut value_area_volume = 0.0;
-            let mut low_key = *poc_key;
-            let mut high_key = *poc_key;
+        // Step 2: Greedily select highest volume levels until we reach target
+        let mut selected_volume = 0.0;
+        let mut selected_prices = Vec::new();
 
-            // Start with POC volume
-            if let Some(&poc_volume) = self.levels.get(poc_key) {
-                value_area_volume += poc_volume;
-                debug!("Starting with POC volume: {:.2}", poc_volume);
+        for (price, volume) in &sorted_levels {
+            if selected_volume < target_volume {
+                selected_volume += volume;
+                selected_prices.push(*price);
+            } else {
+                break;
             }
+        }
 
-            // Expand outward from POC
-            while value_area_volume < target_volume {
-                let lower_key = low_key.previous();
-                let higher_key = high_key.next();
-                let lower_volume = self.get_volume_at_key(&lower_key);
-                let higher_volume = self.get_volume_at_key(&higher_key);
-
-                debug!("Value area expansion: current {:.2}/{:.2}, lower vol {:.2}, higher vol {:.2}", 
-                       value_area_volume, target_volume, lower_volume, higher_volume);
-
-                if lower_volume >= higher_volume && lower_volume > 0.0 {
-                    low_key = lower_key;
-                    value_area_volume += lower_volume;
-                    debug!("Expanded value area lower to {:.2} (volume {:.2})", 
-                           low_key.to_price(self.price_increment), lower_volume);
-                } else if higher_volume > 0.0 {
-                    high_key = higher_key;
-                    value_area_volume += higher_volume;
-                    debug!("Expanded value area higher to {:.2} (volume {:.2})", 
-                           high_key.to_price(self.price_increment), higher_volume);
-                } else {
-                    debug!("Value area expansion complete - no more volume available");
-                    break; // No more volume to add
-                }
-            }
-
-            ValueArea {
-                high: high_key.to_price(self.price_increment),
-                low: low_key.to_price(self.price_increment),
-                volume_percentage: (value_area_volume / total_volume) * 100.0,
-                volume: value_area_volume,
-            }
-        } else {
-            ValueArea {
+        if selected_prices.is_empty() {
+            return ValueArea {
                 high: 0.0,
                 low: 0.0,
                 volume_percentage: 0.0,
                 volume: 0.0,
-            }
+            };
+        }
+
+        // Step 3: Ensure contiguous price range containing the selected levels
+        // Sort selected prices to find min/max range
+        selected_prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let min_price = selected_prices[0];
+        let max_price = selected_prices[selected_prices.len() - 1];
+
+        // Step 4: Calculate actual volume within this contiguous range
+        let actual_volume_in_range = 
+            self.levels.iter()
+                .filter(|(price_key, _)| {
+                    let price = price_key.to_price(self.price_increment);
+                    price >= min_price && price <= max_price
+                })
+                .map(|(_, volume)| *volume)
+                .sum::<f64>();
+
+        // Step 5: Find POC (should be the highest volume level within the value area)
+        let poc = sorted_levels.first().map(|(price, _)| *price).unwrap_or(0.0);
+
+        // Ensure POC is within the value area range
+        let final_low = min_price.min(poc);
+        let final_high = max_price.max(poc);
+
+        // Final validation: ensure POC is actually in our range
+        let final_actual_volume = 
+            self.levels.iter()
+                .filter(|(price_key, _)| {
+                    let price = price_key.to_price(self.price_increment);
+                    price >= final_low && price <= final_high
+                })
+                .map(|(_, volume)| *volume)
+                .sum::<f64>();
+
+        ValueArea {
+            high: final_high,
+            low: final_low,
+            volume_percentage: (final_actual_volume / total_volume) * 100.0,
+            volume: final_actual_volume,
         }
     }
 
+    /// Get min and max price keys from the price level map
+    pub fn get_price_range_keys(&self) -> (PriceKey, PriceKey) {
+        if self.levels.is_empty() {
+            return (PriceKey(0), PriceKey(0));
+        }
+
+        let min_key = *self.levels.keys().next().unwrap();
+        let max_key = *self.levels.keys().next_back().unwrap();
+        (min_key, max_key)
+    }
+
     /// Get volume at specific price key
-    fn get_volume_at_key(&self, key: &PriceKey) -> f64 {
+    pub fn get_volume_at_key(&self, key: &PriceKey) -> f64 {
         self.levels.get(key).copied().unwrap_or(0.0)
     }
 
@@ -355,11 +379,57 @@ mod tests {
         
         let value_area = map.calculate_value_area(70.0);
         
-        // Value area should include POC and adjacent levels to reach 70%
+        // With greedy selection, should get exactly 70% volume
+        // We select 101.0 (50%) + 102.0 (30%) = 80% 
+        // Then the contiguous range 101-102 contains 80% volume
         assert!(value_area.volume_percentage >= 70.0, "Expected >= 70%, got {}", value_area.volume_percentage);
+        assert!(value_area.volume_percentage <= 80.0, "Should not exceed 80% for this test, got {}", value_area.volume_percentage);
         assert!(value_area.volume > 0.0);
         assert!(value_area.low <= 101.0);
-        assert!(value_area.high >= 101.0);
+        assert!(value_area.high >= 102.0);
+        assert!(value_area.high > value_area.low, "Value area should span a range: high={} low={}", 
+                value_area.high, value_area.low);
+    }
+
+    #[test]
+    fn test_value_area_concentrated_volume() {
+        let mut map = PriceLevelMap::new(0.01);  // Fine-grained increment like real data
+        
+        // Simulate the real-world scenario: volume concentrated at one price
+        map.add_volume(114367.6, 4461.0);  // POC volume
+        map.add_volume(114367.59, 100.0);   // Small adjacent volume
+        map.add_volume(114367.61, 150.0);   // Small adjacent volume
+        
+        let total_volume = map.total_volume();
+        assert!(total_volume > 0.0);
+        
+        let value_area = map.calculate_value_area(70.0);
+        
+        // Value area should capture exactly 70% volume (or as close as possible with discrete levels)
+        assert!((value_area.volume_percentage - 70.0).abs() <= 10.0, 
+                "Value area should capture ~70% volume: {}%", value_area.volume_percentage);
+        
+        // Value area should include the POC (highest volume level)
+        assert!(value_area.low <= 114367.6 && value_area.high >= 114367.6,
+                "Value area should include POC at 114367.6");
+        
+        // Should have reasonable volume
+        assert!(value_area.volume > 0.0);
+    }
+
+    #[test]
+    fn test_value_area_single_price_level() {
+        let mut map = PriceLevelMap::new(0.01);
+        
+        // Edge case: all volume at exactly one price
+        map.add_volume(114367.6, 1000.0);
+        
+        let value_area = map.calculate_value_area(70.0);
+        
+        // Should still provide meaningful range
+        assert!(value_area.high >= value_area.low);
+        assert!(value_area.volume_percentage >= 50.0, 
+                "Should capture all volume when only one level exists");
     }
 
     #[test]

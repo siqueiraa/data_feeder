@@ -20,8 +20,27 @@ use crate::postgres::PostgresActor;
 use super::calculator::{DailyVolumeProfile, VolumeProfileStatistics};
 use super::structs::{VolumeProfileConfig, VolumeProfileData, UpdateFrequency};
 
-/// Volume Profile Actor messages for telling (fire-and-forget)
+/// Serializable Volume Profile Actor messages for telling (fire-and-forget)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VolumeProfileTellSerializable {
+    /// Process new 1-minute candle (real-time)
+    ProcessCandle {
+        symbol: String,
+        candle: FuturesOHLCVCandle,
+    },
+    /// Rebuild volume profile for specific date (startup/recovery)
+    RebuildDay {
+        symbol: String,
+        date: NaiveDate,
+    },
+    /// Health check message
+    HealthCheck,
+    /// Trigger batch processing of pending updates
+    ProcessBatch,
+}
+
+/// All Volume Profile Actor messages for telling (including non-serializable ones)
+#[derive(Debug, Clone)]
 pub enum VolumeProfileTell {
     /// Process new 1-minute candle (real-time)
     ProcessCandle {
@@ -37,6 +56,27 @@ pub enum VolumeProfileTell {
     HealthCheck,
     /// Trigger batch processing of pending updates
     ProcessBatch,
+    /// Set actor references for PostgreSQL and LMDB access (not serializable)
+    SetActorReferences {
+        postgres_actor: Option<ActorRef<PostgresActor>>,
+        lmdb_actor: ActorRef<LmdbActor>,
+    },
+}
+
+// Conversion from serializable to full enum
+impl From<VolumeProfileTellSerializable> for VolumeProfileTell {
+    fn from(serializable: VolumeProfileTellSerializable) -> Self {
+        match serializable {
+            VolumeProfileTellSerializable::ProcessCandle { symbol, candle } => {
+                VolumeProfileTell::ProcessCandle { symbol, candle }
+            }
+            VolumeProfileTellSerializable::RebuildDay { symbol, date } => {
+                VolumeProfileTell::RebuildDay { symbol, date }
+            }
+            VolumeProfileTellSerializable::HealthCheck => VolumeProfileTell::HealthCheck,
+            VolumeProfileTellSerializable::ProcessBatch => VolumeProfileTell::ProcessBatch,
+        }
+    }
 }
 
 /// Volume Profile Actor messages for asking (request-response)
@@ -187,15 +227,28 @@ impl VolumeProfileActor {
         let profile_key = ProfileKey::from_candle(symbol.clone(), &candle)
             .ok_or_else(|| "Invalid candle timestamp".to_string())?;
 
-        // Ensure profile exists
+        // Ensure profile exists - CRITICAL FIX: Initialize with historical data first
         if !self.profiles.contains_key(&profile_key) {
-            let profile = DailyVolumeProfile::new(
-                profile_key.symbol.clone(),
-                profile_key.date,
-                self.config.clone(),
-            );
-            self.profiles.insert(profile_key.clone(), profile);
-            info!("Created new volume profile for {} on {}", profile_key.symbol, profile_key.date);
+            info!("🔄 NEW DAILY PROFILE: Creating volume profile for {} on {} - rebuilding historical data first", 
+                  profile_key.symbol, profile_key.date);
+            
+            // CRITICAL FIX: Rebuild historical data for the day BEFORE creating empty profile
+            if let Err(e) = self.rebuild_day(profile_key.symbol.clone(), profile_key.date).await {
+                warn!("⚠️ Failed to rebuild historical data for {} on {}: {}. Creating empty profile.", 
+                      profile_key.symbol, profile_key.date, e);
+                
+                // Fallback: create empty profile if historical rebuild fails
+                let profile = DailyVolumeProfile::new(
+                    profile_key.symbol.clone(),
+                    profile_key.date,
+                    self.config.clone(),
+                );
+                self.profiles.insert(profile_key.clone(), profile);
+                info!("📊 Created fallback empty volume profile for {} on {}", profile_key.symbol, profile_key.date);
+            } else {
+                info!("✅ HISTORICAL REBUILD: Successfully initialized {} on {} with historical data", 
+                      profile_key.symbol, profile_key.date);
+            }
         }
 
         // Update profile with new candle and get profile data
@@ -344,14 +397,16 @@ impl VolumeProfileActor {
                         return Ok(());
                     }
 
-                    info!("Retrieved {} candles for {} on {}", candles.len(), symbol, date);
+                    info!("📊 HISTORICAL DATA: Retrieved {} candles for {} on {}", candles.len(), symbol, date);
 
                     // Create or update profile
                     let profile_key = ProfileKey::new(symbol.clone(), date);
                     let mut profile = DailyVolumeProfile::new(symbol, date, self.config.clone());
                     
-                    // Rebuild from candles
+                    // Rebuild from candles with timing
+                    let rebuild_start = std::time::Instant::now();
                     profile.rebuild_from_candles(&candles);
+                    let rebuild_duration = rebuild_start.elapsed();
                     
                     // Store in memory
                     self.profiles.insert(profile_key.clone(), profile.clone());
@@ -370,8 +425,11 @@ impl VolumeProfileActor {
                     // Kafka publishing removed - now handled by IndicatorActor to avoid duplicate messages
                     // Volume profile data will be included in main technical analysis messages
 
-                    info!("Successfully rebuilt volume profile for {} on {}: {} candles, {:.2} total volume", 
-                          profile_key.symbol, profile_key.date, profile_data.candle_count, profile_data.total_volume);
+                    info!("✅ REBUILD COMPLETE: {} on {} - {} candles processed in {:.2}ms", 
+                          profile_key.symbol, profile_key.date, candles.len(), rebuild_duration.as_millis());
+                    info!("📈 VOLUME PROFILE STATS: total_volume={:.2}, VWAP={:.2}, POC={:.2}, price_levels={}, value_area={:.1}%", 
+                          profile_data.total_volume, profile_data.vwap, profile_data.poc, 
+                          profile_data.price_levels.len(), profile_data.value_area.volume_percentage);
                 }
                 Ok(_) => {
                     error!("Unexpected response from LMDB actor");
@@ -383,7 +441,10 @@ impl VolumeProfileActor {
                 }
             }
         } else {
-            return Err("LMDB actor not available".to_string());
+            error!("❌ CRITICAL: LMDB actor is None - cannot rebuild historical data for {} on {}", symbol, date);
+            error!("💡 FIX: Ensure VolumeProfileActor.SetActorReferences message is sent during startup");
+            error!("🔍 DEBUG: This causes volume profiles to show only single candle data instead of full daily data");
+            return Err("LMDB actor not available - SetActorReferences message not sent during startup".to_string());
         }
 
         Ok(())
@@ -487,12 +548,26 @@ impl Actor for VolumeProfileActor {
             info!("  Price increment mode: {:?}", self.config.price_increment_mode);
             info!("  Update frequency: {:?}", self.config.update_frequency);
             info!("  Value area percentage: {:.1}%", self.config.value_area_percentage);
+            
+            // STARTUP FIX: Initialize daily profiles for current trading day
+            let today = chrono::Utc::now().date_naive();
+            info!("🔄 STARTUP RECONSTRUCTION: Initializing volume profiles for current day: {}", today);
+            
+            // For now, we'll initialize for BTCUSDT (this could be extended to multiple symbols)
+            // In a production system, this list would come from configuration or active trading symbols
+            let active_symbols = vec!["BTCUSDT"]; // TODO: Make this configurable
+            
+            for symbol in active_symbols {
+                info!("🔄 STARTUP: Rebuilding volume profile for {} on {}", symbol, today);
+                if let Err(e) = self.rebuild_day(symbol.to_string(), today).await {
+                    warn!("⚠️ STARTUP: Failed to rebuild volume profile for {} on {}: {}", symbol, today, e);
+                } else {
+                    info!("✅ STARTUP: Successfully initialized volume profile for {} on {}", symbol, today);
+                }
+            }
         } else {
             info!("Volume profile calculation disabled");
         }
-
-        // Initialize daily profiles for current day (if needed)
-        // This could be extended to rebuild profiles on startup
 
         self.is_healthy = true;
         info!("📊 Volume Profile Actor started successfully");
@@ -551,6 +626,13 @@ impl Message<VolumeProfileTell> for VolumeProfileActor {
                     error!("❌ Failed to process volume profile batch: {}", e);
                     self.last_error = Some(Arc::new(e));
                 }
+            }
+            VolumeProfileTell::SetActorReferences { postgres_actor, lmdb_actor } => {
+                info!("🔧 CRITICAL FIX: Setting actor references for VolumeProfileActor");
+                self.postgres_actor = postgres_actor;
+                self.lmdb_actor = Some(lmdb_actor);
+                self.is_healthy = true;
+                info!("✅ CRITICAL FIX: VolumeProfileActor references set - LMDB access enabled for historical data reconstruction");
             }
         }
     }
