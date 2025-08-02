@@ -9,7 +9,6 @@ use tokio_postgres::NoTls;
 use tracing::{error, info, warn};
 
 use crate::historical::structs::FuturesOHLCVCandle;
-use crate::historical::volume_profile_validator::VolumeProfileValidationResult;
 use super::errors::PostgresError;
 
 /// PostgreSQL configuration
@@ -60,10 +59,6 @@ pub enum PostgresTell {
     },
     /// Health check message
     HealthCheck,
-    /// Store volume profile validation result
-    StoreVolumeProfileValidation {
-        validation_result: VolumeProfileValidationResult,
-    },
 }
 
 /// PostgreSQL actor messages for asking (request-response)
@@ -76,17 +71,6 @@ pub enum PostgresAsk {
     },
     /// Get connection health status
     GetHealthStatus,
-    /// Get volume profile validation results for symbol/date
-    GetVolumeProfileValidation {
-        symbol: String,
-        date: chrono::NaiveDate,
-    },
-    /// Get volume profile validation history for symbol
-    GetVolumeProfileValidationHistory {
-        symbol: String,
-        start_date: chrono::NaiveDate,
-        end_date: chrono::NaiveDate,
-    },
 }
 
 /// PostgreSQL actor responses
@@ -104,10 +88,6 @@ pub enum PostgresReply {
     Success,
     /// Error response
     Error(String),
-    /// Volume profile validation result
-    VolumeProfileValidation(Box<Option<VolumeProfileValidationResult>>),
-    /// Volume profile validation history
-    VolumeProfileValidationHistory(Vec<VolumeProfileValidationResult>),
 }
 
 /// PostgreSQL actor for storing candle data
@@ -137,85 +117,8 @@ impl PostgresActor {
             taker_buy_volume = EXCLUDED.taker_buy_volume
     "#;
 
-    /// SQL for creating volume profile validation table
-    const CREATE_VOLUME_PROFILE_VALIDATION_TABLE: &'static str = r#"
-        CREATE TABLE IF NOT EXISTS volume_profile_validations (
-            id SERIAL PRIMARY KEY,
-            symbol VARCHAR(20) NOT NULL,
-            date DATE NOT NULL,
-            validated_at TIMESTAMPTZ NOT NULL,
-            is_valid BOOLEAN NOT NULL,
-            candles_validated INTEGER NOT NULL,
-            total_volume DECIMAL(20,8) NOT NULL,
-            average_volume DECIMAL(20,8) NOT NULL,
-            zero_volume_candles INTEGER NOT NULL,
-            outlier_volume_candles INTEGER NOT NULL,
-            max_volume DECIMAL(20,8) NOT NULL,
-            min_non_zero_volume DECIMAL(20,8),
-            distribution_quality_score DECIMAL(5,4) NOT NULL,
-            price_range_min DECIMAL(20,8) NOT NULL,
-            price_range_max DECIMAL(20,8) NOT NULL,
-            price_gaps_detected INTEGER NOT NULL,
-            max_price_gap_percentage DECIMAL(8,4) NOT NULL,
-            price_continuity_score DECIMAL(5,4) NOT NULL,
-            ohlc_consistency_issues INTEGER NOT NULL,
-            gap_impact_score DECIMAL(5,4) NOT NULL,
-            validation_duration_ms BIGINT NOT NULL,
-            validation_errors_count INTEGER NOT NULL,
-            validation_data JSONB NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            UNIQUE(symbol, date)
-        );
-    "#;
 
-    /// SQL for creating volume profile validation errors table
-    const CREATE_VOLUME_PROFILE_ERRORS_TABLE: &'static str = r#"
-        CREATE TABLE IF NOT EXISTS volume_profile_validation_errors (
-            id SERIAL PRIMARY KEY,
-            validation_id INTEGER NOT NULL REFERENCES volume_profile_validations(id) ON DELETE CASCADE,
-            error_code VARCHAR(50) NOT NULL,
-            message TEXT NOT NULL,
-            timestamp_ms BIGINT NOT NULL,
-            severity VARCHAR(20) NOT NULL,
-            context_data JSONB,
-            created_at TIMESTAMPTZ DEFAULT NOW()
-        );
-    "#;
 
-    /// SQL for inserting volume profile validation
-    const INSERT_VOLUME_PROFILE_VALIDATION_SQL: &'static str = r#"
-        INSERT INTO volume_profile_validations (
-            symbol, date, validated_at, is_valid, candles_validated,
-            total_volume, average_volume, zero_volume_candles, outlier_volume_candles,
-            max_volume, min_non_zero_volume, distribution_quality_score,
-            price_range_min, price_range_max, price_gaps_detected, max_price_gap_percentage,
-            price_continuity_score, ohlc_consistency_issues, gap_impact_score,
-            validation_duration_ms, validation_errors_count, validation_data
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
-        ) ON CONFLICT (symbol, date) DO UPDATE SET
-            validated_at = EXCLUDED.validated_at,
-            is_valid = EXCLUDED.is_valid,
-            candles_validated = EXCLUDED.candles_validated,
-            total_volume = EXCLUDED.total_volume,
-            average_volume = EXCLUDED.average_volume,
-            zero_volume_candles = EXCLUDED.zero_volume_candles,
-            outlier_volume_candles = EXCLUDED.outlier_volume_candles,
-            max_volume = EXCLUDED.max_volume,
-            min_non_zero_volume = EXCLUDED.min_non_zero_volume,
-            distribution_quality_score = EXCLUDED.distribution_quality_score,
-            price_range_min = EXCLUDED.price_range_min,
-            price_range_max = EXCLUDED.price_range_max,
-            price_gaps_detected = EXCLUDED.price_gaps_detected,
-            max_price_gap_percentage = EXCLUDED.max_price_gap_percentage,
-            price_continuity_score = EXCLUDED.price_continuity_score,
-            ohlc_consistency_issues = EXCLUDED.ohlc_consistency_issues,
-            gap_impact_score = EXCLUDED.gap_impact_score,
-            validation_duration_ms = EXCLUDED.validation_duration_ms,
-            validation_errors_count = EXCLUDED.validation_errors_count,
-            validation_data = EXCLUDED.validation_data
-        RETURNING id;
-    "#;
 
     /// Create a new PostgresActor
     pub fn new(config: PostgresConfig) -> Result<Self, PostgresError> {
@@ -352,19 +255,6 @@ impl PostgresActor {
         if test == 1 {
             info!("PostgreSQL connection test successful");
             
-            // Create volume profile validation tables
-            info!("📊 Creating volume profile validation tables...");
-            if let Err(e) = client.execute(Self::CREATE_VOLUME_PROFILE_VALIDATION_TABLE, &[]).await {
-                warn!("Failed to create volume profile validation table: {}", e);
-            } else {
-                info!("✅ Volume profile validation table created/verified");
-            }
-            
-            if let Err(e) = client.execute(Self::CREATE_VOLUME_PROFILE_ERRORS_TABLE, &[]).await {
-                warn!("Failed to create volume profile errors table: {}", e);
-            } else {
-                info!("✅ Volume profile errors table created/verified");
-            }
             
             self.pool = Some(pool);
             self.last_error = None;
@@ -643,197 +533,7 @@ impl PostgresActor {
         }
     }
 
-    /// Store volume profile validation result to PostgreSQL
-    async fn store_volume_profile_validation(&mut self, validation_result: VolumeProfileValidationResult) -> Result<(), PostgresError> {
-        info!("📊 [PostgresActor] Storing volume profile validation for {} on {}", 
-              validation_result.symbol, validation_result.date);
 
-        let pool = match &self.pool {
-            Some(pool) => pool,
-            None => {
-                if self.config.enabled {
-                    warn!("PostgreSQL pool not initialized, skipping volume profile validation storage");
-                }
-                return Ok(());
-            }
-        };
-
-        // Get database client
-        let mut client = match pool.get().await {
-            Ok(client) => client,
-            Err(e) => {
-                error!("❌ [PostgresActor] Failed to acquire database client for volume profile validation: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        // Start transaction
-        let transaction = match client.transaction().await {
-            Ok(transaction) => transaction,
-            Err(e) => {
-                error!("❌ [PostgresActor] Failed to start transaction for volume profile validation: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        // Convert timestamp to PostgreSQL format
-        let validated_at = self.millis_to_timestamp(validation_result.validated_at)?;
-
-        // Serialize full validation data as JSONB string
-        let validation_data = serde_json::to_string(&validation_result)
-            .map_err(|e| PostgresError::Serialization(format!("Failed to serialize validation result: {}", e)))?;
-
-        // Handle potential min_non_zero_volume infinity
-        let min_non_zero_volume = if validation_result.volume_validation.min_non_zero_volume.is_infinite() {
-            None
-        } else {
-            Some(validation_result.volume_validation.min_non_zero_volume)
-        };
-
-        // Insert validation record
-        let validation_id: i32 = match transaction.query_one(
-            Self::INSERT_VOLUME_PROFILE_VALIDATION_SQL,
-            &[
-                &validation_result.symbol,                                                    // $1
-                &validation_result.date,                                                      // $2  
-                &validated_at,                                                                // $3
-                &validation_result.is_valid,                                                  // $4
-                &(validation_result.candles_validated as i32),                               // $5
-                &validation_result.volume_validation.total_volume,                           // $6
-                &validation_result.volume_validation.average_volume,                         // $7
-                &(validation_result.volume_validation.zero_volume_candles as i32),           // $8
-                &(validation_result.volume_validation.outlier_volume_candles as i32),        // $9
-                &validation_result.volume_validation.max_volume,                             // $10
-                &min_non_zero_volume,                                                        // $11
-                &validation_result.volume_validation.distribution_quality_score,            // $12
-                &validation_result.price_validation.price_range.0,                          // $13
-                &validation_result.price_validation.price_range.1,                          // $14
-                &(validation_result.price_validation.price_gaps_detected as i32),           // $15
-                &validation_result.price_validation.max_price_gap_percentage,               // $16
-                &validation_result.price_validation.price_continuity_score,                 // $17
-                &(validation_result.price_validation.ohlc_consistency_issues as i32),       // $18
-                &validation_result.gap_analysis.gap_impact_score,                           // $19
-                &(validation_result.validation_duration_ms as i64),                         // $20
-                &(validation_result.validation_errors.len() as i32),                        // $21
-                &validation_data,                                                            // $22
-            ],
-        ).await {
-            Ok(row) => row.get("id"),
-            Err(e) => {
-                error!("❌ [PostgresActor] Failed to insert volume profile validation: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        // Insert validation errors
-        for error in &validation_result.validation_errors {
-            let context_data = if error.context.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&error.context)
-                    .map_err(|e| PostgresError::Serialization(format!("Failed to serialize error context: {}", e)))?)
-            };
-
-            let severity_str = match error.severity {
-                crate::historical::volume_profile_validator::GapSeverity::Low => "Low",
-                crate::historical::volume_profile_validator::GapSeverity::Medium => "Medium", 
-                crate::historical::volume_profile_validator::GapSeverity::High => "High",
-                crate::historical::volume_profile_validator::GapSeverity::Critical => "Critical",
-            };
-
-            if let Err(e) = transaction.execute(
-                "INSERT INTO volume_profile_validation_errors (validation_id, error_code, message, timestamp_ms, severity, context_data) VALUES ($1, $2, $3, $4, $5, $6)",
-                &[
-                    &validation_id,
-                    &error.error_code,
-                    &error.message,
-                    &error.timestamp,
-                    &severity_str,
-                    &context_data,
-                ],
-            ).await {
-                error!("❌ [PostgresActor] Failed to insert validation error: {}", e);
-                return Err(e.into());
-            }
-        }
-
-        // Commit transaction
-        match transaction.commit().await {
-            Ok(()) => {
-                info!("✅ [PostgresActor] Successfully stored volume profile validation for {} on {} with {} errors", 
-                      validation_result.symbol, validation_result.date, validation_result.validation_errors.len());
-                Ok(())
-            }
-            Err(e) => {
-                error!("❌ [PostgresActor] Failed to commit volume profile validation transaction: {}", e);
-                Err(e.into())
-            }
-        }
-    }
-
-    /// Get volume profile validation result from PostgreSQL
-    async fn get_volume_profile_validation(&self, symbol: String, date: chrono::NaiveDate) -> Result<Option<VolumeProfileValidationResult>, PostgresError> {
-        let pool = match &self.pool {
-            Some(pool) => pool,
-            None => return Ok(None),
-        };
-
-        let client = pool.get().await?;
-        
-        match client.query_opt(
-            "SELECT validation_data FROM volume_profile_validations WHERE symbol = $1 AND date = $2",
-            &[&symbol, &date],
-        ).await {
-            Ok(Some(row)) => {
-                let validation_data: String = row.get("validation_data");
-                match serde_json::from_str(&validation_data) {
-                    Ok(result) => Ok(Some(result)),
-                    Err(e) => {
-                        error!("❌ Failed to deserialize volume profile validation: {}", e);
-                        Ok(None)
-                    }
-                }
-            }
-            Ok(None) => Ok(None),
-            Err(e) => {
-                error!("❌ Failed to query volume profile validation: {}", e);
-                Err(e.into())
-            }
-        }
-    }
-
-    /// Get volume profile validation history from PostgreSQL
-    async fn get_volume_profile_validation_history(&self, symbol: String, start_date: chrono::NaiveDate, end_date: chrono::NaiveDate) -> Result<Vec<VolumeProfileValidationResult>, PostgresError> {
-        let pool = match &self.pool {
-            Some(pool) => pool,
-            None => return Ok(Vec::new()),
-        };
-
-        let client = pool.get().await?;
-        
-        match client.query(
-            "SELECT validation_data FROM volume_profile_validations WHERE symbol = $1 AND date >= $2 AND date <= $3 ORDER BY date ASC",
-            &[&symbol, &start_date, &end_date],
-        ).await {
-            Ok(rows) => {
-                let mut results = Vec::new();
-                for row in rows {
-                    let validation_data: String = row.get("validation_data");
-                    match serde_json::from_str(&validation_data) {
-                        Ok(result) => results.push(result),
-                        Err(e) => {
-                            error!("❌ Failed to deserialize volume profile validation: {}", e);
-                        }
-                    }
-                }
-                Ok(results)
-            }
-            Err(e) => {
-                error!("❌ Failed to query volume profile validation history: {}", e);
-                Err(e.into())
-            }
-        }
-    }
 }
 
 impl Actor for PostgresActor {
@@ -927,14 +627,6 @@ impl Message<PostgresTell> for PostgresActor {
                     info!("✅ [PostgresActor] HealthCheck completed successfully");
                 }
             }
-            PostgresTell::StoreVolumeProfileValidation { validation_result } => {
-                info!("📊 [PostgresActor] Received StoreVolumeProfileValidation message for {} on {}", 
-                      validation_result.symbol, validation_result.date);
-                if let Err(e) = self.store_volume_profile_validation(validation_result).await {
-                    error!("❌ Failed to store volume profile validation: {}", e);
-                    self.last_error = Some(format!("Volume profile validation storage failed: {}", e));
-                }
-            }
         }
     }
 }
@@ -951,18 +643,6 @@ impl Message<PostgresAsk> for PostgresActor {
             }
             PostgresAsk::GetHealthStatus => {
                 Ok(self.get_health_status())
-            }
-            PostgresAsk::GetVolumeProfileValidation { symbol, date } => {
-                match self.get_volume_profile_validation(symbol, date).await {
-                    Ok(result) => Ok(PostgresReply::VolumeProfileValidation(Box::new(result))),
-                    Err(e) => Err(e),
-                }
-            }
-            PostgresAsk::GetVolumeProfileValidationHistory { symbol, start_date, end_date } => {
-                match self.get_volume_profile_validation_history(symbol, start_date, end_date).await {
-                    Ok(results) => Ok(PostgresReply::VolumeProfileValidationHistory(results)),
-                    Err(e) => Err(e),
-                }
             }
         }
     }

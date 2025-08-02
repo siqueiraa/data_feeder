@@ -18,7 +18,8 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
+tracing-appender = "0.2"
 zip = "4.3"
 tempfile = "3.10.1"
 rayon = "1.10"

@@ -2,7 +2,8 @@ use chrono::NaiveDate;
 use tokio_postgres::{Client, Error as PostgresError};
 use tracing::{debug, error, info, warn};
 
-use super::structs::VolumeProfileData;
+use super::structs::{VolumeProfileData, ValueArea};
+use crate::historical::structs::TimestampMS;
 
 // Remove the custom error conversion - we'll handle this differently
 
@@ -28,12 +29,18 @@ impl VolumeProfileDatabase {
             CREATE TABLE IF NOT EXISTS {} (
                 symbol VARCHAR(20) NOT NULL,
                 date DATE NOT NULL,
-                volume_profile JSONB NOT NULL,
-                total_daily_volume DECIMAL(18,8) NOT NULL,
-                price_increment DECIMAL(18,8) NOT NULL,
-                min_price DECIMAL(18,8) NOT NULL,
-                max_price DECIMAL(18,8) NOT NULL,
+                total_volume DECIMAL(20,8) NOT NULL,
+                vwap DECIMAL(20,8) NOT NULL,
+                poc DECIMAL(20,8) NOT NULL,
+                value_area_high DECIMAL(20,8) NOT NULL,
+                value_area_low DECIMAL(20,8) NOT NULL,
+                value_area_volume_percentage DECIMAL(8,4) NOT NULL,
+                value_area_volume DECIMAL(20,8) NOT NULL,
+                price_increment DECIMAL(20,8) NOT NULL,
+                min_price DECIMAL(20,8) NOT NULL,
+                max_price DECIMAL(20,8) NOT NULL,
                 candle_count INTEGER NOT NULL,
+                last_updated BIGINT NOT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 
@@ -50,11 +57,16 @@ impl VolumeProfileDatabase {
             ON {} (symbol, date) 
             WHERE date >= CURRENT_DATE - INTERVAL '30 days';
 
-            -- Create GIN index on JSONB column for efficient JSON queries
-            CREATE INDEX IF NOT EXISTS idx_{}_volume_profile_gin 
-            ON {} USING GIN (volume_profile);
+            -- Create index on VWAP for price analysis
+            CREATE INDEX IF NOT EXISTS idx_{}_vwap 
+            ON {} (vwap);
+            
+            -- Create index on POC for volume analysis
+            CREATE INDEX IF NOT EXISTS idx_{}_poc 
+            ON {} (poc);
             "#,
             self.table_name,
+            self.table_name, self.table_name,
             self.table_name, self.table_name,
             self.table_name, self.table_name,
             self.table_name, self.table_name,
@@ -101,31 +113,39 @@ impl VolumeProfileDatabase {
         debug!("Upserting volume profile: {} on {} ({} price levels)", 
                symbol, date, profile_data.price_levels.len());
 
-        // Convert profile data to JSON string for JSONB storage
-        let volume_profile_json = serde_json::to_string(profile_data)
-            .expect("VolumeProfileData should always be serializable");
-
-        // Prepare upsert SQL
+        // Prepare upsert SQL with individual columns
         let sql = format!(
             r#"
             INSERT INTO {} (
                 symbol, 
                 date, 
-                volume_profile, 
-                total_daily_volume, 
+                total_volume,
+                vwap,
+                poc,
+                value_area_high,
+                value_area_low,
+                value_area_volume_percentage,
+                value_area_volume,
                 price_increment, 
                 min_price, 
                 max_price, 
-                candle_count
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                candle_count,
+                last_updated
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (symbol, date) 
             DO UPDATE SET
-                volume_profile = EXCLUDED.volume_profile,
-                total_daily_volume = EXCLUDED.total_daily_volume,
+                total_volume = EXCLUDED.total_volume,
+                vwap = EXCLUDED.vwap,
+                poc = EXCLUDED.poc,
+                value_area_high = EXCLUDED.value_area_high,
+                value_area_low = EXCLUDED.value_area_low,
+                value_area_volume_percentage = EXCLUDED.value_area_volume_percentage,
+                value_area_volume = EXCLUDED.value_area_volume,
                 price_increment = EXCLUDED.price_increment,
                 min_price = EXCLUDED.min_price,
                 max_price = EXCLUDED.max_price,
                 candle_count = EXCLUDED.candle_count,
+                last_updated = EXCLUDED.last_updated,
                 updated_at = CURRENT_TIMESTAMP
             "#,
             self.table_name
@@ -138,12 +158,18 @@ impl VolumeProfileDatabase {
                 &[
                     &symbol,
                     &date,
-                    &volume_profile_json,
                     &profile_data.total_volume,
+                    &profile_data.vwap,
+                    &profile_data.poc,
+                    &profile_data.value_area.high,
+                    &profile_data.value_area.low,
+                    &profile_data.value_area.volume_percentage,
+                    &profile_data.value_area.volume,
                     &profile_data.price_increment,
                     &profile_data.min_price,
                     &profile_data.max_price,
                     &(profile_data.candle_count as i32),
+                    &profile_data.last_updated,
                 ],
             )
             .await?;
@@ -207,31 +233,39 @@ impl VolumeProfileDatabase {
         date: NaiveDate,
         profile_data: &VolumeProfileData,
     ) -> Result<u64, PostgresError> {
-        // Convert profile data to JSON string for JSONB storage
-        let volume_profile_json = serde_json::to_string(profile_data)
-            .expect("VolumeProfileData should always be serializable");
-
-        // Prepare upsert SQL
+        // Prepare upsert SQL with individual columns
         let sql = format!(
             r#"
             INSERT INTO {} (
                 symbol, 
                 date, 
-                volume_profile, 
-                total_daily_volume, 
+                total_volume,
+                vwap,
+                poc,
+                value_area_high,
+                value_area_low,
+                value_area_volume_percentage,
+                value_area_volume,
                 price_increment, 
                 min_price, 
                 max_price, 
-                candle_count
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                candle_count,
+                last_updated
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (symbol, date) 
             DO UPDATE SET
-                volume_profile = EXCLUDED.volume_profile,
-                total_daily_volume = EXCLUDED.total_daily_volume,
+                total_volume = EXCLUDED.total_volume,
+                vwap = EXCLUDED.vwap,
+                poc = EXCLUDED.poc,
+                value_area_high = EXCLUDED.value_area_high,
+                value_area_low = EXCLUDED.value_area_low,
+                value_area_volume_percentage = EXCLUDED.value_area_volume_percentage,
+                value_area_volume = EXCLUDED.value_area_volume,
                 price_increment = EXCLUDED.price_increment,
                 min_price = EXCLUDED.min_price,
                 max_price = EXCLUDED.max_price,
                 candle_count = EXCLUDED.candle_count,
+                last_updated = EXCLUDED.last_updated,
                 updated_at = CURRENT_TIMESTAMP
             "#,
             self.table_name
@@ -244,12 +278,18 @@ impl VolumeProfileDatabase {
                 &[
                     &symbol,
                     &date,
-                    &volume_profile_json,
                     &profile_data.total_volume,
+                    &profile_data.vwap,
+                    &profile_data.poc,
+                    &profile_data.value_area.high,
+                    &profile_data.value_area.low,
+                    &profile_data.value_area.volume_percentage,
+                    &profile_data.value_area.volume,
                     &profile_data.price_increment,
                     &profile_data.min_price,
                     &profile_data.max_price,
                     &(profile_data.candle_count as i32),
+                    &profile_data.last_updated,
                 ],
             )
             .await?;
@@ -267,27 +307,46 @@ impl VolumeProfileDatabase {
         debug!("Retrieving volume profile: {} on {}", symbol, date);
 
         let sql = format!(
-            "SELECT volume_profile FROM {} WHERE symbol = $1 AND date = $2",
+            "SELECT total_volume, vwap, poc, value_area_high, value_area_low, value_area_volume_percentage, value_area_volume, price_increment, min_price, max_price, candle_count, last_updated FROM {} WHERE symbol = $1 AND date = $2",
             self.table_name
         );
 
         match client.query_opt(&sql, &[&symbol, &date]).await? {
             Some(row) => {
-                let volume_profile_json: String = row.get("volume_profile");
-                
-                match serde_json::from_str::<VolumeProfileData>(&volume_profile_json) {
-                    Ok(profile_data) => {
-                        debug!("Successfully retrieved volume profile: {} on {}", symbol, date);
-                        Ok(Some(profile_data))
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize volume profile data: {}", e);
-                        {
-                            error!("Failed to deserialize volume profile data: {}", e);
-                            Ok(None)
-                        }
-                    }
-                }
+                let total_volume: f64 = row.get("total_volume");
+                let vwap: f64 = row.get("vwap");
+                let poc: f64 = row.get("poc");
+                let value_area_high: f64 = row.get("value_area_high");
+                let value_area_low: f64 = row.get("value_area_low");
+                let value_area_volume_percentage: f64 = row.get("value_area_volume_percentage");
+                let value_area_volume: f64 = row.get("value_area_volume");
+                let price_increment: f64 = row.get("price_increment");
+                let min_price: f64 = row.get("min_price");
+                let max_price: f64 = row.get("max_price");
+                let candle_count: i32 = row.get("candle_count");
+                let last_updated: i64 = row.get("last_updated");
+
+                let profile_data = VolumeProfileData {
+                    date: date.format("%Y-%m-%d").to_string(),
+                    price_levels: Vec::new(), // Empty since we only store aggregated data
+                    total_volume,
+                    vwap,
+                    poc,
+                    value_area: ValueArea {
+                        high: value_area_high,
+                        low: value_area_low,
+                        volume_percentage: value_area_volume_percentage,
+                        volume: value_area_volume,
+                    },
+                    price_increment,
+                    min_price,
+                    max_price,
+                    candle_count: candle_count as u32,
+                    last_updated: last_updated as TimestampMS,
+                };
+
+                debug!("Successfully retrieved volume profile: {} on {}", symbol, date);
+                Ok(Some(profile_data))
             }
             None => {
                 debug!("No volume profile found: {} on {}", symbol, date);
@@ -307,7 +366,7 @@ impl VolumeProfileDatabase {
         debug!("Retrieving volume profiles: {} from {} to {}", symbol, start_date, end_date);
 
         let sql = format!(
-            "SELECT volume_profile FROM {} WHERE symbol = $1 AND date >= $2 AND date <= $3 ORDER BY date",
+            "SELECT date, total_volume, vwap, poc, value_area_high, value_area_low, value_area_volume_percentage, value_area_volume, price_increment, min_price, max_price, candle_count, last_updated FROM {} WHERE symbol = $1 AND date >= $2 AND date <= $3 ORDER BY date",
             self.table_name
         );
 
@@ -315,18 +374,40 @@ impl VolumeProfileDatabase {
         let mut profiles = Vec::with_capacity(rows.len());
 
         for row in rows {
-            let volume_profile_json: String = row.get("volume_profile");
-            
-            match serde_json::from_str::<VolumeProfileData>(&volume_profile_json) {
-                Ok(profile_data) => {
-                    profiles.push(profile_data);
-                }
-                Err(e) => {
-                    error!("Failed to deserialize volume profile data in range query: {}", e);
-                    error!("Failed to deserialize volume profile data: {}", e);
-                    continue; // Skip this row and continue with the next one
-                }
-            }
+            let date: NaiveDate = row.get("date");
+            let total_volume: f64 = row.get("total_volume");
+            let vwap: f64 = row.get("vwap");
+            let poc: f64 = row.get("poc");
+            let value_area_high: f64 = row.get("value_area_high");
+            let value_area_low: f64 = row.get("value_area_low");
+            let value_area_volume_percentage: f64 = row.get("value_area_volume_percentage");
+            let value_area_volume: f64 = row.get("value_area_volume");
+            let price_increment: f64 = row.get("price_increment");
+            let min_price: f64 = row.get("min_price");
+            let max_price: f64 = row.get("max_price");
+            let candle_count: i32 = row.get("candle_count");
+            let last_updated: i64 = row.get("last_updated");
+
+            let profile_data = VolumeProfileData {
+                date: date.format("%Y-%m-%d").to_string(),
+                price_levels: Vec::new(), // Empty since we only store aggregated data
+                total_volume,
+                vwap,
+                poc,
+                value_area: ValueArea {
+                    high: value_area_high,
+                    low: value_area_low,
+                    volume_percentage: value_area_volume_percentage,
+                    volume: value_area_volume,
+                },
+                price_increment,
+                min_price,
+                max_price,
+                candle_count: candle_count as u32,
+                last_updated: last_updated as TimestampMS,
+            };
+
+            profiles.push(profile_data);
         }
 
         info!("Retrieved {} volume profiles for {} from {} to {}", 
@@ -370,7 +451,7 @@ impl VolumeProfileDatabase {
                 COUNT(DISTINCT symbol) as unique_symbols,
                 MIN(date) as earliest_date,
                 MAX(date) as latest_date,
-                AVG(total_daily_volume) as avg_daily_volume,
+                AVG(total_volume) as avg_daily_volume,
                 AVG(candle_count) as avg_candle_count
             FROM {}
             "#,
@@ -445,7 +526,7 @@ impl VolumeProfileDatabase {
         "#;
 
         let rows = client.query(columns_sql, &[&self.table_name]).await?;
-        let mut required_columns = vec!["symbol", "date", "volume_profile", "total_daily_volume"];
+        let mut required_columns = vec!["symbol", "date", "total_volume", "vwap", "poc", "value_area_high", "value_area_low"];
         
         for row in rows {
             let column_name: String = row.get("column_name");
@@ -532,7 +613,9 @@ mod tests {
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS volume_profiles"));
         assert!(sql.contains("symbol VARCHAR(20) NOT NULL"));
         assert!(sql.contains("date DATE NOT NULL"));
-        assert!(sql.contains("volume_profile JSONB NOT NULL"));
+        assert!(sql.contains("total_volume DECIMAL(20,8) NOT NULL"));
+        assert!(sql.contains("vwap DECIMAL(20,8) NOT NULL"));
+        assert!(sql.contains("poc DECIMAL(20,8) NOT NULL"));
         assert!(sql.contains("PRIMARY KEY (symbol, date)"));
     }
 

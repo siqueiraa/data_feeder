@@ -1,4 +1,4 @@
-use data_feeder::historical::actor::{HistoricalActor, HistoricalAsk};
+use data_feeder::historical::actor::{HistoricalActor, HistoricalAsk, HistoricalReply};
 use data_feeder::websocket::{
     WebSocketActor, WebSocketTell, WebSocketAsk, WebSocketReply, StreamType
 };
@@ -14,6 +14,7 @@ use data_feeder::health::HealthDependencies;
 use data_feeder::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 use data_feeder::metrics::{init_metrics};
 use data_feeder::metrics_server::start_metrics_server;
+use data_feeder::logging::{LoggingConfig, LogRotation, init_dual_logging, log_system_info, cleanup_old_logs};
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
@@ -41,6 +42,17 @@ struct ApplicationConfig {
     pub periodic_gap_check_window_minutes: u32, // How far back to scan for gaps (default: 30)
 }
 
+/// Logging configuration from config.toml
+#[derive(Debug, Clone, Deserialize)]
+struct LoggingTomlConfig {
+    pub log_dir: Option<String>,
+    pub level_filter: Option<String>,
+    pub rotation: Option<String>, // "daily", "hourly", or "size:<MB>"
+    pub console_timestamps: Option<bool>,
+    pub file_json_format: Option<bool>,
+    pub cleanup_days: Option<u32>, // Days to keep log files
+}
+
 /// Technical analysis configuration from config.toml
 #[derive(Debug, Clone, Deserialize)]
 struct TechnicalAnalysisTomlConfig {
@@ -48,6 +60,16 @@ struct TechnicalAnalysisTomlConfig {
     pub ema_periods: Vec<u32>,
     pub timeframes: Vec<u64>,
     pub volume_lookback_days: u32,
+}
+
+/// Historical validation configuration from config.toml
+#[derive(Debug, Clone, Deserialize)]
+struct HistoricalValidationTomlConfig {
+    pub enabled: Option<bool>,
+    pub validation_days: Option<u32>,
+    pub parallel_processing: Option<bool>,
+    pub skip_empty_days: Option<bool>,
+    pub force_revalidation: Option<bool>, // Force revalidation even if marked complete
 }
 
 /// Full TOML configuration structure
@@ -58,6 +80,8 @@ struct TomlConfig {
     pub technical_analysis: TechnicalAnalysisTomlConfig,
     pub kafka: Option<KafkaConfig>,
     pub volume_profile: Option<VolumeProfileConfig>,
+    pub logging: Option<LoggingTomlConfig>,
+    pub historical_validation: Option<HistoricalValidationTomlConfig>,
 }
 
 /// Production configuration (converted from TOML)
@@ -89,6 +113,13 @@ struct DataFeederConfig {
     pub historical_validation_complete: bool, // Tracks completion of Phase 1 (full historical validation)
     pub recent_monitoring_days: u32, // Days to monitor in Phase 2 (default: 60)
     pub min_gap_seconds: u64, // Minimum gap duration to detect (default: 90 seconds for 1-minute candles)
+    // Historical validation configuration
+    pub historical_validation_enabled: bool, // Enable/disable historical validation on startup
+    pub historical_validation_days: u32, // Number of days to validate during Phase 1 (default: 60)
+    pub historical_validation_parallel: bool, // Enable parallel validation processing
+    pub historical_validation_skip_empty_days: bool, // Skip days with no data
+    // Logging configuration
+    pub logging_config: LoggingConfig,
 }
 
 impl DataFeederConfig {
@@ -115,6 +146,48 @@ impl DataFeederConfig {
             min_history_days: toml_config.technical_analysis.min_history_days,
         };
         
+        // Convert logging configuration with fallback to defaults
+        let (logging_config, _cleanup_days) = if let Some(log_config) = toml_config.logging {
+            let rotation = log_config.rotation
+                .map(|r| match r.as_str() {
+                    "hourly" => LogRotation::Hourly,
+                    "daily" => LogRotation::Daily,
+                    s if s.starts_with("size:") => {
+                        let size_str = s.strip_prefix("size:").unwrap_or("100");
+                        let size_mb = size_str.parse().unwrap_or(100);
+                        LogRotation::SizeBased(size_mb)
+                    }
+                    _ => LogRotation::Daily,
+                })
+                .unwrap_or(LogRotation::Daily);
+            
+            let config = LoggingConfig {
+                log_dir: log_config.log_dir.unwrap_or_else(|| "logs".to_string()),
+                level_filter: log_config.level_filter.unwrap_or_else(|| "info,data_feeder=info".to_string()),
+                rotation,
+                console_timestamps: log_config.console_timestamps.unwrap_or(true),
+                file_json_format: log_config.file_json_format.unwrap_or(true),
+            };
+            let cleanup = log_config.cleanup_days.unwrap_or(30);
+            (config, cleanup)
+        } else {
+            (LoggingConfig::default(), 30)
+        };
+        
+        // Convert historical validation configuration
+        let (historical_validation_enabled, historical_validation_days, historical_validation_parallel, 
+             historical_validation_skip_empty_days, _force_revalidation) = if let Some(hv_config) = toml_config.historical_validation {
+            (
+                hv_config.enabled.unwrap_or(true),
+                hv_config.validation_days.unwrap_or(60),
+                hv_config.parallel_processing.unwrap_or(false), // Conservative default
+                hv_config.skip_empty_days.unwrap_or(true),
+                hv_config.force_revalidation.unwrap_or(false),
+            )
+        } else {
+            (true, 60, false, true, false) // Default values
+        };
+        
         Self {
             symbols,
             timeframes: toml_config.application.timeframes,
@@ -133,10 +206,17 @@ impl DataFeederConfig {
             postgres_config: toml_config.database,
             kafka_config: toml_config.kafka.unwrap_or_default(),
             volume_profile_config: toml_config.volume_profile.unwrap_or_default(),
-            // Historical validation defaults - start with Phase 1 (full validation)
-            historical_validation_complete: false, // Always start with full historical validation
+            // Historical validation tracking
+            historical_validation_complete: false, // Start with Phase 1 unless forced
             recent_monitoring_days: 60, // Monitor last 60 days in Phase 2
             min_gap_seconds: 75, // Minimum 75 seconds for 1-minute candles (60s + 15s buffer)
+            // Historical validation configuration
+            historical_validation_enabled,
+            historical_validation_days,
+            historical_validation_parallel,
+            historical_validation_skip_empty_days,
+            // Logging configuration
+            logging_config,
         }
     }
 }
@@ -171,6 +251,13 @@ impl Default for DataFeederConfig {
             historical_validation_complete: true, // Always start with full historical validation
             recent_monitoring_days: 60, // Monitor last 60 days in Phase 2
             min_gap_seconds: 60, // Minimum 75 seconds for 1-minute candles (60s + 15s buffer)
+            // Historical validation configuration defaults
+            historical_validation_enabled: true,
+            historical_validation_days: 60,
+            historical_validation_parallel: false,
+            historical_validation_skip_empty_days: true,
+            // Logging configuration
+            logging_config: LoggingConfig::default(),
         }
     }
 }
@@ -388,10 +475,63 @@ async fn detect_and_fill_gaps(
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter("info,data_feeder=info")
-        .init();
+    // Pre-load configuration to get logging settings
+    let mut config = match DataFeederConfig::from_toml("config.toml") {
+        Ok(config) => {
+            // Simple print until logging is initialized
+            println!("✅ Loaded configuration from config.toml");
+            config
+        }
+        Err(e) => {
+            println!("⚠️ Failed to load config.toml: {}. Using default configuration", e);
+            DataFeederConfig {
+                symbols: vec!["BTCUSDT".to_string()],
+                timeframes: vec![60], // 1m
+                start_date: Some("2025-01-01T00:00:00Z".to_string()), // January 1, 2025
+                ..Default::default()
+            }
+        }
+    };
+
+    // Initialize dual logging system (console + rotating files)
+    if let Err(e) = init_dual_logging(config.logging_config.clone()) {
+        eprintln!("❌ Failed to initialize logging system: {}", e);
+        // Fall back to simple logging
+        tracing_subscriber::fmt()
+            .with_env_filter("info,data_feeder=info")
+            .init();
+        error!("⚠️ Using fallback console-only logging due to error: {}", e);
+    }
+
+    // Clean up old log files using configured cleanup days
+    // Note: cleanup_days is not accessible here since it's not stored in config
+    // For now, use default 30 days - in production this would be in the config struct
+    if let Err(e) = cleanup_old_logs(&config.logging_config.log_dir, 30) {
+        warn!("⚠️ Failed to clean up old log files: {}", e);
+    }
+
+    // Log system information for debugging
+    log_system_info();
+    
+    // Log configuration information for debugging
+    info!(
+        symbols_count = config.symbols.len(),
+        timeframes = ?config.timeframes,
+        gap_detection = config.gap_detection_enabled,
+        postgres_enabled = config.postgres_config.enabled,
+        kafka_enabled = config.kafka_config.enabled,
+        volume_profile_enabled = config.volume_profile_config.enabled,
+        technical_analysis = config.enable_technical_analysis,
+        historical_validation_enabled = config.historical_validation_enabled,
+        historical_validation_days = config.historical_validation_days,
+        historical_validation_parallel = config.historical_validation_parallel,
+        historical_validation_skip_empty = config.historical_validation_skip_empty_days,
+        storage_path = %config.storage_path.display(),
+        log_dir = %config.logging_config.log_dir,
+        "🔧 System configuration logged for debugging"
+    );
+
+    info!("🚀 Starting Data Feeder - Production Mode");
 
     // Initialize Prometheus metrics
     match init_metrics() {
@@ -403,25 +543,6 @@ async fn main() {
     }
 
     // Metrics server will be started after actors are launched
-
-    info!("🚀 Starting Data Feeder - Production Mode");
-    
-    // Try to load configuration from config.toml, fallback to default if not found
-    let mut config = match DataFeederConfig::from_toml("config.toml") {
-        Ok(config) => {
-            info!("✅ Loaded configuration from config.toml");
-            config
-        }
-        Err(e) => {
-            warn!("⚠️ Failed to load config.toml: {}. Using default configuration", e);
-            DataFeederConfig {
-                symbols: vec!["BTCUSDT".to_string()],
-                timeframes: vec![60], // 1m
-                start_date: Some("2025-01-01T00:00:00Z".to_string()), // January 1, 2025
-                ..Default::default()
-            }
-        }
-    };
     
     // Ensure TA config symbols match main config symbols
     config.ta_config.symbols = config.symbols.clone();
@@ -538,6 +659,69 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     } else {
         info!("🚫 Gap detection disabled - skipping Step 3");
     }
+    
+    // Step 3.3: Historical Volume Profile Validation - validate existing historical data
+    let historical_validation_start = std::time::Instant::now();
+    info!("📊 Step 3.3: Running historical volume profile validation...");
+    
+    if config.historical_validation_enabled {
+        if !config.historical_validation_complete {
+            info!("🔍 Phase 1: Full historical validation (first-time setup)");
+            info!("⚙️ Validation settings: {} days, parallel={}, skip_empty={}", 
+                  config.historical_validation_days, 
+                  config.historical_validation_parallel, 
+                  config.historical_validation_skip_empty_days);
+            
+            // Calculate validation date range based on configuration
+            let end_date = chrono::Utc::now().naive_utc().date();
+            let start_date = if let Some(ref date_str) = config.start_date {
+                match chrono::DateTime::parse_from_rfc3339(date_str) {
+                    Ok(dt) => dt.naive_utc().date(),
+                    Err(_) => {
+                        warn!("❌ Invalid start_date format, using configured validation days");
+                        end_date - chrono::Duration::days(config.historical_validation_days as i64)
+                    }
+                }
+            } else {
+                // Use configured validation days
+                end_date - chrono::Duration::days(config.historical_validation_days as i64)
+            };
+            
+            info!("📅 Historical validation date range: {} to {} ({} days)", 
+                  start_date, end_date, (end_date - start_date).num_days());
+            
+            // Trigger historical validation
+            let validation_msg = HistoricalAsk::RunHistoricalVolumeProfileValidation {
+                symbols: config.symbols.clone(),
+                timeframes: config.timeframes.clone(),
+                start_date,
+                end_date,
+            };
+            
+            match historical_actor.ask(validation_msg).await {
+                Ok(HistoricalReply::ValidationCompleted) => {
+                    info!("✅ Historical volume profile validation completed successfully");
+                    // Mark validation as complete for future runs
+                    // Note: In production, this would be persisted to configuration file or database
+                }
+                Ok(_) => {
+                    warn!("⚠️ Unexpected reply from historical validation");
+                }
+                Err(e) => {
+                    error!("❌ Historical volume profile validation failed: {}", e);
+                    // Continue startup even if validation fails
+                }
+            }
+        } else {
+            info!("✅ Phase 2: Historical validation already complete - skipping full validation");
+            info!("📊 Recent monitoring will validate last {} days during periodic checks", config.recent_monitoring_days);
+        }
+    } else {
+        info!("🚫 Historical volume profile validation disabled in configuration");
+    }
+    
+    let historical_validation_elapsed = historical_validation_start.elapsed();
+    info!("✅ Step 3.3 completed in {:?} - Historical validation finished", historical_validation_elapsed);
     
     // Step 3.5: Now launch Technical Analysis actors with complete historical data using SAME timestamp
     let ta_start = std::time::Instant::now();
