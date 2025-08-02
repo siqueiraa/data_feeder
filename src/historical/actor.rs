@@ -18,6 +18,7 @@ use crate::queue::types::QueueConfig;
 
 use super::errors::HistoricalDataError;
 use super::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS, Seconds, FuturesExchangeTrade};
+use super::volume_profile_validator::{VolumeProfileValidator, VolumeProfileValidationConfig};
 use crate::postgres::{PostgresActor, PostgresTell};
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 use crate::common::error_utils::ErrorContext;
@@ -33,6 +34,8 @@ pub struct HistoricalActor {
     csv_path: PathBuf,
     postgres_actor: Option<ActorRef<PostgresActor>>,
     lmdb_actor: Option<ActorRef<LmdbActor>>,
+    // Volume profile validation system
+    volume_profile_validator: Option<VolumeProfileValidator>,
     // Queue system for non-blocking operations
     task_queue: TaskQueue,
     io_queue: IoQueue,
@@ -79,13 +82,19 @@ impl HistoricalActor {
         };
         let rate_limiter = RateLimitingQueue::new(QueueConfig::default(), rate_config);
 
+        // Initialize volume profile validator with default configuration
+        let volume_profile_config = VolumeProfileValidationConfig::default();
+        let volume_profile_validator = VolumeProfileValidator::new(volume_profile_config);
+
         info!("HistoricalActor initialized - LMDB operations will be delegated to LmdbActor");
         info!("🚀 Queue system initialized: 8 CPU workers, 4 I/O workers, 2 DB workers, 1200 req/min rate limit");
+        info!("📊 Volume profile validator initialized with default configuration");
 
         Ok(Self { 
             csv_path: csv_path.to_path_buf(),
             postgres_actor: None,
             lmdb_actor: None,
+            volume_profile_validator: Some(volume_profile_validator),
             task_queue,
             io_queue,
             db_queue,
@@ -227,6 +236,65 @@ impl HistoricalActor {
             warn!("Gaps found in NEW candle data for symbol {}, timeframe {}s: {:?}", symbol, timeframe, gaps_in_new);
             warn!("NOT updating certified range due to gaps in new data");
             return Ok(());
+        }
+
+        // 📊 VOLUME PROFILE VALIDATION: Run after gap detection to validate data quality
+        if let Some(validator) = &self.volume_profile_validator {
+            let validation_date = chrono::DateTime::from_timestamp_millis(new_candles_start)
+                .map(|dt| dt.naive_utc().date())
+                .unwrap_or_else(|| chrono::Utc::now().naive_utc().date());
+
+            info!("📊 Running volume profile validation for {} on {} after gap detection", symbol, validation_date);
+            
+            match validator.validate_volume_profile_data(symbol, validation_date, candles, &gaps_in_new) {
+                Ok(validation_result) => {
+                    let status = if validation_result.is_valid { "✅ PASSED" } else { "❌ FAILED" };
+                    info!("📊 Volume profile validation {}: {} for {} on {} ({}ms)", 
+                          status, validation_result.is_valid, symbol, validation_date, validation_result.validation_duration_ms);
+
+                    // Store validation result in LMDB
+                    if let Some(lmdb_actor) = &self.lmdb_actor {
+                        let store_msg = LmdbActorMessage::StoreVolumeProfileValidation {
+                            validation_result: validation_result.clone(),
+                        };
+                        if let Err(e) = lmdb_actor.tell(store_msg).send().await {
+                            error!("❌ Failed to store volume profile validation in LMDB: {}", e);
+                        } else {
+                            info!("💾 Stored volume profile validation in LMDB for {} on {}", symbol, validation_date);
+                        }
+                    }
+
+                    // Store validation result in PostgreSQL
+                    if let Some(postgres_actor) = &self.postgres_actor {
+                        let store_msg = PostgresTell::StoreVolumeProfileValidation {
+                            validation_result: validation_result.clone(),
+                        };
+                        if let Err(e) = postgres_actor.tell(store_msg).send().await {
+                            error!("❌ Failed to store volume profile validation in PostgreSQL: {}", e);
+                        } else {
+                            info!("💾 Stored volume profile validation in PostgreSQL for {} on {}", symbol, validation_date);
+                        }
+                    }
+
+                    // Log validation errors if any
+                    if !validation_result.validation_errors.is_empty() {
+                        warn!("⚠️ Volume profile validation found {} issues for {} on {}:", 
+                              validation_result.validation_errors.len(), symbol, validation_date);
+                        for (i, error) in validation_result.validation_errors.iter().take(3).enumerate() {
+                            warn!("  {}. {} ({}): {}", i + 1, error.error_code, 
+                                  format!("{:?}", error.severity), error.message);
+                        }
+                        if validation_result.validation_errors.len() > 3 {
+                            warn!("  ... and {} more issues", validation_result.validation_errors.len() - 3);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Volume profile validation failed for {} on {}: {}", symbol, validation_date, e);
+                }
+            }
+        } else {
+            info!("📊 Volume profile validator not initialized - skipping validation");
         }
 
         let existing_certified = self.get_certified_range(symbol, timeframe).await?;
