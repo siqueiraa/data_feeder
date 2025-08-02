@@ -549,22 +549,9 @@ impl Actor for VolumeProfileActor {
             info!("  Update frequency: {:?}", self.config.update_frequency);
             info!("  Value area percentage: {:.1}%", self.config.value_area_percentage);
             
-            // STARTUP FIX: Initialize daily profiles for current trading day
-            let today = chrono::Utc::now().date_naive();
-            info!("🔄 STARTUP RECONSTRUCTION: Initializing volume profiles for current day: {}", today);
-            
-            // For now, we'll initialize for BTCUSDT (this could be extended to multiple symbols)
-            // In a production system, this list would come from configuration or active trading symbols
-            let active_symbols = vec!["BTCUSDT"]; // TODO: Make this configurable
-            
-            for symbol in active_symbols {
-                info!("🔄 STARTUP: Rebuilding volume profile for {} on {}", symbol, today);
-                if let Err(e) = self.rebuild_day(symbol.to_string(), today).await {
-                    warn!("⚠️ STARTUP: Failed to rebuild volume profile for {} on {}: {}", symbol, today, e);
-                } else {
-                    info!("✅ STARTUP: Successfully initialized volume profile for {} on {}", symbol, today);
-                }
-            }
+            // ⏰ STARTUP DELAY: Historical data rebuilding will happen after SetActorReferences
+            info!("🔄 STARTUP: Actor references not yet set - historical data rebuilding deferred");
+            info!("💡 Historical data will be rebuilt when SetActorReferences message is received");
         } else {
             info!("Volume profile calculation disabled");
         }
@@ -633,6 +620,28 @@ impl Message<VolumeProfileTell> for VolumeProfileActor {
                 self.lmdb_actor = Some(lmdb_actor);
                 self.is_healthy = true;
                 info!("✅ CRITICAL FIX: VolumeProfileActor references set - LMDB access enabled for historical data reconstruction");
+                
+                // 🔄 NOW REBUILD HISTORICAL DATA: References are set, we can now access LMDB
+                if self.config.enabled {
+                    let today = chrono::Utc::now().date_naive();
+                    info!("🔄 STARTUP RECONSTRUCTION: Now rebuilding volume profiles for current day: {}", today);
+                    
+                    let active_symbols = vec!["BTCUSDT"]; // TODO: Make this configurable
+                    
+                    for symbol in active_symbols {
+                        info!("🔄 STARTUP: Rebuilding volume profile for {} on {}", symbol, today);
+                        match self.rebuild_day(symbol.to_string(), today).await {
+                            Ok(()) => {
+                                info!("✅ STARTUP: Successfully initialized volume profile for {} on {}", symbol, today);
+                            }
+                            Err(e) => {
+                                warn!("⚠️ STARTUP: Failed to rebuild volume profile for {} on {}: {}", symbol, today, e);
+                            }
+                        }
+                    }
+                    
+                    info!("🎯 STARTUP RECONSTRUCTION COMPLETE: All volume profiles initialized");
+                }
             }
         }
     }
