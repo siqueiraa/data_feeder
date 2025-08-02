@@ -241,7 +241,7 @@ impl VolumeProfileActor {
                 let profile = DailyVolumeProfile::new(
                     profile_key.symbol.clone(),
                     profile_key.date,
-                    self.config.clone(),
+                    &self.config,
                 );
                 self.profiles.insert(profile_key.clone(), profile);
                 info!("📊 Created fallback empty volume profile for {} on {}", profile_key.symbol, profile_key.date);
@@ -332,7 +332,7 @@ impl VolumeProfileActor {
                 let profile = DailyVolumeProfile::new(
                     profile_key.symbol.clone(),
                     profile_key.date,
-                    self.config.clone(),
+                    &self.config,
                 );
                 self.profiles.insert(profile_key.clone(), profile);
             }
@@ -401,7 +401,7 @@ impl VolumeProfileActor {
 
                     // Create or update profile
                     let profile_key = ProfileKey::new(symbol.clone(), date);
-                    let mut profile = DailyVolumeProfile::new(symbol, date, self.config.clone());
+                    let mut profile = DailyVolumeProfile::new(symbol, date, &self.config);
                     
                     // Rebuild from candles with timing
                     let rebuild_start = std::time::Instant::now();
@@ -661,18 +661,22 @@ impl Message<VolumeProfileAsk> for VolumeProfileActor {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
-    use crate::volume_profile::structs::{PriceIncrementMode, UpdateFrequency};
+    use crate::volume_profile::structs::{PriceIncrementMode, UpdateFrequency, VolumeDistributionMode, ValueAreaCalculationMode};
 
     fn create_test_config() -> VolumeProfileConfig {
         VolumeProfileConfig {
             enabled: true,
             price_increment_mode: PriceIncrementMode::Fixed,
+            target_price_levels: 200,
             fixed_price_increment: 0.01,
             min_price_increment: 0.001,
             max_price_increment: 1.0,
             update_frequency: UpdateFrequency::EveryCandle,
             batch_size: 5,
             value_area_percentage: 70.0,
+            volume_distribution_mode: VolumeDistributionMode::ClosingPrice,
+            value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
+            asset_overrides: std::collections::HashMap::new(),
         }
     }
 

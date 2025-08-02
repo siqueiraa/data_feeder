@@ -5,8 +5,11 @@ use tracing::{debug, info, warn};
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
 use super::structs::{
     VolumeProfileConfig, VolumeProfileData, ValueArea, 
-    PriceLevelMap, PriceIncrementMode, PriceKey
+    PriceLevelMap, PriceIncrementMode, PriceKey, ResolvedAssetConfig
 };
+
+#[cfg(test)]
+use super::structs::{VolumeDistributionMode, ValueAreaCalculationMode};
 
 /// Daily volume profile calculator with real-time incremental updates
 #[derive(Debug, Clone)]
@@ -15,8 +18,8 @@ pub struct DailyVolumeProfile {
     pub symbol: String,
     /// Trading date
     pub date: NaiveDate,
-    /// Configuration for this profile
-    config: VolumeProfileConfig,
+    /// Resolved configuration for this specific asset
+    config: ResolvedAssetConfig,
     /// Price level map for efficient volume tracking
     price_levels: PriceLevelMap,
     /// Total volume for the day
@@ -41,7 +44,9 @@ pub struct DailyVolumeProfile {
 
 impl DailyVolumeProfile {
     /// Create new daily volume profile
-    pub fn new(symbol: String, date: NaiveDate, config: VolumeProfileConfig) -> Self {
+    pub fn new(symbol: String, date: NaiveDate, global_config: &VolumeProfileConfig) -> Self {
+        // Resolve asset-specific configuration
+        let config = global_config.resolve_for_asset(&symbol);
         let price_increment = Self::calculate_price_increment(&config, None);
         
         Self {
@@ -159,33 +164,38 @@ impl DailyVolumeProfile {
         self.max_price = self.max_price.max(candle.high);
     }
 
-    /// Distribute candle volume using standard market profile methodology
-    /// All volume is attributed to the closing price (time-based distribution)
+    /// Distribute candle volume using the configured distribution method
     fn distribute_volume_across_range(&mut self, candle: &FuturesOHLCVCandle) {
         let volume = candle.volume;
         if volume <= 0.0 {
             return;
         }
 
-        // Standard market profile: attribute all volume to the closing price
-        // This provides cleaner, more realistic volume profiles
-        self.price_levels.add_volume(candle.close, volume);
+        // Use the configured volume distribution method
+        self.price_levels.distribute_candle_volume(
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            volume,
+            &self.config.volume_distribution_mode
+        );
         
-        debug!("Assigned volume {:.2} to closing price {:.2}", volume, candle.close);
+        debug!("Distributed volume {:.2} using {:?} method across OHLC range [{:.2}, {:.2}, {:.2}, {:.2}]", 
+               volume, self.config.volume_distribution_mode, candle.open, candle.high, candle.low, candle.close);
     }
 
     /// Calculate appropriate price increment based on configuration and market data
-    fn calculate_price_increment(config: &VolumeProfileConfig, price_range: Option<f64>) -> f64 {
+    pub fn calculate_price_increment(config: &ResolvedAssetConfig, price_range: Option<f64>) -> f64 {
         match config.price_increment_mode {
             PriceIncrementMode::Fixed => config.fixed_price_increment,
             PriceIncrementMode::Adaptive => {
                 if let Some(range) = price_range {
-                    // Adaptive increment based on price range
-                    // Target ~100-200 price levels for optimal granularity
-                    let target_levels = 150.0;
+                    // Adaptive increment based on price range and target levels
+                    let target_levels = config.target_price_levels as f64;
                     let calculated_increment = range / target_levels;
                     
-                    // Clamp to configured min/max
+                    // Clamp to configured min/max bounds
                     calculated_increment
                         .max(config.min_price_increment)
                         .min(config.max_price_increment)
@@ -210,9 +220,12 @@ impl DailyVolumeProfile {
             // Calculate POC (Point of Control)
             self.cached_poc = self.price_levels.get_poc();
             
-            // Calculate Value Area
+            // Calculate Value Area using configured method
             self.cached_value_area = Some(
-                self.price_levels.calculate_value_area(self.config.value_area_percentage)
+                self.price_levels.calculate_value_area(
+                    self.config.value_area_percentage,
+                    &self.config.value_area_calculation_mode
+                )
             );
         }
         
@@ -326,12 +339,16 @@ mod tests {
         VolumeProfileConfig {
             enabled: true,
             price_increment_mode: PriceIncrementMode::Fixed,
+            target_price_levels: 200,
             fixed_price_increment: 0.01,
             min_price_increment: 0.001,
             max_price_increment: 1.0,
             update_frequency: super::super::structs::UpdateFrequency::EveryCandle,
             batch_size: 1,
             value_area_percentage: 70.0,
+            volume_distribution_mode: VolumeDistributionMode::ClosingPrice,
+            value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
+            asset_overrides: std::collections::HashMap::new(),
         }
     }
 
@@ -354,7 +371,7 @@ mod tests {
     fn test_new_daily_volume_profile() {
         let config = create_test_config();
         let date = NaiveDate::from_ymd_opt(2025, 1, 15).unwrap();
-        let profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, config);
+        let profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
 
         assert_eq!(profile.symbol, "BTCUSDT");
         assert_eq!(profile.date, date);
@@ -369,7 +386,7 @@ mod tests {
         let timestamp = 1736985600000; // This actually converts to 2025-01-16 00:00:00 UTC
         // Use the correct date that matches the timestamp
         let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
-        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, config);
+        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
 
         let candle = create_test_candle(timestamp, timestamp + 59999, 50000.0, 50100.0, 49950.0, 50050.0, 1000.0);
 
@@ -390,7 +407,7 @@ mod tests {
         let config = create_test_config();
         let timestamp = 1736985600000; // This actually converts to 2025-01-16 00:00:00 UTC
         let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
-        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, config);
+        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
         let candle = create_test_candle(timestamp, timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
 
         profile.add_candle(&candle);
@@ -418,7 +435,7 @@ mod tests {
         let config = create_test_config();
         let base_timestamp = 1736985600000; // This actually converts to 2025-01-16 00:00:00 UTC
         let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
-        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, config);
+        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
         
         // Add multiple candles with different volumes and prices
         let candles = vec![
@@ -458,7 +475,7 @@ mod tests {
         let config = create_test_config();
         let base_timestamp = 1736985600000; // This actually converts to 2025-01-16 00:00:00 UTC
         let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
-        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, config);
+        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
         let candles = vec![
             create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0),
             create_test_candle(base_timestamp + 60000, base_timestamp + 119999, 101.0, 103.0, 100.0, 102.0, 1500.0),
@@ -478,7 +495,7 @@ mod tests {
     fn test_wrong_date_candle() {
         let config = create_test_config();
         let date = NaiveDate::from_ymd_opt(2025, 1, 15).unwrap();
-        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, config);
+        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
 
         // Create candle for different date (Jan 16, 2025)
         let wrong_timestamp = 1737072000000; // 2025-01-16 12:00:00 UTC
@@ -499,15 +516,18 @@ mod tests {
         config.min_price_increment = 0.001;
         config.max_price_increment = 1.0;
 
+        // Resolve config for testing
+        let resolved_config = config.resolve_for_asset("TESTUSDT");
+        
         // Test with small price range
-        let small_range_increment = DailyVolumeProfile::calculate_price_increment(&config, Some(1.0));
-        assert!(small_range_increment >= config.min_price_increment);
-        assert!(small_range_increment <= config.max_price_increment);
+        let small_range_increment = DailyVolumeProfile::calculate_price_increment(&resolved_config, Some(1.0));
+        assert!(small_range_increment >= resolved_config.min_price_increment);
+        assert!(small_range_increment <= resolved_config.max_price_increment);
 
         // Test with large price range
-        let large_range_increment = DailyVolumeProfile::calculate_price_increment(&config, Some(1000.0));
-        assert!(large_range_increment >= config.min_price_increment);
-        assert!(large_range_increment <= config.max_price_increment);
+        let large_range_increment = DailyVolumeProfile::calculate_price_increment(&resolved_config, Some(1000.0));
+        assert!(large_range_increment >= resolved_config.min_price_increment);
+        assert!(large_range_increment <= resolved_config.max_price_increment);
         assert!(large_range_increment > small_range_increment);
     }
 
@@ -516,7 +536,7 @@ mod tests {
         let config = create_test_config();
         let base_timestamp = 1736985600000; // This actually converts to 2025-01-16 00:00:00 UTC
         let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
-        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, config);
+        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
 
         let initial_memory = profile.estimate_memory_usage();
         assert!(initial_memory > 0);
@@ -537,5 +557,98 @@ mod tests {
 
         let final_memory = profile.estimate_memory_usage();
         assert!(final_memory > initial_memory);
+    }
+
+    #[test]
+    fn test_different_volume_distribution_modes() {
+        let base_timestamp = 1736985600000;
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        
+        // Test ClosingPrice distribution
+        let mut closing_config = create_test_config();
+        closing_config.volume_distribution_mode = VolumeDistributionMode::ClosingPrice;
+        let mut closing_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &closing_config);
+        
+        // Test UniformOHLC distribution  
+        let mut uniform_config = create_test_config();
+        uniform_config.volume_distribution_mode = VolumeDistributionMode::UniformOHLC;
+        let mut uniform_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &uniform_config);
+        
+        let candle = create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 104.0, 96.0, 102.0, 1000.0);
+        
+        closing_profile.add_candle(&candle);
+        uniform_profile.add_candle(&candle);
+        
+        let closing_data = closing_profile.get_profile_data();
+        let uniform_data = uniform_profile.get_profile_data();
+        
+        // Both should have same total volume
+        assert_eq!(closing_data.total_volume, 1000.0);
+        assert_eq!(uniform_data.total_volume, 1000.0);
+        
+        // Closing price should have 1 price level (all at close)
+        assert_eq!(closing_data.price_levels.len(), 1);
+        assert_eq!(closing_data.price_levels[0].price, 102.0);
+        assert_eq!(closing_data.price_levels[0].volume, 1000.0);
+        
+        // Uniform should have multiple price levels across the range
+        assert!(uniform_data.price_levels.len() > 1);
+        
+        // Check that uniform distribution spreads across expected range
+        let min_price = uniform_data.price_levels.iter().map(|p| p.price).fold(f64::INFINITY, f64::min);
+        let max_price = uniform_data.price_levels.iter().map(|p| p.price).fold(f64::NEG_INFINITY, f64::max);
+        
+        assert!(min_price >= 96.0);
+        assert!(max_price <= 104.0);
+    }
+
+    #[test]
+    fn test_traditional_vs_greedy_value_area_in_calculator() {
+        let base_timestamp = 1736985600000;
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        
+        // Create profiles with different value area calculation modes
+        let mut traditional_config = create_test_config();
+        traditional_config.value_area_calculation_mode = ValueAreaCalculationMode::Traditional;
+        traditional_config.volume_distribution_mode = VolumeDistributionMode::WeightedOHLC;
+        
+        let mut greedy_config = create_test_config();
+        greedy_config.value_area_calculation_mode = ValueAreaCalculationMode::Greedy;
+        greedy_config.volume_distribution_mode = VolumeDistributionMode::WeightedOHLC;
+        
+        let mut traditional_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &traditional_config);
+        let mut greedy_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &greedy_config);
+        
+        // Add candles with varying volumes to create interesting distribution
+        let candles = vec![
+            create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 5000.0), // High volume
+            create_test_candle(base_timestamp + 60000, base_timestamp + 119999, 101.0, 103.0, 99.0, 102.0, 3000.0),
+            create_test_candle(base_timestamp + 120000, base_timestamp + 179999, 102.0, 104.0, 100.0, 103.0, 2000.0),
+            create_test_candle(base_timestamp + 180000, base_timestamp + 239999, 103.0, 105.0, 101.0, 104.0, 1000.0),
+        ];
+        
+        for candle in &candles {
+            traditional_profile.add_candle(candle);
+            greedy_profile.add_candle(candle);
+        }
+        
+        let traditional_data = traditional_profile.get_profile_data();
+        let greedy_data = greedy_profile.get_profile_data();
+        
+        // Both should have same total volume and basic stats
+        assert_eq!(traditional_data.total_volume, greedy_data.total_volume);
+        assert_eq!(traditional_data.candle_count, greedy_data.candle_count);
+        
+        // Value areas should both target 70% but may differ in range
+        // Traditional method expands contiguously from POC, may include less volume
+        // Greedy method selects highest volume levels regardless of contiguity
+        assert!(traditional_data.value_area.volume_percentage >= 0.0);
+        assert!(traditional_data.value_area.volume_percentage <= 100.0);
+        assert!(greedy_data.value_area.volume_percentage >= 0.0);
+        assert!(greedy_data.value_area.volume_percentage <= 100.0);
+        
+        // Both should include high-volume areas but may select differently
+        assert!(traditional_data.value_area.volume > 0.0);
+        assert!(greedy_data.value_area.volume > 0.0);
     }
 }

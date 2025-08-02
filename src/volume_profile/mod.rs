@@ -13,5 +13,6 @@ pub use calculator::DailyVolumeProfile;
 pub use database::VolumeProfileDatabase;
 pub use structs::{
     VolumeProfileConfig, VolumeProfileData, PriceLevelData, ValueArea,
-    PriceIncrementMode, UpdateFrequency
+    PriceIncrementMode, UpdateFrequency, AssetConfig, ResolvedAssetConfig,
+    VolumeDistributionMode, ValueAreaCalculationMode
 };
