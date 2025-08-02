@@ -10,6 +10,7 @@ use tracing::{error, info, warn, debug};
 
 use crate::historical::errors::HistoricalDataError;
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS, Seconds};
+use crate::historical::volume_profile_validator::VolumeProfileValidationResult;
 use super::messages::{LmdbActorMessage, LmdbActorResponse, LmdbActorTell};
 use super::gap_detector::GapDetector;
 use super::storage::LmdbStorage;
@@ -307,6 +308,68 @@ impl LmdbActor {
             }
         }
     }
+
+    async fn handle_store_volume_profile_validation(
+        &mut self,
+        validation_result: VolumeProfileValidationResult,
+    ) -> LmdbActorResponse {
+        info!("📊 Storing volume profile validation for {} on {}", 
+              validation_result.symbol, validation_result.date);
+
+        match self.storage.store_volume_profile_validation(&validation_result) {
+            Ok(()) => {
+                info!("✅ Volume profile validation stored for {} on {}", 
+                      validation_result.symbol, validation_result.date);
+                LmdbActorResponse::Success
+            }
+            Err(e) => {
+                error!("❌ Failed to store volume profile validation: {}", e);
+                LmdbActorResponse::ErrorResponse(format!("Failed to store validation: {}", e))
+            }
+        }
+    }
+
+    async fn handle_get_volume_profile_validation(
+        &mut self,
+        symbol: String,
+        date: chrono::NaiveDate,
+    ) -> LmdbActorResponse {
+        debug!("📊 Getting volume profile validation for {} on {}", symbol, date);
+
+        match self.storage.get_volume_profile_validation(&symbol, date) {
+            Ok(result) => {
+                debug!("✅ Retrieved volume profile validation for {} on {}: {:?}", 
+                       symbol, date, result.is_some());
+                LmdbActorResponse::VolumeProfileValidation(result)
+            }
+            Err(e) => {
+                error!("❌ Failed to get volume profile validation: {}", e);
+                LmdbActorResponse::ErrorResponse(format!("Failed to get validation: {}", e))
+            }
+        }
+    }
+
+    async fn handle_get_volume_profile_validation_history(
+        &mut self,
+        symbol: String,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> LmdbActorResponse {
+        info!("📊 Getting volume profile validation history for {} from {} to {}", 
+              symbol, start_date, end_date);
+
+        match self.storage.get_volume_profile_validation_history(&symbol, start_date, end_date) {
+            Ok(history) => {
+                info!("✅ Retrieved {} volume profile validation records for {}", 
+                      history.len(), symbol);
+                LmdbActorResponse::VolumeProfileValidationHistory(history)
+            }
+            Err(e) => {
+                error!("❌ Failed to get volume profile validation history: {}", e);
+                LmdbActorResponse::ErrorResponse(format!("Failed to get validation history: {}", e))
+            }
+        }
+    }
 }
 
 impl Actor for LmdbActor {
@@ -352,6 +415,15 @@ impl Message<LmdbActorMessage> for LmdbActor {
             }
             LmdbActorMessage::InitializeDatabase { symbol, timeframe } => {
                 self.handle_initialize_database(symbol, timeframe).await
+            }
+            LmdbActorMessage::StoreVolumeProfileValidation { validation_result } => {
+                self.handle_store_volume_profile_validation(validation_result).await
+            }
+            LmdbActorMessage::GetVolumeProfileValidation { symbol, date } => {
+                self.handle_get_volume_profile_validation(symbol, date).await
+            }
+            LmdbActorMessage::GetVolumeProfileValidationHistory { symbol, start_date, end_date } => {
+                self.handle_get_volume_profile_validation_history(symbol, start_date, end_date).await
             }
         }
     }

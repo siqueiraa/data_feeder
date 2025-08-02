@@ -46,6 +46,12 @@ pub enum HistoricalDataError {
     DirectoryCreation(String),
     #[error("Semaphore acquisition error: {0}")]
     SemaphoreAcquisition(String),
+    #[error("Volume profile validation error: {0}")]
+    VolumeProfileValidationError(String),
+    #[error("Volume gap detected: {0}")]
+    VolumeGapError(String),
+    #[error("Volume data quality error: {0}")]
+    VolumeDataQualityError(String),
 }
 
 impl From<tokio::task::JoinError> for HistoricalDataError {

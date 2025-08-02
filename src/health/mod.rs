@@ -244,6 +244,12 @@ pub async fn check_postgres_health(
         Ok(PostgresReply::Error(error_msg)) => {
             Err(format!("PostgreSQL actor returned error: {}", error_msg).into())
         }
+        Ok(PostgresReply::VolumeProfileValidation(_)) => {
+            Err("Unexpected VolumeProfileValidation response to health check request".into())
+        }
+        Ok(PostgresReply::VolumeProfileValidationHistory(_)) => {
+            Err("Unexpected VolumeProfileValidationHistory response to health check request".into())
+        }
         Err(e) => Err(format!("Failed to get PostgreSQL health status: {}", e).into()),
     }
 }

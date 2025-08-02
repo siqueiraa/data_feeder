@@ -1,12 +1,13 @@
 /// Database and storage constants
 // LMDB Configuration
 pub const LMDB_MAP_SIZE: usize = 1024 * 1024 * 1024; // 1GB per symbol-timeframe
-pub const LMDB_MAX_DBS: u32 = 10;
+pub const LMDB_MAX_DBS: u32 = 15; // Increased for volume profile validation
 pub const LMDB_MAX_READERS: u32 = 256;
 
 // Database names
 pub const CANDLES_DB_NAME: &str = "candles";
 pub const CERTIFIED_RANGE_DB_NAME: &str = "certified_range";
+pub const VOLUME_PROFILE_VALIDATION_DB_NAME: &str = "volume_profile_validation";
 
 // Batch processing
 pub const BATCH_SIZE: usize = 1000;

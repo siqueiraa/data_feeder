@@ -19,4 +19,7 @@ pub enum PostgresError {
     
     #[error("Invalid timestamp: {0}")]
     InvalidTimestamp(i64),
+    
+    #[error("Serialization error: {0}")]
+    Serialization(String),
 }

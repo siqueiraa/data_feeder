@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::historical::errors::HistoricalDataError;
 use crate::historical::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS, Seconds};
+use crate::historical::volume_profile_validator::VolumeProfileValidationResult;
 use crate::common::constants::*;
 use crate::common::error_utils::ErrorContext;
 use crate::common::shared_data::intern_symbol;
@@ -32,22 +33,62 @@ pub struct SymbolStatsInternal {
     pub size_bytes: u64,
 }
 
-/// LMDB storage manager for candle data
+/// LMDB storage manager for candle data and volume profile validation
 pub struct LmdbStorage {
     pub envs: FxHashMap<(Arc<str>, Seconds), Env>,
     pub candle_dbs: FxHashMap<(Arc<str>, Seconds), Database<Str, SerdeBincode<FuturesOHLCVCandle>>>,
     pub certified_range_dbs: FxHashMap<(Arc<str>, Seconds), Database<Str, SerdeBincode<TimeRange>>>,
+    pub volume_validation_env: Option<Env>,
+    pub volume_validation_db: Option<Database<Str, SerdeBincode<VolumeProfileValidationResult>>>,
     base_path: std::path::PathBuf,
 }
 
 impl LmdbStorage {
     pub fn new(base_path: &Path) -> Self {
-        Self {
+        let mut storage = Self {
             envs: FxHashMap::default(),
             candle_dbs: FxHashMap::default(),
             certified_range_dbs: FxHashMap::default(),
+            volume_validation_env: None,
+            volume_validation_db: None,
             base_path: base_path.to_path_buf(),
+        };
+        
+        // Initialize volume profile validation database
+        if let Err(e) = storage.initialize_volume_validation_database() {
+            warn!("Failed to initialize volume profile validation database: {}", e);
         }
+        
+        storage
+    }
+
+    /// Initialize the volume profile validation database (separate from symbol-timeframe databases)
+    fn initialize_volume_validation_database(&mut self) -> Result<(), HistoricalDataError> {
+        let validation_path = self.base_path.join("volume_profile_validation");
+        
+        // Create directory
+        std::fs::create_dir_all(&validation_path)
+            .with_io_context("Failed to create volume profile validation database directory")?;
+
+        // Create LMDB environment
+        let env = open_lmdb_environment(&validation_path)?;
+
+        // Create transaction and database
+        let mut wtxn = env.write_txn()
+            .with_db_context("Failed to create volume profile validation write transaction")?;
+
+        let validation_db = env
+            .create_database::<Str, SerdeBincode<VolumeProfileValidationResult>>(&mut wtxn, Some(VOLUME_PROFILE_VALIDATION_DB_NAME))
+            .with_db_context("Failed to create volume profile validation database")?;
+
+        wtxn.commit()
+            .with_db_context("Failed to commit volume profile validation database creation")?;
+
+        self.volume_validation_env = Some(env);
+        self.volume_validation_db = Some(validation_db);
+
+        info!("✅ Initialized volume profile validation database");
+        Ok(())
     }
 
     /// Initialize database for a symbol-timeframe combination
@@ -311,5 +352,96 @@ impl LmdbStorage {
         let interned_symbol = intern_symbol(symbol);
         let key = (interned_symbol, timeframe);
         self.envs.contains_key(&key)
+    }
+
+    /// Store volume profile validation result
+    pub fn store_volume_profile_validation(
+        &self,
+        validation_result: &VolumeProfileValidationResult,
+    ) -> Result<(), HistoricalDataError> {
+        let env = self.volume_validation_env.as_ref()
+            .ok_or_else(|| HistoricalDataError::DatabaseError("Volume validation environment not initialized".to_string()))?;
+        let db = self.volume_validation_db.as_ref()
+            .ok_or_else(|| HistoricalDataError::DatabaseError("Volume validation database not initialized".to_string()))?;
+
+        let mut wtxn = env.write_txn()
+            .with_db_context("Failed to create volume profile validation write transaction")?;
+
+        // Create key: symbol_date (e.g., "BTCUSDT_2024-01-01")
+        let key = format!("{}_{}", validation_result.symbol, validation_result.date);
+
+        db.put(&mut wtxn, &key, validation_result)
+            .with_db_context(&format!("Failed to store volume profile validation for {}", key))?;
+
+        wtxn.commit()
+            .with_db_context("Failed to commit volume profile validation storage")?;
+
+        debug!("💾 Stored volume profile validation for {}", key);
+        Ok(())
+    }
+
+    /// Get volume profile validation result for symbol and date
+    pub fn get_volume_profile_validation(
+        &self,
+        symbol: &str,
+        date: chrono::NaiveDate,
+    ) -> Result<Option<VolumeProfileValidationResult>, HistoricalDataError> {
+        let env = self.volume_validation_env.as_ref()
+            .ok_or_else(|| HistoricalDataError::DatabaseError("Volume validation environment not initialized".to_string()))?;
+        let db = self.volume_validation_db.as_ref()
+            .ok_or_else(|| HistoricalDataError::DatabaseError("Volume validation database not initialized".to_string()))?;
+
+        let rtxn = env.read_txn()
+            .with_db_context("Failed to create volume profile validation read transaction")?;
+
+        let key = format!("{}_{}", symbol, date);
+        
+        match db.get(&rtxn, &key)? {
+            Some(validation_result) => Ok(Some(validation_result)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get volume profile validation history for symbol in date range
+    pub fn get_volume_profile_validation_history(
+        &self,
+        symbol: &str,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> Result<Vec<VolumeProfileValidationResult>, HistoricalDataError> {
+        let env = self.volume_validation_env.as_ref()
+            .ok_or_else(|| HistoricalDataError::DatabaseError("Volume validation environment not initialized".to_string()))?;
+        let db = self.volume_validation_db.as_ref()
+            .ok_or_else(|| HistoricalDataError::DatabaseError("Volume validation database not initialized".to_string()))?;
+
+        let rtxn = env.read_txn()
+            .with_db_context("Failed to create volume profile validation read transaction")?;
+
+        let mut results = Vec::new();
+        let prefix = format!("{}_", symbol);
+
+        // Iterate through all keys with the symbol prefix
+        for result in db.iter(&rtxn)? {
+            let (key, validation_result) = result?;
+            
+            if key.starts_with(&prefix) {
+                // Extract date from key (format: "SYMBOL_YYYY-MM-DD")
+                if let Some(date_str) = key.strip_prefix(&prefix) {
+                    if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                        if date >= start_date && date <= end_date {
+                            results.push(validation_result);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by date
+        results.sort_by(|a, b| a.date.cmp(&b.date));
+
+        debug!("📊 Retrieved {} volume profile validation records for {} from {} to {}", 
+               results.len(), symbol, start_date, end_date);
+
+        Ok(results)
     }
 }
