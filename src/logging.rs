@@ -275,7 +275,7 @@ mod tests {
         std::fs::write(&old_file, "old").unwrap();
         
         // Set old file's modified time to past
-        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 3600); // 10 days ago
+        let _old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 3600); // 10 days ago
         // Note: Setting file times requires additional crates, so we'll just test the function exists
         
         // Test cleanup (won't actually remove files in this simple test)

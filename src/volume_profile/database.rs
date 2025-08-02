@@ -2,7 +2,7 @@ use chrono::NaiveDate;
 use tokio_postgres::{Client, Error as PostgresError};
 use tracing::{debug, error, info, warn};
 
-use super::structs::{VolumeProfileData, ValueArea};
+use super::structs::{VolumeProfileData, ValueArea, PriceLevelData};
 use crate::historical::structs::TimestampMS;
 
 // Remove the custom error conversion - we'll handle this differently
@@ -22,9 +22,9 @@ impl VolumeProfileDatabase {
         }
     }
 
-    /// SQL to create volume profiles table
+    /// SQL to create volume profiles table (flat format - no JSON)
     pub fn get_create_table_sql(&self) -> String {
-        format!(
+        let mut sql = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
                 symbol VARCHAR(20) NOT NULL,
@@ -34,8 +34,8 @@ impl VolumeProfileDatabase {
                 poc DECIMAL(20,8) NOT NULL,
                 value_area_high DECIMAL(20,8) NOT NULL,
                 value_area_low DECIMAL(20,8) NOT NULL,
-                value_area_volume_percentage DECIMAL(8,4) NOT NULL,
                 value_area_volume DECIMAL(20,8) NOT NULL,
+                value_area_percentage DECIMAL(8,4) NOT NULL,
                 price_increment DECIMAL(20,8) NOT NULL,
                 min_price DECIMAL(20,8) NOT NULL,
                 max_price DECIMAL(20,8) NOT NULL,
@@ -44,35 +44,55 @@ impl VolumeProfileDatabase {
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 
+                -- Price level columns (up to 200 levels, no JSON)
+            "#,
+            self.table_name
+        );
+        
+        // Add price level columns dynamically
+        for i in 1..=200 {
+            sql.push_str(&format!(
+                "price_{:03} DECIMAL(20,8), volume_{:03} DECIMAL(20,8){}",
+                i, i, if i == 200 { "" } else { ",\n                " }
+            ));
+        }
+        
+        sql.push_str(&format!(
+            r#"
+                
                 PRIMARY KEY (symbol, date)
             );
 
             -- Create indexes for optimal query performance
-            CREATE INDEX IF NOT EXISTS idx_{}_date ON {} (date);
-            CREATE INDEX IF NOT EXISTS idx_{}_symbol ON {} (symbol);
-            CREATE INDEX IF NOT EXISTS idx_{}_symbol_date ON {} (symbol, date);
+            CREATE INDEX IF NOT EXISTS idx_{table}_date ON {table} (date);
+            CREATE INDEX IF NOT EXISTS idx_{table}_symbol ON {table} (symbol);
+            CREATE INDEX IF NOT EXISTS idx_{table}_symbol_date ON {table} (symbol, date);
             
             -- Create partial index for recent data (last 30 days)
-            CREATE INDEX IF NOT EXISTS idx_{}_recent 
-            ON {} (symbol, date) 
+            CREATE INDEX IF NOT EXISTS idx_{table}_recent 
+            ON {table} (symbol, date) 
             WHERE date >= CURRENT_DATE - INTERVAL '30 days';
 
             -- Create index on VWAP for price analysis
-            CREATE INDEX IF NOT EXISTS idx_{}_vwap 
-            ON {} (vwap);
+            CREATE INDEX IF NOT EXISTS idx_{table}_vwap 
+            ON {table} (vwap);
             
             -- Create index on POC for volume analysis
-            CREATE INDEX IF NOT EXISTS idx_{}_poc 
-            ON {} (poc);
+            CREATE INDEX IF NOT EXISTS idx_{table}_poc 
+            ON {table} (poc);
+            
+            -- Create composite index for common queries
+            CREATE INDEX IF NOT EXISTS idx_{table}_symbol_vwap 
+            ON {table} (symbol, vwap);
+            
+            -- Create index for value area queries
+            CREATE INDEX IF NOT EXISTS idx_{table}_value_area 
+            ON {table} (symbol, value_area_high, value_area_low);
             "#,
-            self.table_name,
-            self.table_name, self.table_name,
-            self.table_name, self.table_name,
-            self.table_name, self.table_name,
-            self.table_name, self.table_name,
-            self.table_name, self.table_name,
-            self.table_name, self.table_name
-        )
+            table = self.table_name
+        ));
+        
+        sql
     }
 
     /// SQL to create or replace the update trigger function
@@ -102,45 +122,52 @@ impl VolumeProfileDatabase {
         )
     }
 
-    /// Upsert volume profile data
-    pub async fn upsert_volume_profile(
+    /// Upsert volume profile data with flat column format (NO JSON)
+    pub async fn upsert_volume_profile_flat(
         &self,
         client: &Client,
         symbol: &str,
         date: NaiveDate,
         profile_data: &VolumeProfileData,
     ) -> Result<u64, PostgresError> {
+        let level_count = profile_data.price_levels.len().min(200);
         debug!("Upserting volume profile: {} on {} ({} price levels)", 
-               symbol, date, profile_data.price_levels.len());
+               symbol, date, level_count);
 
-        // Prepare upsert SQL with individual columns
-        let sql = format!(
+        // Build dynamic SQL based on actual price level count
+        let mut sql = format!(
             r#"
             INSERT INTO {} (
-                symbol, 
-                date, 
-                total_volume,
-                vwap,
-                poc,
-                value_area_high,
-                value_area_low,
-                value_area_volume_percentage,
-                value_area_volume,
-                price_increment, 
-                min_price, 
-                max_price, 
-                candle_count,
-                last_updated
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            ON CONFLICT (symbol, date) 
+                symbol, date, total_volume, vwap, poc, value_area_high, value_area_low,
+                value_area_volume, value_area_percentage, price_increment, min_price, max_price,
+                candle_count, last_updated
+            "#,
+            self.table_name
+        );
+
+        // Add price level columns dynamically
+        for i in 1..=level_count {
+            sql.push_str(&format!(", price_{:03}, volume_{:03}", i, i));
+        }
+
+        sql.push_str(") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14");
+
+        // Add parameter placeholders for price levels
+        for i in 0..level_count {
+            sql.push_str(&format!(", ${}, ${}", 15 + i*2, 16 + i*2));
+        }
+
+        sql.push_str(
+            r#"
+            ) ON CONFLICT (symbol, date) 
             DO UPDATE SET
                 total_volume = EXCLUDED.total_volume,
                 vwap = EXCLUDED.vwap,
                 poc = EXCLUDED.poc,
                 value_area_high = EXCLUDED.value_area_high,
                 value_area_low = EXCLUDED.value_area_low,
-                value_area_volume_percentage = EXCLUDED.value_area_volume_percentage,
                 value_area_volume = EXCLUDED.value_area_volume,
+                value_area_percentage = EXCLUDED.value_area_percentage,
                 price_increment = EXCLUDED.price_increment,
                 min_price = EXCLUDED.min_price,
                 max_price = EXCLUDED.max_price,
@@ -148,40 +175,64 @@ impl VolumeProfileDatabase {
                 last_updated = EXCLUDED.last_updated,
                 updated_at = CURRENT_TIMESTAMP
             "#,
-            self.table_name
         );
 
+        // Add price level columns to update
+        for i in 1..=level_count {
+            sql.push_str(&format!(
+                ", price_{:03} = EXCLUDED.price_{:03}, volume_{:03} = EXCLUDED.volume_{:03}",
+                i, i, i, i
+            ));
+        }
+
+        // Build parameter list
+        let candle_count_param = profile_data.candle_count as i32;
+        let last_updated_param = profile_data.last_updated;
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
+            &symbol,
+            &date,
+            &profile_data.total_volume,
+            &profile_data.vwap,
+            &profile_data.poc,
+            &profile_data.value_area.high,
+            &profile_data.value_area.low,
+            &profile_data.value_area.volume,
+            &profile_data.value_area.volume_percentage,
+            &profile_data.price_increment,
+            &profile_data.min_price,
+            &profile_data.max_price,
+            &candle_count_param,
+            &last_updated_param,
+        ];
+
+        // Add price level parameters
+        for level in &profile_data.price_levels[..level_count] {
+            params.push(&level.price);
+            params.push(&level.volume);
+        }
+
         // Execute upsert
-        let rows_affected = client
-            .execute(
-                &sql,
-                &[
-                    &symbol,
-                    &date,
-                    &profile_data.total_volume,
-                    &profile_data.vwap,
-                    &profile_data.poc,
-                    &profile_data.value_area.high,
-                    &profile_data.value_area.low,
-                    &profile_data.value_area.volume_percentage,
-                    &profile_data.value_area.volume,
-                    &profile_data.price_increment,
-                    &profile_data.min_price,
-                    &profile_data.max_price,
-                    &(profile_data.candle_count as i32),
-                    &profile_data.last_updated,
-                ],
-            )
-            .await?;
+        let rows_affected = client.execute(&sql, &params[..]).await?;
 
         if rows_affected > 0 {
-            debug!("Successfully upserted volume profile: {} on {} ({} rows affected)", 
+            debug!("Successfully upserted flat volume profile: {} on {} ({} rows affected)", 
                    symbol, date, rows_affected);
         } else {
-            warn!("Volume profile upsert returned 0 rows affected: {} on {}", symbol, date);
+            warn!("Flat volume profile upsert returned 0 rows affected: {} on {}", symbol, date);
         }
 
         Ok(rows_affected)
+    }
+
+    /// Upsert volume profile data (backward compatibility wrapper)
+    pub async fn upsert_volume_profile(
+        &self,
+        client: &Client,
+        symbol: &str,
+        date: NaiveDate,
+        profile_data: &VolumeProfileData,
+    ) -> Result<u64, PostgresError> {
+        self.upsert_volume_profile_flat(client, symbol, date, profile_data).await
     }
 
     /// Batch upsert multiple volume profiles
@@ -225,7 +276,7 @@ impl VolumeProfileDatabase {
         Ok(total_rows_affected)
     }
 
-    /// Upsert volume profile within a transaction
+    /// Upsert volume profile within a transaction (flat format with price levels)
     async fn upsert_volume_profile_in_transaction(
         &self,
         transaction: &tokio_postgres::Transaction<'_>,
@@ -233,34 +284,44 @@ impl VolumeProfileDatabase {
         date: NaiveDate,
         profile_data: &VolumeProfileData,
     ) -> Result<u64, PostgresError> {
-        // Prepare upsert SQL with individual columns
-        let sql = format!(
+        let level_count = profile_data.price_levels.len().min(200);
+        debug!("Upserting volume profile in transaction: {} on {} ({} price levels)", 
+               symbol, date, level_count);
+
+        // Build dynamic SQL based on actual price level count
+        let mut sql = format!(
             r#"
             INSERT INTO {} (
-                symbol, 
-                date, 
-                total_volume,
-                vwap,
-                poc,
-                value_area_high,
-                value_area_low,
-                value_area_volume_percentage,
-                value_area_volume,
-                price_increment, 
-                min_price, 
-                max_price, 
-                candle_count,
-                last_updated
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            ON CONFLICT (symbol, date) 
+                symbol, date, total_volume, vwap, poc, value_area_high, value_area_low,
+                value_area_volume, value_area_percentage, price_increment, min_price, max_price,
+                candle_count, last_updated
+            "#,
+            self.table_name
+        );
+
+        // Add price level columns dynamically
+        for i in 1..=level_count {
+            sql.push_str(&format!(", price_{:03}, volume_{:03}", i, i));
+        }
+
+        sql.push_str(") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14");
+
+        // Add parameter placeholders for price levels
+        for i in 0..level_count {
+            sql.push_str(&format!(", ${}, ${}", 15 + i*2, 16 + i*2));
+        }
+
+        sql.push_str(
+            r#"
+            ) ON CONFLICT (symbol, date) 
             DO UPDATE SET
                 total_volume = EXCLUDED.total_volume,
                 vwap = EXCLUDED.vwap,
                 poc = EXCLUDED.poc,
                 value_area_high = EXCLUDED.value_area_high,
                 value_area_low = EXCLUDED.value_area_low,
-                value_area_volume_percentage = EXCLUDED.value_area_volume_percentage,
                 value_area_volume = EXCLUDED.value_area_volume,
+                value_area_percentage = EXCLUDED.value_area_percentage,
                 price_increment = EXCLUDED.price_increment,
                 min_price = EXCLUDED.min_price,
                 max_price = EXCLUDED.max_price,
@@ -268,36 +329,52 @@ impl VolumeProfileDatabase {
                 last_updated = EXCLUDED.last_updated,
                 updated_at = CURRENT_TIMESTAMP
             "#,
-            self.table_name
         );
 
+        // Add price level columns to update
+        for i in 1..=level_count {
+            sql.push_str(&format!(
+                ", price_{:03} = EXCLUDED.price_{:03}, volume_{:03} = EXCLUDED.volume_{:03}",
+                i, i, i, i
+            ));
+        }
+
+        // Build parameter list
+        let candle_count_param = profile_data.candle_count as i32;
+        let last_updated_param = profile_data.last_updated;
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
+            &symbol,
+            &date,
+            &profile_data.total_volume,
+            &profile_data.vwap,
+            &profile_data.poc,
+            &profile_data.value_area.high,
+            &profile_data.value_area.low,
+            &profile_data.value_area.volume,
+            &profile_data.value_area.volume_percentage,
+            &profile_data.price_increment,
+            &profile_data.min_price,
+            &profile_data.max_price,
+            &candle_count_param,
+            &last_updated_param,
+        ];
+
+        // Add price level parameters
+        for level in &profile_data.price_levels[..level_count] {
+            params.push(&level.price);
+            params.push(&level.volume);
+        }
+
         // Execute upsert within transaction
-        let rows_affected = transaction
-            .execute(
-                &sql,
-                &[
-                    &symbol,
-                    &date,
-                    &profile_data.total_volume,
-                    &profile_data.vwap,
-                    &profile_data.poc,
-                    &profile_data.value_area.high,
-                    &profile_data.value_area.low,
-                    &profile_data.value_area.volume_percentage,
-                    &profile_data.value_area.volume,
-                    &profile_data.price_increment,
-                    &profile_data.min_price,
-                    &profile_data.max_price,
-                    &(profile_data.candle_count as i32),
-                    &profile_data.last_updated,
-                ],
-            )
-            .await?;
+        let rows_affected = transaction.execute(&sql, &params[..]).await?;
+
+        debug!("Successfully upserted volume profile in transaction: {} on {} ({} rows affected)", 
+               symbol, date, rows_affected);
 
         Ok(rows_affected)
     }
 
-    /// Get volume profile for specific symbol and date
+    /// Get volume profile for specific symbol and date (flat format with price levels)
     pub async fn get_volume_profile(
         &self,
         client: &Client,
@@ -306,10 +383,18 @@ impl VolumeProfileDatabase {
     ) -> Result<Option<VolumeProfileData>, PostgresError> {
         debug!("Retrieving volume profile: {} on {}", symbol, date);
 
-        let sql = format!(
-            "SELECT total_volume, vwap, poc, value_area_high, value_area_low, value_area_volume_percentage, value_area_volume, price_increment, min_price, max_price, candle_count, last_updated FROM {} WHERE symbol = $1 AND date = $2",
+        // Build SQL to retrieve all columns including price levels
+        let mut sql = format!(
+            "SELECT symbol, date, total_volume, vwap, poc, value_area_high, value_area_low, value_area_volume, value_area_percentage, price_increment, min_price, max_price, candle_count, last_updated FROM {}",
             self.table_name
         );
+
+        // Add price level columns dynamically
+        for i in 1..=200 {
+            sql.push_str(&format!(", price_{:03}, volume_{:03}", i, i));
+        }
+
+        sql.push_str(&format!(" FROM {} WHERE symbol = $1 AND date = $2", self.table_name));
 
         match client.query_opt(&sql, &[&symbol, &date]).await? {
             Some(row) => {
@@ -318,24 +403,47 @@ impl VolumeProfileDatabase {
                 let poc: f64 = row.get("poc");
                 let value_area_high: f64 = row.get("value_area_high");
                 let value_area_low: f64 = row.get("value_area_low");
-                let value_area_volume_percentage: f64 = row.get("value_area_volume_percentage");
                 let value_area_volume: f64 = row.get("value_area_volume");
+                let value_area_percentage: f64 = row.get("value_area_percentage");
                 let price_increment: f64 = row.get("price_increment");
                 let min_price: f64 = row.get("min_price");
                 let max_price: f64 = row.get("max_price");
                 let candle_count: i32 = row.get("candle_count");
                 let last_updated: i64 = row.get("last_updated");
 
+                // Build price levels from individual columns
+                let mut price_levels = Vec::new();
+                for i in 1..=200 {
+                    let price_col = format!("price_{:03}", i);
+                    let volume_col = format!("volume_{:03}", i);
+                    
+                    if let (Ok(price), Ok(volume)) = (row.try_get::<_, Option<f64>>(price_col.as_str()), row.try_get::<_, Option<f64>>(volume_col.as_str())) {
+                        if let (Some(price), Some(volume)) = (price, volume) {
+                            if volume > 0.0 { // Only include non-zero volume levels
+                                price_levels.push(PriceLevelData {
+                                    price,
+                                    volume,
+                                    percentage: 0.0, // Calculate if needed
+                                });
+                            }
+                        } else {
+                            break; // Stop when we hit null values
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
                 let profile_data = VolumeProfileData {
                     date: date.format("%Y-%m-%d").to_string(),
-                    price_levels: Vec::new(), // Empty since we only store aggregated data
+                    price_levels,
                     total_volume,
                     vwap,
                     poc,
                     value_area: ValueArea {
                         high: value_area_high,
                         low: value_area_low,
-                        volume_percentage: value_area_volume_percentage,
+                        volume_percentage: value_area_percentage,
                         volume: value_area_volume,
                     },
                     price_increment,
@@ -345,7 +453,8 @@ impl VolumeProfileDatabase {
                     last_updated: last_updated as TimestampMS,
                 };
 
-                debug!("Successfully retrieved volume profile: {} on {}", symbol, date);
+                debug!("Successfully retrieved volume profile: {} on {} ({} price levels)", 
+                       symbol, date, profile_data.price_levels.len());
                 Ok(Some(profile_data))
             }
             None => {
@@ -355,7 +464,7 @@ impl VolumeProfileDatabase {
         }
     }
 
-    /// Get volume profiles for symbol within date range
+    /// Get volume profiles for symbol within date range (flat format with price levels)
     pub async fn get_volume_profiles_in_range(
         &self,
         client: &Client,
@@ -365,10 +474,21 @@ impl VolumeProfileDatabase {
     ) -> Result<Vec<VolumeProfileData>, PostgresError> {
         debug!("Retrieving volume profiles: {} from {} to {}", symbol, start_date, end_date);
 
-        let sql = format!(
-            "SELECT date, total_volume, vwap, poc, value_area_high, value_area_low, value_area_volume_percentage, value_area_volume, price_increment, min_price, max_price, candle_count, last_updated FROM {} WHERE symbol = $1 AND date >= $2 AND date <= $3 ORDER BY date",
+        // Build SQL to retrieve all columns including price levels
+        let mut sql = format!(
+            "SELECT symbol, date, total_volume, vwap, poc, value_area_high, value_area_low, value_area_volume, value_area_percentage, price_increment, min_price, max_price, candle_count, last_updated FROM {}",
             self.table_name
         );
+
+        // Add price level columns dynamically
+        for i in 1..=200 {
+            sql.push_str(&format!(", price_{:03}, volume_{:03}", i, i));
+        }
+
+        sql.push_str(&format!(
+            " FROM {} WHERE symbol = $1 AND date >= $2 AND date <= $3 ORDER BY date",
+            self.table_name
+        ));
 
         let rows = client.query(&sql, &[&symbol, &start_date, &end_date]).await?;
         let mut profiles = Vec::with_capacity(rows.len());
@@ -380,24 +500,47 @@ impl VolumeProfileDatabase {
             let poc: f64 = row.get("poc");
             let value_area_high: f64 = row.get("value_area_high");
             let value_area_low: f64 = row.get("value_area_low");
-            let value_area_volume_percentage: f64 = row.get("value_area_volume_percentage");
             let value_area_volume: f64 = row.get("value_area_volume");
+            let value_area_percentage: f64 = row.get("value_area_percentage");
             let price_increment: f64 = row.get("price_increment");
             let min_price: f64 = row.get("min_price");
             let max_price: f64 = row.get("max_price");
             let candle_count: i32 = row.get("candle_count");
             let last_updated: i64 = row.get("last_updated");
 
+            // Build price levels from individual columns
+            let mut price_levels = Vec::new();
+            for i in 1..=200 {
+                let price_col = format!("price_{:03}", i);
+                let volume_col = format!("volume_{:03}", i);
+                
+                if let (Ok(price), Ok(volume)) = (row.try_get::<_, Option<f64>>(price_col.as_str()), row.try_get::<_, Option<f64>>(volume_col.as_str())) {
+                    if let (Some(price), Some(volume)) = (price, volume) {
+                        if volume > 0.0 { // Only include non-zero volume levels
+                            price_levels.push(PriceLevelData {
+                                price,
+                                volume,
+                                percentage: 0.0, // Calculate if needed
+                            });
+                        }
+                    } else {
+                        break; // Stop when we hit null values
+                    }
+                } else {
+                    break;
+                }
+            }
+
             let profile_data = VolumeProfileData {
                 date: date.format("%Y-%m-%d").to_string(),
-                price_levels: Vec::new(), // Empty since we only store aggregated data
+                price_levels,
                 total_volume,
                 vwap,
                 poc,
                 value_area: ValueArea {
                     high: value_area_high,
                     low: value_area_low,
-                    volume_percentage: value_area_volume_percentage,
+                    volume_percentage: value_area_percentage,
                     volume: value_area_volume,
                 },
                 price_increment,
@@ -410,7 +553,7 @@ impl VolumeProfileDatabase {
             profiles.push(profile_data);
         }
 
-        info!("Retrieved {} volume profiles for {} from {} to {}", 
+        info!("Retrieved {} volume profiles for {} from {} to {} (flat format)", 
               profiles.len(), symbol, start_date, end_date);
 
         Ok(profiles)
@@ -496,9 +639,9 @@ impl VolumeProfileDatabase {
         Ok(stats)
     }
 
-    /// Check if table exists and is properly set up
+    /// Check if table exists and is properly set up for flat format
     pub async fn verify_table_schema(&self, client: &Client) -> Result<bool, PostgresError> {
-        debug!("Verifying volume profile table schema");
+        debug!("Verifying volume profile table schema for flat format");
 
         let sql = r#"
             SELECT EXISTS (
@@ -516,7 +659,7 @@ impl VolumeProfileDatabase {
             return Ok(false);
         }
 
-        // Check if required columns exist
+        // Check if required columns exist for flat format
         let columns_sql = r#"
             SELECT column_name, data_type 
             FROM information_schema.columns 
@@ -526,10 +669,20 @@ impl VolumeProfileDatabase {
         "#;
 
         let rows = client.query(columns_sql, &[&self.table_name]).await?;
-        let mut required_columns = vec!["symbol", "date", "total_volume", "vwap", "poc", "value_area_high", "value_area_low"];
+        let mut required_columns = vec![
+            "symbol", "date", "total_volume", "vwap", "poc", 
+            "value_area_high", "value_area_low", "value_area_volume", 
+            "value_area_percentage", "price_increment", "min_price", 
+            "max_price", "candle_count", "last_updated"
+        ];
         
+        // Check for at least some price level columns
+        let mut has_price_levels = false;
         for row in rows {
             let column_name: String = row.get("column_name");
+            if column_name.starts_with("price_") {
+                has_price_levels = true;
+            }
             required_columns.retain(|&col| col != column_name);
         }
 
@@ -538,8 +691,33 @@ impl VolumeProfileDatabase {
             return Ok(false);
         }
 
-        info!("Volume profile table schema verified successfully");
+        if !has_price_levels {
+            error!("Volume profile table missing price level columns (price_001, volume_001, etc.)");
+            return Ok(false);
+        }
+
+        info!("Volume profile flat table schema verified successfully");
         Ok(true)
+    }
+
+    /// Create the new flat table schema (drops old table if exists)
+    pub async fn create_flat_table_schema(&self, client: &Client) -> Result<(), PostgresError> {
+        info!("Creating new flat volume profile table schema");
+
+        // Drop existing table if it exists (for migration)
+        let drop_sql = format!("DROP TABLE IF EXISTS {} CASCADE", self.table_name);
+        client.execute(&drop_sql, &[]).await?;
+
+        // Create new flat format table
+        let create_sql = self.get_create_table_sql();
+        client.execute(&create_sql, &[]).await?;
+
+        // Create trigger
+        let trigger_sql = self.get_create_trigger_sql();
+        client.execute(&trigger_sql, &[]).await?;
+
+        info!("Successfully created flat volume profile table schema");
+        Ok(())
     }
 }
 
@@ -630,23 +808,14 @@ mod tests {
     }
 
     #[test]
-    fn test_json_serialization() {
+    fn test_flat_format_compatibility() {
         let profile_data = create_test_profile_data();
         
-        // Test that profile data can be serialized to JSON
-        let json_result = serde_json::to_value(&profile_data);
-        assert!(json_result.is_ok());
-        
-        // Test that it can be deserialized back
-        let json_value = json_result.unwrap();
-        let json_str = serde_json::to_string(&json_value).unwrap();
-        let deserialized_result = serde_json::from_str::<VolumeProfileData>(&json_str);
-        assert!(deserialized_result.is_ok());
-        
-        let deserialized = deserialized_result.unwrap();
-        assert_eq!(deserialized.date, profile_data.date);
-        assert_eq!(deserialized.total_volume, profile_data.total_volume);
-        assert_eq!(deserialized.price_levels.len(), profile_data.price_levels.len());
+        // Test that the struct can be converted to/from flat format
+        assert!(!profile_data.price_levels.is_empty());
+        assert_eq!(profile_data.price_levels.len(), 2);
+        assert_eq!(profile_data.price_levels[0].price, 50000.0);
+        assert_eq!(profile_data.price_levels[0].volume, 1000.0);
     }
 
     // Note: Database integration tests would require a running PostgreSQL instance

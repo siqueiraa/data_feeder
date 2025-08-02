@@ -53,7 +53,7 @@ impl Default for VolumeProfileConfig {
             update_frequency: UpdateFrequency::EveryCandle,
             batch_size: 10,
             value_area_percentage: 70.0,
-            volume_distribution_mode: VolumeDistributionMode::UniformOHLC,
+            volume_distribution_mode: VolumeDistributionMode::WeightedOHLC,
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
             asset_overrides: HashMap::new(),
         }
@@ -185,15 +185,41 @@ pub enum UpdateFrequency {
 }
 
 /// Volume distribution methods for candle data
+/// 
+/// Different distribution modes create different volume profile characteristics:
+/// - WeightedOHLC: Most balanced and realistic for general trading analysis
+/// - ClosingPrice: Traditional Market Profile approach, best for trend analysis
+/// - UniformOHLC: Academic approach, can create artificial distributions
+/// - HighLowWeighted: Best for breakout and support/resistance analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VolumeDistributionMode {
     /// Distribute volume uniformly across OHLC range (traditional volume profile)
+    /// 
+    /// WARNING: This can create artificial volume distributions where no actual trades occurred.
+    /// Use with caution as it may result in unbalanced value areas with POC close to extremes.
+    /// Better suited for academic analysis rather than real trading decisions.
     UniformOHLC,
+    
     /// Assign all volume to closing price (time-based market profile)
+    /// 
+    /// This is the traditional Market Profile approach used by professional traders.
+    /// Creates clean, focused profiles that highlight price acceptance levels.
+    /// Best for: trend analysis, auction theory, institutional trading patterns.
     ClosingPrice,
-    /// Weighted distribution: 50% close, 25% high, 25% low
+    
+    /// Weighted distribution: 50% close, 25% high, 25% low (RECOMMENDED DEFAULT)
+    /// 
+    /// Provides the most balanced and realistic volume distribution for general analysis.
+    /// Emphasizes closing price (where most trading decisions are made) while acknowledging
+    /// activity at extremes. Results in well-balanced value areas with centered POC.
+    /// Best for: general trading analysis, balanced volume profiles, trend identification.
     WeightedOHLC,
+    
     /// High-Low weighted: 50% high, 50% low (price action focus)
+    /// 
+    /// Emphasizes price extremes and ranges, ignoring open/close prices.
+    /// Useful for breakout analysis and support/resistance identification.
+    /// Best for: range trading, breakout analysis, support/resistance mapping.
     HighLowWeighted,
 }
 
@@ -231,6 +257,79 @@ pub struct VolumeProfileData {
     pub candle_count: u32,
     /// Last update timestamp
     pub last_updated: TimestampMS,
+}
+
+/// Flat volume profile data without JSON - for direct database storage
+#[derive(Debug, Clone)]
+pub struct DailyVolumeProfileFlat {
+    /// Trading date (YYYY-MM-DD format)
+    pub date: String,
+    /// Total volume for the day
+    pub total_volume: f64,
+    /// Volume Weighted Average Price
+    pub vwap: f64,
+    /// Point of Control (price level with highest volume)
+    pub poc: f64,
+    /// Value area (70% of volume concentration)
+    pub value_area: ValueArea,
+    /// Price increment used for this profile
+    pub price_increment: f64,
+    /// Minimum price for the day
+    pub min_price: f64,
+    /// Maximum price for the day
+    pub max_price: f64,
+    /// Number of 1-minute candles processed
+    pub candle_count: u32,
+    /// Last update timestamp
+    pub last_updated: TimestampMS,
+    /// Individual price levels as (price, volume) pairs
+    pub price_levels: Vec<(f64, f64)>,
+}
+
+impl From<VolumeProfileData> for DailyVolumeProfileFlat {
+    fn from(data: VolumeProfileData) -> Self {
+        Self {
+            date: data.date,
+            total_volume: data.total_volume,
+            vwap: data.vwap,
+            poc: data.poc,
+            value_area: data.value_area,
+            price_increment: data.price_increment,
+            min_price: data.min_price,
+            max_price: data.max_price,
+            candle_count: data.candle_count,
+            last_updated: data.last_updated,
+            price_levels: data.price_levels
+                .into_iter()
+                .map(|level| (level.price, level.volume))
+                .collect(),
+        }
+    }
+}
+
+impl From<DailyVolumeProfileFlat> for VolumeProfileData {
+    fn from(flat: DailyVolumeProfileFlat) -> Self {
+        Self {
+            date: flat.date,
+            price_levels: flat.price_levels
+                .into_iter()
+                .map(|(price, volume)| PriceLevelData {
+                    price,
+                    volume,
+                    percentage: 0.0, // Will be calculated based on total_volume
+                })
+                .collect(),
+            total_volume: flat.total_volume,
+            vwap: flat.vwap,
+            poc: flat.poc,
+            value_area: flat.value_area,
+            price_increment: flat.price_increment,
+            min_price: flat.min_price,
+            max_price: flat.max_price,
+            candle_count: flat.candle_count,
+            last_updated: flat.last_updated,
+        }
+    }
 }
 
 /// Individual price level data within volume profile
@@ -984,5 +1083,76 @@ mod tests {
         // Verify reasonable values
         assert_eq!(fine_increment, 100.0 / 1000.0); // $0.10 increment for 1000 levels in $100
         assert_eq!(coarse_increment, 100.0 / 50.0);  // $2.00 increment for 50 levels in $100
+    }
+
+    #[test]
+    fn test_balanced_volume_profile_with_weighted_ohlc() {
+        let mut map = PriceLevelMap::new(0.5); // Use 0.5 increment for better granularity
+        
+        // Create a more realistic trading scenario with bell-curve like distribution
+        // Simulate accumulation around 101-102 range with some outliers
+        let candles = vec![
+            // Low volume outliers
+            (99.0, 100.0, 99.0, 99.5, 500.0),   // Low outlier
+            (104.0, 105.0, 104.0, 104.5, 500.0), // High outlier
+            
+            // Main accumulation zone - should create centered POC
+            (100.5, 101.5, 100.0, 101.0, 3000.0), // Volume at 101 area
+            (101.0, 102.0, 100.8, 101.5, 4000.0), // Peak volume
+            (101.5, 102.5, 101.0, 102.0, 3500.0), // Volume at 102 area
+            (101.8, 102.2, 101.3, 101.8, 3000.0), // More volume around 101-102
+            (101.2, 102.8, 101.0, 102.2, 2500.0), // Balanced distribution
+            
+            // Some mid-range activity
+            (102.0, 103.0, 101.8, 102.5, 1500.0), // Moderate volume
+            (100.8, 102.0, 100.5, 101.2, 1000.0), // Lower moderate volume
+        ];
+        
+        // Use WeightedOHLC distribution (new default)
+        for (open, high, low, close, volume) in candles {
+            map.distribute_candle_volume(open, high, low, close, volume, &VolumeDistributionMode::WeightedOHLC);
+        }
+        
+        // Calculate value area using traditional method
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let poc = map.get_poc().unwrap();
+        
+        // Basic validations that should always pass with WeightedOHLC
+        
+        // Value area should contain significant volume (close to target)
+        assert!(value_area.volume_percentage >= 65.0, 
+                "Value area should contain at least 65% of volume, got {:.1}%", value_area.volume_percentage);
+        
+        // POC should be within the value area (fundamental requirement)
+        assert!(poc >= value_area.low && poc <= value_area.high,
+                "POC ({}) should be within value area [{} - {}]", poc, value_area.low, value_area.high);
+        
+        // Value area should have reasonable range (not degenerate)
+        let va_range = value_area.high - value_area.low;
+        assert!(va_range >= 0.0, "Value area range should be non-negative: {:.1}", va_range);
+        
+        // With WeightedOHLC, we should have multiple price levels (not just one)
+        let price_levels = map.to_price_levels();
+        assert!(price_levels.len() >= 3, 
+                "WeightedOHLC should create multiple price levels, got {}", price_levels.len());
+        
+        // The POC should be a high-volume level
+        let poc_level = price_levels.iter().find(|level| level.price == poc).unwrap();
+        let max_volume = price_levels.iter().map(|l| l.volume).fold(0.0, f64::max);
+        assert!((poc_level.volume - max_volume).abs() < 0.01,
+                "POC should be at the highest volume level");
+    }
+
+    #[test]
+    fn test_weighted_ohlc_default_configuration() {
+        // Verify that the new default configuration uses WeightedOHLC
+        let config = VolumeProfileConfig::default();
+        assert!(matches!(config.volume_distribution_mode, VolumeDistributionMode::WeightedOHLC),
+                "Default configuration should use WeightedOHLC distribution");
+        
+        // Test that asset resolution maintains the default
+        let resolved = config.resolve_for_asset("BTCUSDT");
+        assert!(matches!(resolved.volume_distribution_mode, VolumeDistributionMode::WeightedOHLC),
+                "Resolved configuration should inherit WeightedOHLC default");
     }
 }

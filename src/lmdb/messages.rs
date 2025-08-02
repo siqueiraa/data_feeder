@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use kameo::Reply;
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
-use crate::historical::volume_profile_validator::VolumeProfileValidationResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LmdbActorMessage {
@@ -42,21 +41,6 @@ pub enum LmdbActorMessage {
         symbol: String,
         timeframe: u64,
     },
-    /// Store volume profile validation result
-    StoreVolumeProfileValidation {
-        validation_result: VolumeProfileValidationResult,
-    },
-    /// Get volume profile validation results for symbol/date
-    GetVolumeProfileValidation {
-        symbol: String,
-        date: chrono::NaiveDate,
-    },
-    /// Get volume profile validation history for symbol
-    GetVolumeProfileValidationHistory {
-        symbol: String,
-        start_date: chrono::NaiveDate,
-        end_date: chrono::NaiveDate,
-    },
 }
 
 /// Fire-and-forget messages for LmdbActor (Tell messages)
@@ -95,10 +79,6 @@ pub enum LmdbActorResponse {
     Success,
     /// Error response
     ErrorResponse(String),
-    /// Volume profile validation result
-    VolumeProfileValidation(Option<VolumeProfileValidationResult>),
-    /// Volume profile validation history
-    VolumeProfileValidationHistory(Vec<VolumeProfileValidationResult>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

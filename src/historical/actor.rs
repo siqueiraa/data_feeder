@@ -18,7 +18,6 @@ use crate::queue::types::QueueConfig;
 
 use super::errors::HistoricalDataError;
 use super::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS, Seconds, FuturesExchangeTrade};
-use super::volume_profile_validator::{VolumeProfileValidator, VolumeProfileValidationConfig};
 use crate::postgres::{PostgresActor, PostgresTell};
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 use crate::common::error_utils::ErrorContext;
@@ -35,7 +34,6 @@ pub struct HistoricalActor {
     postgres_actor: Option<ActorRef<PostgresActor>>,
     lmdb_actor: Option<ActorRef<LmdbActor>>,
     // Volume profile validation system
-    volume_profile_validator: Option<VolumeProfileValidator>,
     // Queue system for non-blocking operations
     task_queue: TaskQueue,
     io_queue: IoQueue,
@@ -82,19 +80,14 @@ impl HistoricalActor {
         };
         let rate_limiter = RateLimitingQueue::new(QueueConfig::default(), rate_config);
 
-        // Initialize volume profile validator with default configuration
-        let volume_profile_config = VolumeProfileValidationConfig::default();
-        let volume_profile_validator = VolumeProfileValidator::new(volume_profile_config);
 
         info!("HistoricalActor initialized - LMDB operations will be delegated to LmdbActor");
         info!("🚀 Queue system initialized: 8 CPU workers, 4 I/O workers, 2 DB workers, 1200 req/min rate limit");
-        info!("📊 Volume profile validator initialized with default configuration");
 
         Ok(Self { 
             csv_path: csv_path.to_path_buf(),
             postgres_actor: None,
             lmdb_actor: None,
-            volume_profile_validator: Some(volume_profile_validator),
             task_queue,
             io_queue,
             db_queue,
@@ -112,177 +105,9 @@ impl HistoricalActor {
         self.lmdb_actor = Some(lmdb_actor);
     }
 
-    /// Run historical volume profile validation for all existing data
-    /// This addresses the user's request to validate historical data beyond just current day
-    pub async fn run_historical_volume_profile_validation(
-        &self,
-        symbols: &[String],
-        timeframes: &[Seconds],
-        start_date: chrono::NaiveDate,
-        end_date: chrono::NaiveDate,
-    ) -> Result<(), HistoricalDataError> {
-        if self.volume_profile_validator.is_none() {
-            warn!("📊 Volume profile validator not initialized - skipping historical validation");
-            return Ok(());
-        }
-
-        if self.lmdb_actor.is_none() {
-            error!("❌ LMDB actor not available for historical validation");
-            return Err(HistoricalDataError::StorageError("LMDB actor not initialized".to_string()));
-        }
-
-        let validator = self.volume_profile_validator.as_ref().unwrap();
-        let lmdb_actor = self.lmdb_actor.as_ref().unwrap();
-
-        info!("🔍 Starting historical volume profile validation");
-        info!("📅 Date range: {} to {}", start_date, end_date);
-        info!("📊 Symbols: {:?}", symbols);
-        info!("⏱️ Timeframes: {:?}s", timeframes);
-
-        let mut total_days_processed = 0;
-        let mut total_validation_errors = 0;
-        let mut total_validation_successes = 0;
-        let validation_start_time = Instant::now();
-
-        // Iterate through each day in the date range
-        let mut current_date = start_date;
-        while current_date <= end_date {
-            for symbol in symbols {
-                for &timeframe in timeframes {
-                    match self.validate_historical_day(
-                        validator,
-                        lmdb_actor,
-                        symbol,
-                        timeframe,
-                        current_date,
-                    ).await {
-                        Ok(validation_result) => {
-                            if validation_result.is_valid {
-                                total_validation_successes += 1;
-                            } else {
-                                total_validation_errors += 1;
-                                info!("❌ Historical validation failed for {} {}s on {}: {} issues", 
-                                      symbol, timeframe, current_date, validation_result.validation_errors.len());
-                            }
-                        }
-                        Err(e) => {
-                            error!("❌ Failed to validate {} {}s on {}: {}", symbol, timeframe, current_date, e);
-                            total_validation_errors += 1;
-                        }
-                    }
-                }
-            }
-            total_days_processed += 1;
-            current_date = current_date.succ_opt().unwrap_or(current_date);
-            
-            // Log progress every 7 days
-            if total_days_processed % 7 == 0 {
-                info!("📊 Historical validation progress: {} days processed, {} successes, {} errors", 
-                      total_days_processed, total_validation_successes, total_validation_errors);
-            }
-        }
-
-        let validation_duration = validation_start_time.elapsed();
-        info!("✅ Historical volume profile validation completed in {:?}", validation_duration);
-        info!("📊 Final stats: {} days processed, {} successes, {} errors", 
-              total_days_processed, total_validation_successes, total_validation_errors);
-
-        Ok(())
-    }
-
-    /// Validate volume profile data for a specific day
-    async fn validate_historical_day(
-        &self,
-        validator: &VolumeProfileValidator,
-        lmdb_actor: &ActorRef<LmdbActor>,
-        symbol: &str,
-        timeframe: Seconds,
-        date: chrono::NaiveDate,
-    ) -> Result<crate::historical::volume_profile_validator::VolumeProfileValidationResult, HistoricalDataError> {
-        // Convert date to timestamp range (full day)
-        let start_of_day = date.and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis();
-        let end_of_day = date.and_hms_opt(23, 59, 59)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis() + 999; // Include end of day
-
-        // Fetch candles for the day from LMDB
-        let get_candles_msg = LmdbActorMessage::GetCandles {
-            symbol: symbol.to_string(),
-            timeframe,
-            start: start_of_day,
-            end: end_of_day,
-            limit: None, // Get all candles for the day
-        };
-
-        let candles = match lmdb_actor.ask(get_candles_msg).send().await {
-            Ok(LmdbActorResponse::Candles(candles)) => candles,
-            Ok(LmdbActorResponse::ErrorResponse(e)) => {
-                return Err(HistoricalDataError::StorageError(format!("LMDB error: {}", e)));
-            }
-            Ok(_) => {
-                return Err(HistoricalDataError::StorageError("Unexpected LMDB response".to_string()));
-            }
-            Err(e) => {
-                return Err(HistoricalDataError::StorageError(format!("LMDB communication error: {}", e)));
-            }
-        };
-
-        // Skip validation if no candles for this day
-        if candles.is_empty() {
-            info!("⏭️ Skipping validation for {} {}s on {} - no data", symbol, timeframe, date);
-            // Return a valid result with no candles to avoid counting as error
-            return Ok(crate::historical::volume_profile_validator::VolumeProfileValidationResult {
-                symbol: symbol.to_string(),
-                date,
-                validated_at: chrono::Utc::now().timestamp_millis(),
-                is_valid: true,
-                candles_validated: 0,
-                validation_errors: Vec::new(),
-                volume_validation: crate::historical::volume_profile_validator::VolumeValidationResult {
-                    total_volume: 0.0,
-                    average_volume: 0.0,
-                    zero_volume_candles: 0,
-                    outlier_volume_candles: 0,
-                    max_volume: 0.0,
-                    min_non_zero_volume: 0.0,
-                    distribution_quality_score: 1.0, // Perfect for empty data
-                },
-                price_validation: crate::historical::volume_profile_validator::PriceValidationResult {
-                    price_range: (0.0, 0.0),
-                    price_gaps_detected: 0,
-                    max_price_gap_percentage: 0.0,
-                    price_continuity_score: 1.0, // Perfect for empty data
-                    ohlc_consistency_issues: 0,
-                },
-                gap_analysis: crate::historical::volume_profile_validator::GapAnalysisResult {
-                    time_gaps: Vec::new(),
-                    volume_gaps: Vec::new(),
-                    data_quality_gaps: Vec::new(),
-                    gap_impact_score: 0.0,
-                },
-                validation_duration_ms: 0,
-            });
-        }
-
-        // Check for time gaps in the day's data
-        let gaps = scan_for_candle_gaps(&candles, timeframe, start_of_day, end_of_day);
-
-        // Run volume profile validation
-        let validation_result = validator.validate_volume_profile_data(symbol, date, &candles, &gaps)?;
 
 
-        info!("📊 Historical validation for {} {}s on {}: {} ({} candles, {}ms)", 
-              symbol, timeframe, date,
-              if validation_result.is_valid { "✅ PASSED" } else { "❌ FAILED" },
-              validation_result.candles_validated,
-              validation_result.validation_duration_ms);
 
-        Ok(validation_result)
-    }
 
     /// Non-blocking cleanup of CSV files - spawns a background task
     fn cleanup_csv_files_non_blocking(&self) {
@@ -410,41 +235,6 @@ impl HistoricalActor {
             return Ok(());
         }
 
-        // 📊 VOLUME PROFILE VALIDATION: Run after gap detection to validate data quality
-        if let Some(validator) = &self.volume_profile_validator {
-            let validation_date = chrono::DateTime::from_timestamp_millis(new_candles_start)
-                .map(|dt| dt.naive_utc().date())
-                .unwrap_or_else(|| chrono::Utc::now().naive_utc().date());
-
-            info!("📊 Running volume profile validation for {} on {} after gap detection", symbol, validation_date);
-            
-            match validator.validate_volume_profile_data(symbol, validation_date, candles, &gaps_in_new) {
-                Ok(validation_result) => {
-                    let status = if validation_result.is_valid { "✅ PASSED" } else { "❌ FAILED" };
-                    info!("📊 Volume profile validation {}: {} for {} on {} ({}ms)", 
-                          status, validation_result.is_valid, symbol, validation_date, validation_result.validation_duration_ms);
-
-
-                    // Log validation errors if any
-                    if !validation_result.validation_errors.is_empty() {
-                        warn!("⚠️ Volume profile validation found {} issues for {} on {}:", 
-                              validation_result.validation_errors.len(), symbol, validation_date);
-                        for (i, error) in validation_result.validation_errors.iter().take(3).enumerate() {
-                            warn!("  {}. {} ({}): {}", i + 1, error.error_code, 
-                                  format!("{:?}", error.severity), error.message);
-                        }
-                        if validation_result.validation_errors.len() > 3 {
-                            warn!("  ... and {} more issues", validation_result.validation_errors.len() - 3);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Volume profile validation failed for {} on {}: {}", symbol, validation_date, e);
-                }
-            }
-        } else {
-            info!("📊 Volume profile validator not initialized - skipping validation");
-        }
 
         let existing_certified = self.get_certified_range(symbol, timeframe).await?;
 
@@ -1307,21 +1097,10 @@ impl Message<HistoricalAsk> for HistoricalActor {
                     }
                 }
             }
-            HistoricalAsk::RunHistoricalVolumeProfileValidation { symbols, timeframes, start_date, end_date } => {
-                info!("🔍 Received request for historical volume profile validation");
-                info!("📅 Date range: {} to {}", start_date, end_date);
-                info!("📊 Symbols: {:?}, Timeframes: {:?}s", symbols, timeframes);
-                
-                match self.run_historical_volume_profile_validation(&symbols, &timeframes, start_date, end_date).await {
-                    Ok(()) => {
-                        info!("✅ Historical volume profile validation completed successfully");
-                        Ok(HistoricalReply::ValidationCompleted)
-                    }
-                    Err(e) => {
-                        error!("❌ Historical volume profile validation failed: {}", e);
-                        Err(e)
-                    }
-                }
+            HistoricalAsk::RunHistoricalVolumeProfileValidation { symbols: _, timeframes: _, start_date: _, end_date: _ } => {
+                info!("🔍 Volume profile validation has been removed from the system");
+                warn!("⚠️ RunHistoricalVolumeProfileValidation message received but validation is no longer supported");
+                Err(HistoricalDataError::Validation("Volume profile validation has been removed".to_string()))
             }
         }
     }

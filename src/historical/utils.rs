@@ -14,7 +14,6 @@ use rustc_hash::FxHashMap;
 
 use super::errors::HistoricalDataError;
 use super::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS, Seconds, FuturesExchangeTrade};
-use super::volume_profile_validator::{VolumeProfileValidator, VolumeProfileValidationConfig, VolumeProfileValidationResult};
 
 
 // Convert Binance interval strings to Seconds
@@ -127,130 +126,7 @@ pub fn scan_for_candle_gaps(
     gaps
 }
 
-/// Enhanced gap detection that includes volume profile validation
-/// This function runs after the standard gap detection and adds volume-aware validation
-pub fn scan_for_gaps_with_volume_profile_validation(
-    symbol: &str,
-    date: chrono::NaiveDate,
-    candles: &[FuturesOHLCVCandle],
-    timeframe: Seconds,
-    start_time: TimestampMS,
-    end_time: TimestampMS,
-    validation_config: Option<VolumeProfileValidationConfig>,
-) -> Result<(Vec<TimeRange>, Option<VolumeProfileValidationResult>), HistoricalDataError> {
-    info!("🔍 Starting enhanced gap detection with volume profile validation for {} on {}", symbol, date);
-    
-    // First, run standard gap detection
-    let time_gaps = scan_for_candle_gaps(candles, timeframe, start_time, end_time);
-    
-    // If no validation config provided, return just the time gaps
-    let validation_config = match validation_config {
-        Some(config) => config,
-        None => {
-            info!("📊 No volume profile validation config provided, skipping validation");
-            return Ok((time_gaps, None));
-        }
-    };
-    
-    // Skip validation for insufficient data
-    if candles.len() < validation_config.min_candles_for_validation as usize {
-        warn!("📊 Insufficient candles for volume profile validation: {} < {}", 
-              candles.len(), validation_config.min_candles_for_validation);
-        return Ok((time_gaps, None));
-    }
-    
-    // Run volume profile validation
-    let validator = VolumeProfileValidator::new(validation_config);
-    let validation_result = validator.validate_volume_profile_data(
-        symbol,
-        date,
-        candles,
-        &time_gaps,
-    )?;
-    
-    // Log validation results
-    let status = if validation_result.is_valid { "✅ VALID" } else { "❌ INVALID" };
-    info!("🔍 Volume profile validation completed {}: {} errors in {}ms", 
-          status, 
-          validation_result.validation_errors.len(),
-          validation_result.validation_duration_ms);
-    
-    if !validation_result.validation_errors.is_empty() {
-        warn!("📊 Volume profile validation issues found:");
-        for (i, error) in validation_result.validation_errors.iter().enumerate().take(5) {
-            warn!("  {}. [{}] {}", i + 1, error.error_code, error.message);
-        }
-        if validation_result.validation_errors.len() > 5 {
-            warn!("  ... and {} more issues", validation_result.validation_errors.len() - 5);
-        }
-    }
-    
-    Ok((time_gaps, Some(validation_result)))
-}
 
-/// Check if candle data is suitable for volume profile calculation
-/// This is a quick pre-check before running full validation
-pub fn is_suitable_for_volume_profile(candles: &[FuturesOHLCVCandle], min_candles: u32) -> bool {
-    if candles.len() < min_candles as usize {
-        return false;
-    }
-    
-    // Check for basic data sanity
-    let total_volume: f64 = candles.iter().map(|c| c.volume).sum();
-    let has_reasonable_volume = total_volume > 0.0;
-    
-    // Check for reasonable price range
-    let prices: Vec<f64> = candles.iter().flat_map(|c| vec![c.open, c.high, c.low, c.close]).collect();
-    let min_price = prices.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-    let max_price = prices.iter().fold(0.0f64, |a, &b| a.max(b));
-    let has_reasonable_price_range = min_price > 0.0 && max_price > min_price;
-    
-    has_reasonable_volume && has_reasonable_price_range
-}
-
-/// Volume-aware candle validation for real-time processing
-/// This is a lightweight version for use in real-time scenarios
-pub fn validate_candle_for_volume_profile(
-    candle: &FuturesOHLCVCandle,
-    previous_candles: &[FuturesOHLCVCandle],
-    min_volume_threshold: f64,
-) -> Result<bool, HistoricalDataError> {
-    // Basic OHLC validation
-    if !(candle.low <= candle.open && candle.open <= candle.high &&
-         candle.low <= candle.close && candle.close <= candle.high &&
-         candle.low <= candle.high) {
-        warn!("❌ OHLC inconsistency in candle: O={}, H={}, L={}, C={}", 
-              candle.open, candle.high, candle.low, candle.close);
-        return Ok(false);
-    }
-    
-    // Volume validation
-    if candle.volume < min_volume_threshold {
-        warn!("❌ Volume below threshold: {} < {}", candle.volume, min_volume_threshold);
-        return Ok(false);
-    }
-    
-    // Timestamp validation
-    if candle.open_time >= candle.close_time {
-        warn!("❌ Invalid timestamp: open_time={} >= close_time={}", 
-              candle.open_time, candle.close_time);
-        return Ok(false);
-    }
-    
-    // Price continuity check if we have previous candles
-    if !previous_candles.is_empty() {
-        let prev_candle = previous_candles.last().unwrap();
-        let price_gap = (candle.open - prev_candle.close).abs();
-        let gap_percentage = (price_gap / prev_candle.close) * 100.0;
-        
-        if gap_percentage > 20.0 { // 20% price gap threshold for real-time
-            warn!("❌ Large price gap: {:.2}% between consecutive candles", gap_percentage);
-            return Ok(false);
-        }
-    }
-    
-    Ok(true)
-}
 
 pub fn aggregate_candles_with_gap_filling(
     trades: &[FuturesExchangeTrade],

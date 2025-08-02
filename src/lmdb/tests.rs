@@ -638,9 +638,7 @@ async fn test_race_condition_stress_test() -> Result<(), Box<dyn std::error::Err
             Ok(LmdbActorResponse::DataRange { .. }) |
             Ok(LmdbActorResponse::Candles(_)) |
             Ok(LmdbActorResponse::ValidationResult { .. }) |
-            Ok(LmdbActorResponse::StorageStats { .. }) |
-            Ok(LmdbActorResponse::VolumeProfileValidation(_)) |
-            Ok(LmdbActorResponse::VolumeProfileValidationHistory(_)) => {
+            Ok(LmdbActorResponse::StorageStats { .. }) => {
                 successful_operations += 1;
             },
             Ok(LmdbActorResponse::ErrorResponse(err)) => {

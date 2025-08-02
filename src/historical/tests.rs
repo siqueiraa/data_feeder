@@ -36,6 +36,9 @@ async fn test_fetch_candles() {
                 println!("First candle open time: {}", candle.open_time());
             }
         }
+        Ok(HistoricalReply::ValidationCompleted) => {
+            println!("Validation completed successfully");
+        }
         Err(e) => {
             // For testing the actor system, we mainly care that it doesn't panic
             println!("Expected error during test (no network access): {:?}", e);
