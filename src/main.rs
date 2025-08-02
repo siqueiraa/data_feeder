@@ -494,14 +494,18 @@ async fn main() {
     };
 
     // Initialize dual logging system (console + rotating files)
-    if let Err(e) = init_dual_logging(config.logging_config.clone()) {
-        eprintln!("❌ Failed to initialize logging system: {}", e);
-        // Fall back to simple logging
-        tracing_subscriber::fmt()
-            .with_env_filter("info,data_feeder=info")
-            .init();
-        error!("⚠️ Using fallback console-only logging due to error: {}", e);
-    }
+    let _logging_guard = match init_dual_logging(config.logging_config.clone()) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!("❌ Failed to initialize logging system: {}", e);
+            // Fall back to simple logging
+            tracing_subscriber::fmt()
+                .with_env_filter("info,data_feeder=info")
+                .init();
+            error!("⚠️ Using fallback console-only logging due to error: {}", e);
+            None
+        }
+    };
 
     // Clean up old log files using configured cleanup days
     // Note: cleanup_days is not accessible here since it's not stored in config
