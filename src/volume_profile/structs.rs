@@ -119,7 +119,7 @@ impl VolumeProfileConfig {
         // Validate each asset override
         for (symbol, asset_config) in &self.asset_overrides {
             if let Some(levels) = asset_config.target_price_levels {
-                if levels < 10 || levels > 10000 {
+                if !(10..=10000).contains(&levels) {
                     return Err(format!("Asset {}: target_price_levels must be between 10 and 10000, got {}", symbol, levels));
                 }
             }
@@ -143,7 +143,7 @@ impl VolumeProfileConfig {
             }
 
             if let Some(va_pct) = asset_config.value_area_percentage {
-                if va_pct < 50.0 || va_pct > 95.0 {
+                if !(50.0..=95.0).contains(&va_pct) {
                     return Err(format!("Asset {}: value_area_percentage must be between 50% and 95%, got {}%", symbol, va_pct));
                 }
             }

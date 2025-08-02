@@ -33,7 +33,7 @@ mod tests {
     fn test_consistent_lmdb_config() {
         let (map_size, max_dbs, max_readers) = get_lmdb_config();
         assert_eq!(map_size, 1024 * 1024 * 1024); // 1GB
-        assert_eq!(max_dbs, 10);
+        assert_eq!(max_dbs, 15);
         assert_eq!(max_readers, 256);
     }
 

@@ -39,6 +39,10 @@ http-body-util = "0.1"
 tokio-metrics = { version = "0.3", features = ["rt"] }
 num_cpus = "1.16"
 
+[features]
+default = []
+postgres-tests = []
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"

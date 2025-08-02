@@ -105,7 +105,7 @@ pub enum PostgresReply {
     /// Error response
     Error(String),
     /// Volume profile validation result
-    VolumeProfileValidation(Option<VolumeProfileValidationResult>),
+    VolumeProfileValidation(Box<Option<VolumeProfileValidationResult>>),
     /// Volume profile validation history
     VolumeProfileValidationHistory(Vec<VolumeProfileValidationResult>),
 }
@@ -954,7 +954,7 @@ impl Message<PostgresAsk> for PostgresActor {
             }
             PostgresAsk::GetVolumeProfileValidation { symbol, date } => {
                 match self.get_volume_profile_validation(symbol, date).await {
-                    Ok(result) => Ok(PostgresReply::VolumeProfileValidation(result)),
+                    Ok(result) => Ok(PostgresReply::VolumeProfileValidation(Box::new(result))),
                     Err(e) => Err(e),
                 }
             }
