@@ -175,6 +175,9 @@ impl DailyVolumeProfile {
             return;
         }
 
+        // Store original total for validation
+        let original_total = self.price_levels.total_volume();
+
         // Use the configured volume distribution method
         self.price_levels.distribute_candle_volume(
             candle.open,
@@ -184,6 +187,22 @@ impl DailyVolumeProfile {
             volume,
             &self.config.volume_distribution_mode
         );
+        
+        // Validate volume conservation
+        let new_total = self.price_levels.total_volume();
+        let expected_total = original_total + volume;
+        
+        // Allow small floating point tolerance
+        let tolerance = f64::EPSILON * 1000.0;
+        let difference = (new_total - expected_total).abs();
+        
+        if difference > tolerance {
+            warn!("Volume conservation issue: expected={}, actual={}, difference={}", 
+                  expected_total, new_total, difference);
+        } else {
+            debug!("Volume conservation validated: candle_volume={}, total_volume={}", 
+                   volume, new_total);
+        }
         
         debug!("Distributed volume {:.2} using {:?} method across OHLC range [{:.2}, {:.2}, {:.2}, {:.2}]", 
                volume, self.config.volume_distribution_mode, candle.open, candle.high, candle.low, candle.close);

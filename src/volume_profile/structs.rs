@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use crate::historical::structs::TimestampMS;
+use crate::volume_profile::precision::PricePrecisionManager;
 
 /// Asset-specific volume profile configuration overrides
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +424,8 @@ pub struct PriceLevelMap {
     pub levels: BTreeMap<PriceKey, f64>,
     /// Price increment for this profile
     pub price_increment: f64,
+    /// Precision manager for consistent price-to-key mapping
+    precision_manager: PricePrecisionManager,
 }
 
 impl PriceLevelMap {
@@ -431,12 +434,13 @@ impl PriceLevelMap {
         Self {
             levels: BTreeMap::new(),
             price_increment,
+            precision_manager: PricePrecisionManager::default(),
         }
     }
 
     /// Add volume to a specific price level
     pub fn add_volume(&mut self, price: f64, volume: f64) {
-        let price_key = PriceKey::from_price(price, self.price_increment);
+        let price_key = PriceKey::from_price_with_manager(price, self.price_increment, &self.precision_manager);
         *self.levels.entry(price_key).or_insert(0.0) += volume;
     }
 
@@ -876,15 +880,38 @@ impl PriceLevelMap {
 pub struct PriceKey(i64);
 
 impl PriceKey {
-    /// Create price key from price and increment
+    /// Create price key from price and increment using precision-aware mapping
     pub fn from_price(price: f64, price_increment: f64) -> Self {
-        let key = (price / price_increment).round() as i64;
+        let precision_manager = PricePrecisionManager::default();
+        let key = precision_manager.price_to_key(price, price_increment)
+            .unwrap_or_else(|_| {
+                // Fallback to simple rounding only if precision manager fails
+                eprintln!("Warning: Precision manager failed, using simple rounding for price {} with increment {}", price, price_increment);
+                (price / price_increment).round() as i64
+            });
         Self(key)
     }
 
-    /// Convert price key back to price
+    /// Create price key from price and increment using the provided precision manager
+    pub fn from_price_with_manager(price: f64, price_increment: f64, precision_manager: &PricePrecisionManager) -> Self {
+        let key = precision_manager.price_to_key(price, price_increment)
+            .unwrap_or_else(|_| {
+                // Fallback to simple rounding only if precision manager fails
+                eprintln!("Warning: Precision manager failed, using simple rounding for price {} with increment {}", price, price_increment);
+                (price / price_increment).round() as i64
+            });
+        Self(key)
+    }
+
+    /// Convert price key back to price with precision validation
     pub fn to_price(self, price_increment: f64) -> f64 {
-        self.0 as f64 * price_increment
+        let precision_manager = PricePrecisionManager::default();
+        precision_manager.key_to_price(self.0, price_increment)
+            .unwrap_or_else(|_| {
+                // Fallback to simple multiplication only if precision manager fails
+                eprintln!("Warning: Precision manager failed, using simple multiplication for key {} with increment {}", self.0, price_increment);
+                self.0 as f64 * price_increment
+            })
     }
 
     /// Get next price key (higher price by one increment)
@@ -895,6 +922,19 @@ impl PriceKey {
     /// Get previous price key (lower price by one increment)
     pub fn previous(self) -> Self {
         Self(self.0 - 1)
+    }
+
+    /// Validate precision for this price key
+    pub fn validate_precision(&self, price_increment: f64) -> bool {
+        let precision_manager = PricePrecisionManager::default();
+        let reconstructed = precision_manager.key_to_price(self.0, price_increment);
+        
+        if let Ok(price) = reconstructed {
+            let validation = precision_manager.validate_precision(price, price_increment);
+            validation.map(|v| v.is_accurate).unwrap_or(false)
+        } else {
+            false
+        }
     }
 }
 
@@ -912,6 +952,9 @@ mod tests {
         
         // Should be close to original price (within increment precision)
         assert!((converted_price - price).abs() < price_increment);
+        
+        // Validate precision accuracy
+        assert!(key.validate_precision(price_increment), "Price key should maintain precision");
     }
 
     #[test]

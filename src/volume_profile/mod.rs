@@ -6,7 +6,9 @@
 pub mod actor;
 pub mod calculator;
 pub mod database;
+pub mod precision;
 pub mod structs;
+pub mod validation;
 
 pub use actor::{VolumeProfileActor, VolumeProfileTell, VolumeProfileAsk, VolumeProfileReply};
 pub use calculator::DailyVolumeProfile;
