@@ -40,6 +40,8 @@ pub struct DailyVolumeProfile {
     cached_value_area: Option<ValueArea>,
     /// Flag indicating if caches need recalculation
     cache_dirty: bool,
+    /// Cache coordinator for enhanced cache management
+    cache_coordinator: CacheCoordinator,
 }
 
 impl DailyVolumeProfile {
@@ -63,6 +65,7 @@ impl DailyVolumeProfile {
             cached_poc: None,
             cached_value_area: None,
             cache_dirty: false,
+            cache_coordinator: CacheCoordinator::new(),
         }
     }
 
@@ -89,8 +92,9 @@ impl DailyVolumeProfile {
         self.candle_count += 1;
         self.last_updated = candle.close_time;
         
-        // Mark caches as dirty
+        // Mark caches as dirty with coordinator tracking
         self.cache_dirty = true;
+        self.cache_coordinator.mark_dirty();
 
         debug!("Volume profile updated: {} candles, total volume: {:.2}", 
                self.candle_count, self.total_volume);
@@ -230,6 +234,7 @@ impl DailyVolumeProfile {
         }
         
         self.cache_dirty = false;
+        self.cache_coordinator.reset_after_recalculation();
         
         debug!("Recalculated volume profile caches: VWAP={:.2}, POC={:.2}", 
                self.cached_vwap.unwrap_or(0.0), self.cached_poc.unwrap_or(0.0));
@@ -237,12 +242,78 @@ impl DailyVolumeProfile {
 
     /// Invalidate all cached calculations
     fn invalidate_caches(&mut self) {
+        self.cache_coordinator.invalidate_before_update();
         self.cached_vwap = None;
         self.cached_poc = None;
         self.cached_value_area = None;
         self.cache_dirty = true;
     }
+}
 
+/// Cache state tracking for coordinated invalidation
+#[derive(Debug, Clone, PartialEq)]
+pub enum CacheState {
+    Valid,
+    Dirty,
+    InvalidatedBeforeUpdate,
+}
+
+/// Cache coordinator for enhanced cache management
+#[derive(Debug, Clone)]
+pub struct CacheCoordinator {
+    /// Track if cache was explicitly invalidated before update
+    invalidated_before_update: bool,
+    /// Track cache coherency state
+    state: CacheState,
+}
+
+impl CacheCoordinator {
+    /// Create new cache coordinator
+    pub fn new() -> Self {
+        Self {
+            invalidated_before_update: false,
+            state: CacheState::Valid,
+        }
+    }
+    
+    /// Invalidate cache before update operation
+    pub fn invalidate_before_update(&mut self) -> CacheState {
+        self.invalidated_before_update = true;
+        self.state = CacheState::InvalidatedBeforeUpdate;
+        self.state.clone()
+    }
+    
+    /// Validate cache coherency
+    pub fn validate_cache_coherency(&self) -> bool {
+        // Cache is coherent if it was properly invalidated before updates
+        match self.state {
+            CacheState::Valid => true,
+            CacheState::InvalidatedBeforeUpdate => true,
+            CacheState::Dirty => self.invalidated_before_update, // Only coherent if explicitly invalidated first
+        }
+    }
+    
+    /// Mark cache as dirty
+    pub fn mark_dirty(&mut self) {
+        if !self.invalidated_before_update {
+            self.state = CacheState::Dirty;
+        }
+    }
+    
+    /// Reset coordinator after cache recalculation
+    pub fn reset_after_recalculation(&mut self) {
+        self.invalidated_before_update = false;
+        self.state = CacheState::Valid;
+    }
+}
+
+impl Default for CacheCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DailyVolumeProfile {
     /// Get current statistics for monitoring
     pub fn get_statistics(&self) -> VolumeProfileStatistics {
         VolumeProfileStatistics {
@@ -650,5 +721,67 @@ mod tests {
         // Both should include high-volume areas but may select differently
         assert!(traditional_data.value_area.volume > 0.0);
         assert!(greedy_data.value_area.volume > 0.0);
+    }
+
+    #[test]
+    fn test_cache_coordinator_basic_operations() {
+        let mut coordinator = CacheCoordinator::new();
+        
+        // Initial state should be valid
+        assert!(coordinator.validate_cache_coherency());
+        assert_eq!(coordinator.state, CacheState::Valid);
+        
+        // Invalidate before update
+        let state = coordinator.invalidate_before_update();
+        assert_eq!(state, CacheState::InvalidatedBeforeUpdate);
+        assert!(coordinator.validate_cache_coherency());
+        
+        // Reset after recalculation
+        coordinator.reset_after_recalculation();
+        assert_eq!(coordinator.state, CacheState::Valid);
+        assert!(coordinator.validate_cache_coherency());
+    }
+
+    #[test]
+    fn test_cache_coordinator_dirty_tracking() {
+        let mut coordinator = CacheCoordinator::new();
+        
+        // Mark as dirty without prior invalidation - this should be incoherent
+        coordinator.mark_dirty();
+        assert_eq!(coordinator.state, CacheState::Dirty);
+        assert!(!coordinator.validate_cache_coherency()); // Should be incoherent
+        
+        // Reset and invalidate before marking dirty - this should be coherent
+        coordinator = CacheCoordinator::new();
+        coordinator.invalidate_before_update();
+        coordinator.mark_dirty();
+        assert!(coordinator.validate_cache_coherency()); // Should be coherent
+    }
+
+    #[test]
+    fn test_cache_coordinator_integration() {
+        let config = VolumeProfileConfig::default();
+        let mut profile = DailyVolumeProfile::new(
+            "TESTUSDT".to_string(),
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            &config
+        );
+
+        // Initial state should have coherent cache
+        assert!(profile.cache_coordinator.validate_cache_coherency());
+        
+        // Add candle - this should mark cache as dirty
+        let candle = create_test_candle(1640995200000, 1640995260000, 50000.0, 50001.0, 49999.0, 50000.5, 1000.0);
+        profile.add_candle(&candle);
+        
+        // Cache should still be coherent (coordinator tracks the dirty marking)
+        assert!(profile.cache_coordinator.validate_cache_coherency());
+        
+        // Get profile data - this triggers cache recalculation
+        let _data = profile.get_profile_data();
+        
+        // After recalculation, cache should be valid and coherent
+        assert_eq!(profile.cache_coordinator.state, CacheState::Valid);
+        assert!(profile.cache_coordinator.validate_cache_coherency());
     }
 }
