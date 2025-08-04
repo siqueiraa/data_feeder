@@ -810,22 +810,22 @@ mod tests {
         // Test case 1: Small gap (1 week) - should use daily
         let small_gap_start = now - (7 * 24 * 60 * 60 * 1000); // 1 week ago
         let small_gap_end = now;
-        assert_eq!(should_use_monthly_data(small_gap_start, small_gap_end), false);
+        assert!(!should_use_monthly_data(small_gap_start, small_gap_end));
         
         // Test case 2: Medium gap (1 month) - should use daily
         let medium_gap_start = now - (30 * 24 * 60 * 60 * 1000); // 1 month ago
         let medium_gap_end = now;
-        assert_eq!(should_use_monthly_data(medium_gap_start, medium_gap_end), false);
+        assert!(!should_use_monthly_data(medium_gap_start, medium_gap_end));
         
         // Test case 3: Large gap (3 months) - should use monthly
         let large_gap_start = now - (90 * 24 * 60 * 60 * 1000); // 3 months ago
         let large_gap_end = now;
-        assert_eq!(should_use_monthly_data(large_gap_start, large_gap_end), true);
+        assert!(should_use_monthly_data(large_gap_start, large_gap_end));
         
         // Test case 4: Very large gap (1 year) - should use monthly
         let very_large_gap_start = now - (365 * 24 * 60 * 60 * 1000); // 1 year ago
         let very_large_gap_end = now;
-        assert_eq!(should_use_monthly_data(very_large_gap_start, very_large_gap_end), true);
+        assert!(should_use_monthly_data(very_large_gap_start, very_large_gap_end));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Datelike, Timelike};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -9,7 +9,7 @@ use super::structs::{
 };
 
 #[cfg(test)]
-use super::structs::{VolumeDistributionMode, ValueAreaCalculationMode};
+use super::structs::{VolumeDistributionMode, ValueAreaCalculationMode, VolumeProfileCalculationMode};
 
 /// Daily volume profile calculator with real-time incremental updates
 #[derive(Debug, Clone)]
@@ -151,13 +151,51 @@ impl DailyVolumeProfile {
         }
     }
 
-    /// Check if candle belongs to this trading date
+    /// Check if candle belongs to this trading date with enhanced validation
     fn is_candle_for_date(&self, candle: &FuturesOHLCVCandle) -> bool {
-        // Convert timestamp to UTC date
+        // Convert timestamp to UTC date with explicit validation
         if let Some(datetime) = chrono::DateTime::from_timestamp_millis(candle.open_time) {
             let candle_date = datetime.date_naive();
-            candle_date == self.date
+            
+            // Direct date match (most common case)
+            if candle_date == self.date {
+                return true;
+            }
+            
+            // Handle timezone boundary conditions (within 1 hour of day boundary)
+            let day_difference = (candle_date - self.date).num_days().abs();
+            if day_difference == 1 {
+                let hour = datetime.time().hour();
+                // Accept candles within 1 hour of day boundary to handle timezone shifts
+                if hour >= 23 || hour == 0 {
+                    debug!("Accepting candle at timezone boundary: candle_date={}, target_date={}, hour={}", 
+                           candle_date, self.date, hour);
+                    return true;
+                }
+            }
+            
+            // Handle potential DST transition cases
+            if day_difference == 1 {
+                let month = self.date.month();
+                if month == 3 || month == 11 { // DST transition months
+                    let day = self.date.day();
+                    if (8..=15).contains(&day) { // Typical DST transition period
+                        let hour = datetime.time().hour();
+                        if hour >= 22 || hour <= 2 { // Extended boundary for DST
+                            debug!("Accepting candle during potential DST transition: candle_date={}, target_date={}, hour={}", 
+                                   candle_date, self.date, hour);
+                            return true;
+                        }
+                    }
+                }
+            }
+            
+            // Log rejected candles for debugging
+            debug!("Rejecting candle for date mismatch: candle_timestamp={}, candle_date={}, target_date={}", 
+                   candle.open_time, candle_date, self.date);
+            false
         } else {
+            warn!("Invalid candle timestamp: {}", candle.open_time);
             false
         }
     }
@@ -192,16 +230,19 @@ impl DailyVolumeProfile {
         let new_total = self.price_levels.total_volume();
         let expected_total = original_total + volume;
         
-        // Allow small floating point tolerance
-        let tolerance = f64::EPSILON * 1000.0;
+        // Allow reasonable floating point tolerance for financial data
+        // Use relative tolerance based on the magnitude of values being compared
+        let relative_tolerance = expected_total.abs() * f64::EPSILON * 1000.0;
+        let absolute_tolerance = 1e-10; // Minimum absolute tolerance for very small differences
+        let tolerance = relative_tolerance.max(absolute_tolerance);
         let difference = (new_total - expected_total).abs();
         
         if difference > tolerance {
-            warn!("Volume conservation issue: expected={}, actual={}, difference={}", 
-                  expected_total, new_total, difference);
+            warn!("Volume conservation issue: expected={}, actual={}, difference={} (tolerance={})", 
+                  expected_total, new_total, difference, tolerance);
         } else {
-            debug!("Volume conservation validated: candle_volume={}, total_volume={}", 
-                   volume, new_total);
+            debug!("Volume conservation validated: candle_volume={}, total_volume={}, difference={}", 
+                   volume, new_total, difference);
         }
         
         debug!("Distributed volume {:.2} using {:?} method across OHLC range [{:.2}, {:.2}, {:.2}, {:.2}]", 
@@ -230,24 +271,26 @@ impl DailyVolumeProfile {
         }
     }
 
-    /// Recalculate cached values (VWAP, POC, Value Area)
+    /// Recalculate cached values (VWAP, POC, Value Area) using dual-method algorithm
     fn recalculate_caches(&mut self) {
         if self.total_volume <= 0.0 {
             self.cached_vwap = Some(0.0);
             self.cached_poc = Some(0.0);
             self.cached_value_area = Some(ValueArea::default());
         } else {
+            debug!("Recalculating volume profile caches using {} method", self.config.calculation_mode);
             // Calculate VWAP
             self.cached_vwap = Some(self.price_levels.calculate_vwap());
             
-            // Calculate POC (Point of Control)
-            self.cached_poc = self.price_levels.get_poc();
+            // Calculate POC (Point of Control) using configured method
+            self.cached_poc = self.price_levels.identify_poc(&self.config.calculation_mode);
             
             // Calculate Value Area using configured method
             self.cached_value_area = Some(
                 self.price_levels.calculate_value_area(
                     self.config.value_area_percentage,
-                    &self.config.value_area_calculation_mode
+                    &self.config.value_area_calculation_mode,
+                    &self.config.calculation_mode
                 )
             );
         }
@@ -438,6 +481,7 @@ mod tests {
             value_area_percentage: 70.0,
             volume_distribution_mode: VolumeDistributionMode::ClosingPrice,
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
+            calculation_mode: VolumeProfileCalculationMode::Volume,
             asset_overrides: std::collections::HashMap::new(),
         }
     }
@@ -577,7 +621,7 @@ mod tests {
         assert_eq!(profile.total_volume, 2500.0);
         
         let profile_data = profile.get_profile_data();
-        assert!(profile_data.price_levels.len() > 0);
+        assert!(!profile_data.price_levels.is_empty());
         assert!(profile_data.vwap > 0.0);
     }
 
@@ -778,6 +822,229 @@ mod tests {
     }
 
     #[test]
+    fn test_dual_method_integration_with_daily_volume_profile() {
+        // Test Volume method
+        let mut volume_config = create_test_config();
+        volume_config.calculation_mode = VolumeProfileCalculationMode::Volume;
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        let mut volume_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &volume_config);
+        
+        // Test TPO method
+        let mut tpo_config = create_test_config();
+        tpo_config.calculation_mode = VolumeProfileCalculationMode::TPO;
+        let mut tpo_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &tpo_config);
+        
+        let base_timestamp = 1736985600000; // 2025-01-16 00:00:00 UTC
+        
+        // Create test data where TPO and Volume methods will produce different results
+        let candles = vec![
+            // Price 100: 1 big volume candle 
+            create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 100.0, 100.0, 100.0, 1000.0),
+            
+            // Price 101: 5 small volume candles (high TPO, low volume per candle)
+            create_test_candle(base_timestamp + 60000, base_timestamp + 119999, 101.0, 101.0, 101.0, 101.0, 50.0),
+            create_test_candle(base_timestamp + 120000, base_timestamp + 179999, 101.0, 101.0, 101.0, 101.0, 50.0),
+            create_test_candle(base_timestamp + 180000, base_timestamp + 239999, 101.0, 101.0, 101.0, 101.0, 50.0),
+            create_test_candle(base_timestamp + 240000, base_timestamp + 299999, 101.0, 101.0, 101.0, 101.0, 50.0),
+            create_test_candle(base_timestamp + 300000, base_timestamp + 359999, 101.0, 101.0, 101.0, 101.0, 50.0),
+            
+            // Price 102: 2 medium volume candles
+            create_test_candle(base_timestamp + 360000, base_timestamp + 419999, 102.0, 102.0, 102.0, 102.0, 300.0),
+            create_test_candle(base_timestamp + 420000, base_timestamp + 479999, 102.0, 102.0, 102.0, 102.0, 300.0),
+        ];
+        
+        // Process candles in both profiles
+        for candle in &candles {
+            volume_profile.add_candle(candle);
+            tpo_profile.add_candle(candle);
+        }
+        
+        let volume_data = volume_profile.get_profile_data();
+        let tpo_data = tpo_profile.get_profile_data();
+        
+        // Both should have same total volume and candle count
+        assert_eq!(volume_data.total_volume, 1850.0, "Total volume should be 1850");
+        assert_eq!(tpo_data.total_volume, 1850.0, "Total volume should be same for both methods");
+        assert_eq!(volume_data.candle_count, 8, "Should have 8 candles");
+        assert_eq!(tpo_data.candle_count, 8, "Should have same candle count");
+        
+        // Volume method POC should be at price 100 (1000 volume)
+        assert_eq!(volume_data.poc, 100.0, "Volume POC should be at price 100");
+        
+        // TPO method POC should be at price 101 (5 candles)
+        assert_eq!(tpo_data.poc, 101.0, "TPO POC should be at price 101");
+        
+        // Both should have valid value areas
+        assert!(volume_data.value_area.high >= volume_data.value_area.low, "Volume VA should have valid range");
+        assert!(tpo_data.value_area.high >= tpo_data.value_area.low, "TPO VA should have valid range");
+        
+        // Volume method should include price 100 in value area
+        assert!(volume_data.value_area.low <= 100.0 && volume_data.value_area.high >= 100.0, 
+                "Volume method should include price 100 in value area");
+        
+        // TPO method should include price 101 in value area
+        assert!(tpo_data.value_area.low <= 101.0 && tpo_data.value_area.high >= 101.0, 
+                "TPO method should include price 101 in value area");
+    }
+
+    #[test]
+    fn test_edge_case_equal_volumes_equal_candles() {
+        let config = create_test_config();
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        let mut profile = DailyVolumeProfile::new("TESTUSDT".to_string(), date, &config);
+        
+        let base_timestamp = 1736985600000;
+        
+        // Create edge case: all price levels have equal volumes and candle counts
+        let candles = vec![
+            create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 100.0, 100.0, 100.0, 500.0),
+            create_test_candle(base_timestamp + 60000, base_timestamp + 119999, 101.0, 101.0, 101.0, 101.0, 500.0),
+            create_test_candle(base_timestamp + 120000, base_timestamp + 179999, 102.0, 102.0, 102.0, 102.0, 500.0),
+        ];
+        
+        for candle in &candles {
+            profile.add_candle(candle);
+        }
+        
+        let profile_data = profile.get_profile_data();
+        
+        // Should handle equal volumes gracefully
+        assert!(profile_data.poc >= 100.0 && profile_data.poc <= 102.0, 
+                "POC should be within price range for equal volumes");
+        assert!(profile_data.value_area.volume_percentage > 0.0, 
+                "Should calculate reasonable value area percentage");
+        assert!(profile_data.value_area.high >= profile_data.value_area.low, 
+                "Should maintain valid value area range");
+    }
+
+    #[test]
+    fn test_configuration_switching_runtime() {
+        let base_timestamp = 1736985600000;
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        
+        // Start with Volume method
+        let mut config = create_test_config();
+        config.calculation_mode = VolumeProfileCalculationMode::Volume;
+        let mut profile = DailyVolumeProfile::new("TESTUSDT".to_string(), date, &config);
+        
+        let candles = vec![
+            create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 100.0, 100.0, 100.0, 1000.0),
+            create_test_candle(base_timestamp + 60000, base_timestamp + 119999, 101.0, 101.0, 101.0, 101.0, 100.0),
+            create_test_candle(base_timestamp + 120000, base_timestamp + 179999, 101.0, 101.0, 101.0, 101.0, 100.0),
+            create_test_candle(base_timestamp + 180000, base_timestamp + 239999, 101.0, 101.0, 101.0, 101.0, 100.0),
+        ];
+        
+        for candle in &candles {
+            profile.add_candle(candle);
+        }
+        
+        let volume_data = profile.get_profile_data();
+        assert_eq!(volume_data.poc, 100.0, "Volume method should identify POC at 100.0");
+        
+        // Switch to TPO method (simulating runtime configuration change)
+        config.calculation_mode = VolumeProfileCalculationMode::TPO;
+        let mut tpo_profile = DailyVolumeProfile::new("TESTUSDT".to_string(), date, &config);
+        
+        for candle in &candles {
+            tpo_profile.add_candle(candle);
+        }
+        
+        let tpo_data = tpo_profile.get_profile_data();
+        assert_eq!(tpo_data.poc, 101.0, "TPO method should identify POC at 101.0");
+        
+        // Both should maintain data integrity
+        assert_eq!(volume_data.total_volume, tpo_data.total_volume, "Total volume should be consistent");
+        assert_eq!(volume_data.candle_count, tpo_data.candle_count, "Candle count should be consistent");
+    }
+
+    #[test]
+    fn test_business_rules_compliance_integration() {
+        let config = create_test_config();
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        let mut profile = DailyVolumeProfile::new("TESTUSDT".to_string(), date, &config);
+        
+        let base_timestamp = 1736985600000;
+        
+        // Create realistic trading data
+        let candles = vec![
+            create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 100.5, 99.5, 100.2, 500.0),
+            create_test_candle(base_timestamp + 60000, base_timestamp + 119999, 100.2, 100.8, 100.0, 100.6, 800.0),
+            create_test_candle(base_timestamp + 120000, base_timestamp + 179999, 100.6, 101.2, 100.3, 101.0, 1200.0), // POC area
+            create_test_candle(base_timestamp + 180000, base_timestamp + 239999, 101.0, 101.5, 100.7, 101.3, 900.0),
+            create_test_candle(base_timestamp + 240000, base_timestamp + 299999, 101.3, 101.8, 101.0, 101.5, 600.0),
+        ];
+        
+        for candle in &candles {
+            profile.add_candle(candle);
+        }
+        
+        let profile_data = profile.get_profile_data();
+        
+        // Validate business rules compliance
+        assert!(profile_data.value_area.high > profile_data.value_area.low, 
+                "VAH should be greater than VAL");
+        assert!(profile_data.poc >= profile_data.value_area.low && profile_data.poc <= profile_data.value_area.high, 
+                "POC should be within value area: POC={:.2}, VAL={:.2}, VAH={:.2}", 
+                profile_data.poc, profile_data.value_area.low, profile_data.value_area.high);
+        assert!(profile_data.value_area.volume_percentage >= 50.0 && profile_data.value_area.volume_percentage <= 100.0, 
+                "Value area percentage should be reasonable: {:.2}%", profile_data.value_area.volume_percentage);
+    }
+
+    #[test] 
+    fn test_performance_comparison_tpo_vs_volume() {
+        use std::time::Instant;
+        
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        let base_timestamp = 1736985600000;
+        
+        // Create large dataset for performance testing
+        let mut candles = Vec::new();
+        for i in 0..1000 {
+            let price = 100.0 + (i % 50) as f64 * 0.01; // Spread across 50 price levels
+            let volume = 100.0 + (i % 20) as f64 * 10.0; // Varying volumes
+            candles.push(create_test_candle(
+                base_timestamp + i * 60000,
+                base_timestamp + i * 60000 + 59999,
+                price, price + 0.005, price - 0.005, price + 0.002,
+                volume
+            ));
+        }
+        
+        // Test Volume method performance
+        let mut volume_config = create_test_config();
+        volume_config.calculation_mode = VolumeProfileCalculationMode::Volume;
+        let mut volume_profile = DailyVolumeProfile::new("PERFTEST".to_string(), date, &volume_config);
+        
+        let volume_start = Instant::now();
+        for candle in &candles {
+            volume_profile.add_candle(candle);
+        }
+        let _volume_data = volume_profile.get_profile_data();
+        let volume_duration = volume_start.elapsed();
+        
+        // Test TPO method performance
+        let mut tpo_config = create_test_config();
+        tpo_config.calculation_mode = VolumeProfileCalculationMode::TPO;
+        let mut tpo_profile = DailyVolumeProfile::new("PERFTEST".to_string(), date, &tpo_config);
+        
+        let tpo_start = Instant::now();
+        for candle in &candles {
+            tpo_profile.add_candle(candle);
+        }
+        let _tpo_data = tpo_profile.get_profile_data();
+        let tpo_duration = tpo_start.elapsed();
+        
+        // Both methods should complete in reasonable time (< 100ms for 1000 candles)
+        assert!(volume_duration.as_millis() < 100, 
+                "Volume method should complete in <100ms, took {}ms", volume_duration.as_millis());
+        assert!(tpo_duration.as_millis() < 100, 
+                "TPO method should complete in <100ms, took {}ms", tpo_duration.as_millis());
+        
+        println!("Performance comparison: Volume={}ms, TPO={}ms", 
+                 volume_duration.as_millis(), tpo_duration.as_millis());
+    }
+
+    #[test]
     fn test_cache_coordinator_integration() {
         let config = VolumeProfileConfig::default();
         let mut profile = DailyVolumeProfile::new(
@@ -802,5 +1069,154 @@ mod tests {
         // After recalculation, cache should be valid and coherent
         assert_eq!(profile.cache_coordinator.state, CacheState::Valid);
         assert!(profile.cache_coordinator.validate_cache_coherency());
+    }
+
+    #[test]
+    fn test_enhanced_date_validation_basic() {
+        let config = create_test_config();
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        let profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
+
+        // Test exact date match
+        let exact_timestamp = 1736985600000; // 2025-01-16 00:00:00 UTC
+        let exact_candle = create_test_candle(exact_timestamp, exact_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(profile.is_candle_for_date(&exact_candle));
+
+        // Test clearly wrong date (outside timezone boundary window)
+        let wrong_timestamp = 1737072000000 + 5 * 60 * 60 * 1000; // 2025-01-17 05:00:00 UTC (next day, well outside boundary)
+        let wrong_candle = create_test_candle(wrong_timestamp, wrong_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(!profile.is_candle_for_date(&wrong_candle));
+    }
+
+    #[test]
+    fn test_enhanced_date_validation_timezone_boundary() {
+        let config = create_test_config();
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        let profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
+
+        // Test candle at 23:30 of previous day (should be accepted due to timezone boundary)
+        let boundary_timestamp = 1736985600000 - 30 * 60 * 1000; // 2025-01-15 23:30:00 UTC
+        let boundary_candle = create_test_candle(boundary_timestamp, boundary_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(profile.is_candle_for_date(&boundary_candle));
+
+        // Test candle at 00:30 of next day (should be accepted due to timezone boundary)
+        let next_boundary_timestamp = 1736985600000 + 24 * 60 * 60 * 1000 + 30 * 60 * 1000; // 2025-01-17 00:30:00 UTC
+        let next_boundary_candle = create_test_candle(next_boundary_timestamp, next_boundary_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(profile.is_candle_for_date(&next_boundary_candle));
+
+        // Test candle at 02:00 of next day (should be rejected - too far from boundary)
+        let far_timestamp = 1736985600000 + 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000; // 2025-01-17 02:00:00 UTC
+        let far_candle = create_test_candle(far_timestamp, far_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(!profile.is_candle_for_date(&far_candle));
+    }
+
+    #[test]
+    fn test_enhanced_date_validation_dst_transition() {
+        let config = create_test_config();
+        
+        // Test March DST transition (second Sunday in March 2025 is March 9th)
+        let march_date = NaiveDate::from_ymd_opt(2025, 3, 9).unwrap();
+        let march_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), march_date, &config);
+
+        // March 9, 2025 00:00:00 UTC
+        let march_base_timestamp = march_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+        
+        // Test candle from previous day at 22:30 (should be accepted during DST period)
+        let dst_boundary_timestamp = march_base_timestamp - (1.5 * 60.0 * 60.0 * 1000.0) as i64; // 22:30 previous day
+        let dst_candle = create_test_candle(dst_boundary_timestamp, dst_boundary_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(march_profile.is_candle_for_date(&dst_candle));
+
+        // Test November DST transition (using a date within DST transition window - Nov 10, 2025)
+        let november_date = NaiveDate::from_ymd_opt(2025, 11, 10).unwrap(); // Within typical DST window
+        let november_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), november_date, &config);
+
+        let november_base_timestamp = november_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+        
+        // Test candle from next day at 01:30 (should be accepted during DST period)
+        let dst_next_timestamp = november_base_timestamp + 24 * 60 * 60 * 1000 + (1.5 * 60.0 * 60.0 * 1000.0) as i64; // 01:30 next day
+        let dst_next_candle = create_test_candle(dst_next_timestamp, dst_next_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(november_profile.is_candle_for_date(&dst_next_candle));
+    }
+
+    #[test]
+    fn test_enhanced_date_validation_leap_year() {
+        let config = create_test_config();
+        
+        // Test leap year date (2024 is a leap year)
+        let leap_date = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+        let leap_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), leap_date, &config);
+
+        // Test candle on leap day
+        let leap_timestamp = leap_date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_millis();
+        let leap_candle = create_test_candle(leap_timestamp, leap_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(leap_profile.is_candle_for_date(&leap_candle));
+
+        // Test non-leap year (2025)
+        let non_leap_date = NaiveDate::from_ymd_opt(2025, 2, 28).unwrap();
+        let non_leap_profile = DailyVolumeProfile::new("BTCUSDT".to_string(), non_leap_date, &config);
+
+        let non_leap_timestamp = non_leap_date.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_millis();
+        let non_leap_candle = create_test_candle(non_leap_timestamp, non_leap_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        assert!(non_leap_profile.is_candle_for_date(&non_leap_candle));
+    }
+
+    #[test]
+    fn test_enhanced_date_validation_edge_cases() {
+        let config = create_test_config();
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        let profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
+
+        // Test invalid timestamp
+        let invalid_candle = FuturesOHLCVCandle {
+            open_time: -1, // Invalid timestamp
+            close_time: 0,
+            open: 100.0,
+            high: 102.0,
+            low: 98.0,
+            close: 101.0,
+            volume: 1000.0,
+            number_of_trades: 100,
+            taker_buy_base_asset_volume: 600.0,
+            closed: true,
+        };
+        assert!(!profile.is_candle_for_date(&invalid_candle));
+
+        // Test timestamp at max i64 (should be invalid)
+        let max_timestamp_candle = FuturesOHLCVCandle {
+            open_time: i64::MAX,
+            close_time: i64::MAX,
+            open: 100.0,
+            high: 102.0,
+            low: 98.0,
+            close: 101.0,
+            volume: 1000.0,
+            number_of_trades: 100,
+            taker_buy_base_asset_volume: 600.0,
+            closed: true,
+        };
+        assert!(!profile.is_candle_for_date(&max_timestamp_candle));
+    }
+
+    #[test]
+    fn test_comprehensive_date_validation_logging() {
+        let config = create_test_config();
+        let date = NaiveDate::from_ymd_opt(2025, 1, 16).unwrap();
+        let mut profile = DailyVolumeProfile::new("BTCUSDT".to_string(), date, &config);
+
+        // Test that accepted candles are logged and processed correctly
+        let valid_timestamp = 1736985600000; // 2025-01-16 00:00:00 UTC
+        let valid_candle = create_test_candle(valid_timestamp, valid_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        
+        profile.add_candle(&valid_candle);
+        assert_eq!(profile.candle_count, 1);
+        assert_eq!(profile.total_volume, 1000.0);
+
+        // Test that rejected candles are logged but not processed (use clearly invalid timestamp)
+        let wrong_timestamp = 1737072000000 + 10 * 60 * 60 * 1000; // 2025-01-17 10:00:00 UTC (next day, well outside boundary)
+        let wrong_candle = create_test_candle(wrong_timestamp, wrong_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 500.0);
+        
+        profile.add_candle(&wrong_candle);
+        assert_eq!(profile.candle_count, 1); // Should not increase
+        assert_eq!(profile.total_volume, 1000.0); // Should not change
     }
 }

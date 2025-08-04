@@ -381,10 +381,10 @@ mod tests {
         let counts = vec![21, 50];
         let periods = vec![21, 89];
         
-        assert_eq!(batch_readiness_check(&counts, &periods), false); // Second EMA not ready
+        assert!(!batch_readiness_check(&counts, &periods)); // Second EMA not ready
         
         let counts_ready = vec![21, 89];
-        assert_eq!(batch_readiness_check(&counts_ready, &periods), true); // Both ready
+        assert!(batch_readiness_check(&counts_ready, &periods)); // Both ready
     }
     
     #[test]

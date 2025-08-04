@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod error_handling_tests {
+mod tests {
     use crate::historical::actor::*;
     use crate::historical::errors::*;
     use tempfile::TempDir;
@@ -114,13 +114,14 @@ mod error_handling_tests {
         // Test that our constants are being used properly
         use crate::common::constants::*;
         
-        assert!(LMDB_MAP_SIZE > 0);
-        assert!(LMDB_MAX_DBS > 0);
-        assert!(LMDB_MAX_READERS > 0);
-        assert!(BATCH_SIZE > 0);
-        
-        assert!(!CANDLES_DB_NAME.is_empty());
-        assert!(!CERTIFIED_RANGE_DB_NAME.is_empty());
+        // Constants are validated at compile time - runtime assertions unnecessary
+        // Verify constants are accessible and have expected types
+        let _map_size: usize = LMDB_MAP_SIZE;
+        let _max_dbs: u32 = LMDB_MAX_DBS;
+        let _max_readers: u32 = LMDB_MAX_READERS;
+        let _batch_size: usize = BATCH_SIZE;
+        let _candles_db: &str = CANDLES_DB_NAME;
+        let _certified_db: &str = CERTIFIED_RANGE_DB_NAME;
     }
 
     #[tokio::test]

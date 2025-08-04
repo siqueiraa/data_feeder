@@ -481,6 +481,7 @@ mod tests {
                     price: 115932.40,
                     volume: 264.75,
                     percentage: 100.0,
+                    candle_count: 1,
                 }
             ],
             total_volume: 264.75,
@@ -541,6 +542,7 @@ mod tests {
                     price: 115932.40,
                     volume: 264.75,
                     percentage: 100.0,
+                    candle_count: 1,
                 }
             ],
             total_volume: 264.75,
@@ -600,9 +602,9 @@ mod tests {
         let volume_profile = VolumeProfileData {
             date: "2025-08-01".to_string(),
             price_levels: vec![
-                PriceLevelData { price: 100.0, volume: 500.0, percentage: 50.0 },
-                PriceLevelData { price: 101.0, volume: 300.0, percentage: 30.0 },
-                PriceLevelData { price: 102.0, volume: 200.0, percentage: 20.0 },
+                PriceLevelData { price: 100.0, volume: 500.0, percentage: 50.0, candle_count: 5 },
+                PriceLevelData { price: 101.0, volume: 300.0, percentage: 30.0, candle_count: 3 },
+                PriceLevelData { price: 102.0, volume: 200.0, percentage: 20.0, candle_count: 2 },
             ],
             total_volume: 1000.0,
             vwap: 100.8,

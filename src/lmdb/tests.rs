@@ -362,7 +362,7 @@ async fn test_concurrent_database_initialization() -> Result<(), Box<dyn std::er
     
     // Verify that all data was stored correctly
     let range_msg = LmdbActorMessage::GetDataRange {
-        symbol: symbol,
+        symbol,
         timeframe,
     };
     

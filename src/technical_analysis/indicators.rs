@@ -21,6 +21,6 @@ mod tests {
     #[test]
     fn test_indicators_module_exists() {
         // Placeholder test to ensure module compiles
-        assert!(true);
+        // Module existence validated by successful compilation
     }
 }

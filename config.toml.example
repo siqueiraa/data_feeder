@@ -56,3 +56,38 @@ batch_size = 16384
 linger_ms = 10
 request_timeout_ms = 30000
 delivery_timeout_ms = 120000
+
+[volume_profile]
+# Volume Profile settings - Asset-aware configuration
+enabled = true
+price_increment_mode = "Adaptive"    # "Fixed" or "Adaptive" - Adaptive recommended for multi-asset
+target_price_levels = 500           # Target number of price levels per range (adaptive mode)
+fixed_price_increment = 0.01        # Used when mode is "Fixed"
+min_price_increment = 0.00000001    # Minimum increment for adaptive mode (altcoin precision)
+max_price_increment = 1.0         # Maximum increment for adaptive mode (high-value assets)
+volume_distribution_mode = "WeightedOHLC"          # "UniformOHLC", "ClosingPrice", "WeightedOHLC", "HighLowWeighted"
+value_area_calculation_mode = "Traditional"       # "Traditional", "Greedy"
+calculation_mode = "Volume"                      # "Volume" or "TPO" - Controls POC and value area calculation method
+update_frequency = "EveryCandle"    # "EveryCandle" or "Batched"
+batch_size = 1                      # Number of profiles to batch before storage
+value_area_percentage = 70.0        # Percentage of volume to include in value area (industry standard)
+
+# Volume Profile Calculation Methods:
+# - "Volume": Weight by actual trading volume (default, most common)
+#   POC = price level with highest volume, VA = 70% of total volume
+# - "TPO": Weight by time periods/candle count (traditional Market Profile)
+#   POC = price level with most time periods, VA = 70% of total time periods
+
+# Asset-specific overrides (optional - for fine-tuning specific assets)
+[volume_profile.asset_overrides]
+# High-value assets with fixed increments for better performance
+"BTCUSDT" = { price_increment_mode = "Fixed", fixed_price_increment = 10.0, calculation_mode = "Volume" }   # $10 increments for Bitcoin
+"ETHUSDT" = { price_increment_mode = "Fixed", fixed_price_increment = 1.0, calculation_mode = "Volume" }    # $1 increments for Ethereum
+
+# Mid-value assets
+"SOLUSDT" = { price_increment_mode = "Fixed", fixed_price_increment = 0.1, calculation_mode = "Volume" }    # $0.10 increments for Solana
+"ADAUSDT" = { price_increment_mode = "Fixed", fixed_price_increment = 0.001, calculation_mode = "Volume" }  # $0.001 increments for Cardano
+
+# Micro-cap altcoins with ultra-precise adaptive ranges
+"PEPEUSDT" = { price_increment_mode = "Adaptive", min_price_increment = 0.00000001, max_price_increment = 0.000001, calculation_mode = "TPO" }
+"SHIBUSDT" = { price_increment_mode = "Adaptive", min_price_increment = 0.00000001, max_price_increment = 0.00001, calculation_mode = "TPO" }

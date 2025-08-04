@@ -422,7 +422,7 @@ mod tests {
     async fn test_api_actor_creation() {
         // Create a dummy LmdbActor for testing
         let temp_dir = TempDir::new().unwrap();
-        let lmdb_actor = kameo::spawn(LmdbActor::new(&temp_dir.path().to_path_buf(), 60).unwrap());
+        let lmdb_actor = kameo::spawn(LmdbActor::new(temp_dir.path(), 60).unwrap());
         
         let actor = ApiActor::new(lmdb_actor.clone()).unwrap();
         
@@ -433,7 +433,7 @@ mod tests {
     async fn test_interval_to_seconds() {
         // Create a dummy LmdbActor for testing
         let temp_dir = TempDir::new().unwrap();
-        let lmdb_actor = kameo::spawn(LmdbActor::new(&temp_dir.path().to_path_buf(), 60).unwrap());
+        let lmdb_actor = kameo::spawn(LmdbActor::new(temp_dir.path(), 60).unwrap());
         
         let actor = ApiActor::new(lmdb_actor.clone()).unwrap();
         

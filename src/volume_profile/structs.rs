@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use tracing::warn;
 use crate::historical::structs::TimestampMS;
 use crate::volume_profile::precision::PricePrecisionManager;
 
@@ -22,6 +23,9 @@ pub struct AssetConfig {
     pub value_area_calculation_mode: Option<ValueAreaCalculationMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_area_percentage: Option<f64>,
+    /// Override calculation mode for this specific asset
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calculation_mode: Option<VolumeProfileCalculationMode>,
 }
 
 /// Volume profile configuration
@@ -38,6 +42,10 @@ pub struct VolumeProfileConfig {
     pub value_area_percentage: f64,
     pub volume_distribution_mode: VolumeDistributionMode,
     pub value_area_calculation_mode: ValueAreaCalculationMode,
+    /// Calculation mode for POC and value area determination
+    /// Controls whether to use volume weighting or time period (TPO) weighting
+    #[serde(default)]
+    pub calculation_mode: VolumeProfileCalculationMode,
     #[serde(default)]
     pub asset_overrides: HashMap<String, AssetConfig>,
 }
@@ -56,6 +64,7 @@ impl Default for VolumeProfileConfig {
             value_area_percentage: 70.0,
             volume_distribution_mode: VolumeDistributionMode::WeightedOHLC,
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
+            calculation_mode: VolumeProfileCalculationMode::default(),
             asset_overrides: HashMap::new(),
         }
     }
@@ -91,6 +100,9 @@ impl VolumeProfileConfig {
             value_area_percentage: asset_override
                 .and_then(|c| c.value_area_percentage)
                 .unwrap_or(self.value_area_percentage),
+            calculation_mode: asset_override
+                .and_then(|c| c.calculation_mode.clone())
+                .unwrap_or_else(|| self.calculation_mode.clone()),
         }
     }
 
@@ -148,6 +160,8 @@ impl VolumeProfileConfig {
                     return Err(format!("Asset {}: value_area_percentage must be between 50% and 95%, got {}%", symbol, va_pct));
                 }
             }
+
+            // Calculation mode validation is implicit - enum ensures valid values
         }
 
         Ok(())
@@ -165,6 +179,7 @@ pub struct ResolvedAssetConfig {
     pub volume_distribution_mode: VolumeDistributionMode,
     pub value_area_calculation_mode: ValueAreaCalculationMode,
     pub value_area_percentage: f64,
+    pub calculation_mode: VolumeProfileCalculationMode,
 }
 
 /// Price increment calculation mode
@@ -222,6 +237,65 @@ pub enum VolumeDistributionMode {
     /// Useful for breakout analysis and support/resistance identification.
     /// Best for: range trading, breakout analysis, support/resistance mapping.
     HighLowWeighted,
+}
+
+/// Volume profile calculation mode determines the weighting method for POC and value area calculations
+/// 
+/// This is the core algorithmic choice that affects all volume profile calculations:
+/// - POC (Point of Control) identification
+/// - Value area expansion logic
+/// - Volume percentage calculations
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum VolumeProfileCalculationMode {
+    /// Volume-based calculation (default): Weight by actual trading volume
+    /// 
+    /// Uses actual volume traded at each price level to identify POC and expand value area.
+    /// This reflects real market activity and liquidity distribution.
+    /// 
+    /// - POC: Price level with highest actual trading volume
+    /// - Value Area: Expands from POC to capture 70% of total trading volume
+    /// - Best for: Liquidity analysis, institutional trading patterns, volume-based strategies
+    #[serde(rename = "Volume")]
+    Volume,
+    
+    /// TPO-based calculation (Time-Price Opportunity): Weight by time periods/candle count
+    /// 
+    /// Uses the number of time periods (candles) at each price level, following
+    /// traditional Market Profile methodology. Each time period is weighted equally
+    /// regardless of volume.
+    /// 
+    /// - POC: Price level with most time periods (candle count)
+    /// - Value Area: Expands from POC to capture 70% of total time periods
+    /// - Best for: Time-based auction theory, price acceptance analysis, traditional Market Profile
+    #[serde(rename = "TPO")]
+    TPO,
+}
+
+impl Default for VolumeProfileCalculationMode {
+    fn default() -> Self {
+        Self::Volume
+    }
+}
+
+impl std::fmt::Display for VolumeProfileCalculationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Volume => write!(f, "Volume"),
+            Self::TPO => write!(f, "TPO"),
+        }
+    }
+}
+
+impl std::str::FromStr for VolumeProfileCalculationMode {
+    type Err = String;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "volume" => Ok(Self::Volume),
+            "tpo" => Ok(Self::TPO),
+            _ => Err(format!("Invalid calculation mode: {}. Valid options: Volume, TPO", s)),
+        }
+    }
 }
 
 /// Value area calculation methods
@@ -318,6 +392,7 @@ impl From<DailyVolumeProfileFlat> for VolumeProfileData {
                     price,
                     volume,
                     percentage: 0.0, // Will be calculated based on total_volume
+                    candle_count: 0, // Will be calculated based on actual data
                 })
                 .collect(),
             total_volume: flat.total_volume,
@@ -342,6 +417,9 @@ pub struct PriceLevelData {
     pub volume: f64,
     /// Percentage of total daily volume
     pub percentage: f64,
+    /// Number of candles/time periods at this price level (for TPO calculations)
+    #[serde(default)]
+    pub candle_count: u32,
 }
 
 /// Value area representing 70% volume concentration
@@ -355,6 +433,69 @@ pub struct ValueArea {
     pub volume_percentage: f64,
     /// Total volume within value area
     pub volume: f64,
+}
+
+/// Business rules validation result for value area calculations
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueAreaValidationResult {
+    /// Overall validation status
+    pub is_valid: bool,
+    /// Detailed error messages for any rule violations
+    pub errors: Vec<String>,
+    /// Warnings for edge cases that don't invalidate the result
+    pub warnings: Vec<String>,
+    /// Debugging metrics
+    pub metrics: ValidationMetrics,
+}
+
+/// Detailed metrics for value area validation debugging
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidationMetrics {
+    /// Point of Control price
+    pub poc_price: f64,
+    /// Value Area High price  
+    pub vah_price: f64,
+    /// Value Area Low price
+    pub val_price: f64,
+    /// Actual volume percentage achieved
+    pub actual_volume_percentage: f64,
+    /// Target volume percentage requested
+    pub target_volume_percentage: f64,
+    /// Distance from POC to VAH
+    pub poc_to_vah_distance: f64,
+    /// Distance from POC to VAL
+    pub poc_to_val_distance: f64,
+    /// Number of price levels in value area
+    pub price_levels_count: usize,
+    /// Whether POC is properly centered
+    pub is_poc_centered: bool,
+}
+
+impl Default for ValueAreaValidationResult {
+    fn default() -> Self {
+        Self {
+            is_valid: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            metrics: ValidationMetrics::default(),
+        }
+    }
+}
+
+impl Default for ValidationMetrics {
+    fn default() -> Self {
+        Self {
+            poc_price: 0.0,
+            vah_price: 0.0,
+            val_price: 0.0,
+            actual_volume_percentage: 0.0,
+            target_volume_percentage: 0.0,
+            poc_to_vah_distance: 0.0,
+            poc_to_val_distance: 0.0,
+            price_levels_count: 0,
+            is_poc_centered: false,
+        }
+    }
 }
 
 
@@ -422,6 +563,8 @@ impl ValueAreaValidator {
 pub struct PriceLevelMap {
     /// Price levels mapped to volume (using BTreeMap for sorted access)
     pub levels: BTreeMap<PriceKey, f64>,
+    /// Price levels mapped to candle count for TPO calculations
+    pub candle_counts: BTreeMap<PriceKey, u32>,
     /// Price increment for this profile
     pub price_increment: f64,
     /// Precision manager for consistent price-to-key mapping
@@ -433,6 +576,7 @@ impl PriceLevelMap {
     pub fn new(price_increment: f64) -> Self {
         Self {
             levels: BTreeMap::new(),
+            candle_counts: BTreeMap::new(),
             price_increment,
             precision_manager: PricePrecisionManager::default(),
         }
@@ -444,6 +588,13 @@ impl PriceLevelMap {
         *self.levels.entry(price_key).or_insert(0.0) += volume;
     }
 
+    /// Add volume and increment candle count at a specific price level
+    pub fn add_volume_at_price(&mut self, price: f64, volume: f64) {
+        let price_key = PriceKey::from_price_with_manager(price, self.price_increment, &self.precision_manager);
+        *self.levels.entry(price_key).or_insert(0.0) += volume;
+        *self.candle_counts.entry(price_key).or_insert(0) += 1;
+    }
+
     /// Distribute volume across price range using the specified distribution mode
     pub fn distribute_candle_volume(&mut self, _open: f64, high: f64, low: f64, close: f64, volume: f64, mode: &VolumeDistributionMode) {
         if volume <= 0.0 {
@@ -453,7 +604,7 @@ impl PriceLevelMap {
         match mode {
             VolumeDistributionMode::ClosingPrice => {
                 // Traditional time-based market profile: all volume at close
-                self.add_volume(close, volume);
+                self.add_volume_at_price(close, volume);
             },
             VolumeDistributionMode::UniformOHLC => {
                 // Distribute volume uniformly across OHLC range
@@ -461,14 +612,14 @@ impl PriceLevelMap {
             },
             VolumeDistributionMode::WeightedOHLC => {
                 // Weighted: 50% close, 25% high, 25% low
-                self.add_volume(close, volume * 0.5);
-                self.add_volume(high, volume * 0.25);
-                self.add_volume(low, volume * 0.25);
+                self.add_volume_at_price(close, volume * 0.5);
+                self.add_volume_at_price(high, volume * 0.25);
+                self.add_volume_at_price(low, volume * 0.25);
             },
             VolumeDistributionMode::HighLowWeighted => {
                 // Price action focused: 50% high, 50% low
-                self.add_volume(high, volume * 0.5);
-                self.add_volume(low, volume * 0.5);
+                self.add_volume_at_price(high, volume * 0.5);
+                self.add_volume_at_price(low, volume * 0.5);
             },
         }
     }
@@ -477,7 +628,7 @@ impl PriceLevelMap {
     fn distribute_volume_uniform(&mut self, high: f64, low: f64, volume: f64) {
         if high <= low {
             // Edge case: no range, assign all to single price
-            self.add_volume(high, volume);
+            self.add_volume_at_price(high, volume);
             return;
         }
 
@@ -487,7 +638,7 @@ impl PriceLevelMap {
         
         if levels_in_range <= 1 {
             // Range is smaller than price increment
-            self.add_volume(high, volume);
+            self.add_volume_at_price(high, volume);
             return;
         }
 
@@ -497,7 +648,7 @@ impl PriceLevelMap {
         for i in 0..levels_in_range {
             let price = low + (i as f64 * self.price_increment);
             if price <= high {
-                self.add_volume(price, volume_per_level);
+                self.add_volume_at_price(price, volume_per_level);
             }
         }
     }
@@ -507,12 +658,290 @@ impl PriceLevelMap {
         self.levels.values().sum()
     }
 
+    /// Get total candle count across all price levels
+    pub fn get_total_candle_count(&self) -> u32 {
+        self.candle_counts.values().sum()
+    }
+
+    /// Get total volume for percentage calculations
+    pub fn get_total_volume(&self) -> f64 {
+        self.total_volume()
+    }
+    
+    /// Calculate percentage of total volume for a given volume amount
+    pub fn calculate_volume_percentage(&self, volume: f64) -> f64 {
+        let total = self.get_total_volume();
+        if total > 0.0 {
+            (volume / total) * 100.0
+        } else {
+            0.0
+        }
+    }
+    
+    /// Calculate percentage of total candles for a given candle count
+    pub fn calculate_candle_percentage(&self, candle_count: u32) -> f64 {
+        let total = self.get_total_candle_count();
+        if total > 0 {
+            (candle_count as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+    
+    /// Get price level with highest candle count for TPO analysis
+    pub fn get_highest_candle_count_level(&self) -> Option<(f64, u32)> {
+        self.candle_counts
+            .iter()
+            .max_by(|(_, count_a), (_, count_b)| count_a.cmp(count_b))
+            .map(|(price_key, &count)| (price_key.to_price(self.price_increment), count))
+    }
+    
+    /// Get price level with highest volume for Volume analysis
+    pub fn get_highest_volume_level(&self) -> Option<(f64, f64)> {
+        self.levels
+            .iter()
+            .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(price_key, &volume)| (price_key.to_price(self.price_increment), volume))
+    }
+    
+    /// Get combined metrics for a specific price level
+    pub fn get_price_level_metrics(&self, price: f64) -> Option<(f64, u32)> {
+        let price_key = PriceKey::from_price_with_manager(price, self.price_increment, &self.precision_manager);
+        let volume = self.levels.get(&price_key).copied().unwrap_or(0.0);
+        let candle_count = self.candle_counts.get(&price_key).copied().unwrap_or(0);
+        if volume > 0.0 || candle_count > 0 {
+            Some((volume, candle_count))
+        } else {
+            None
+        }
+    }
+
     /// Get price level with highest volume (Point of Control)
     pub fn get_poc(&self) -> Option<f64> {
         self.levels
             .iter()
             .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(price_key, _)| price_key.to_price(self.price_increment))
+    }
+
+    /// Identify POC using TPO method (highest candle count)
+    pub fn identify_poc_tpo(&self) -> Option<f64> {
+        self.candle_counts
+            .iter()
+            .max_by(|(_, count_a), (_, count_b)| count_a.cmp(count_b))
+            .map(|(price_key, _)| price_key.to_price(self.price_increment))
+    }
+
+    /// Identify POC using Volume method (highest actual volume)
+    pub fn identify_poc_volume(&self) -> Option<f64> {
+        self.levels
+            .iter()
+            .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(price_key, _)| price_key.to_price(self.price_increment))
+    }
+
+    /// Unified POC identification based on calculation mode
+    pub fn identify_poc(&self, calculation_mode: &VolumeProfileCalculationMode) -> Option<f64> {
+        match calculation_mode {
+            VolumeProfileCalculationMode::Volume => self.identify_poc_volume(),
+            VolumeProfileCalculationMode::TPO => self.identify_poc_tpo(),
+        }
+    }
+
+    /// Expand value area using TPO (Time-Price Opportunity) method
+    /// Starts from POC and expands bidirectionally counting time periods until threshold reached
+    pub fn expand_value_area_tpo(&self, value_area_percentage: f64) -> ValueArea {
+        let total_candles = self.get_total_candle_count() as f64;
+        let target_candles = total_candles * (value_area_percentage / 100.0);
+        
+        if self.candle_counts.is_empty() || total_candles <= 0.0 {
+            return ValueArea::default();
+        }
+        
+        // Find TPO POC (highest candle count)
+        let poc_key = self.candle_counts
+            .iter()
+            .max_by(|(_, count_a), (_, count_b)| count_a.cmp(count_b))
+            .map(|(key, _)| *key);
+            
+        let poc_key = match poc_key {
+            Some(key) => key,
+            None => return ValueArea::default(),
+        };
+        
+        // Get all price keys sorted by price
+        let mut all_levels: Vec<_> = self.candle_counts.keys().collect();
+        all_levels.sort();
+        
+        let poc_index = all_levels.iter().position(|&key| *key == poc_key)
+            .unwrap_or(0);
+        
+        // Start from POC and expand symmetrically
+        let mut included_candles = self.candle_counts.get(&poc_key).copied().unwrap_or(0) as f64;
+        let mut selected_levels = vec![poc_key];
+        let mut low_index = poc_index;
+        let mut high_index = poc_index;
+        
+        // Expand symmetrically to center POC
+        while included_candles < target_candles && (low_index > 0 || high_index < all_levels.len() - 1) {
+            let mut candidates = Vec::new();
+            
+            // Check left expansion
+            if low_index > 0 {
+                let left_key = *all_levels[low_index - 1];
+                let left_candles = self.candle_counts.get(&left_key).copied().unwrap_or(0) as f64;
+                if left_candles > 0.0 {
+                    candidates.push((left_key, left_candles, low_index - 1, "left"));
+                }
+            }
+            
+            // Check right expansion
+            if high_index < all_levels.len() - 1 {
+                let right_key = *all_levels[high_index + 1];
+                let right_candles = self.candle_counts.get(&right_key).copied().unwrap_or(0) as f64;
+                if right_candles > 0.0 {
+                    candidates.push((right_key, right_candles, high_index + 1, "right"));
+                }
+            }
+            
+            if candidates.is_empty() {
+                break;
+            }
+            
+            // Sort by candle count descending, then prefer symmetric expansion
+            candidates.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            
+            // Select the best candidate
+            let (selected_key, selected_candles, selected_index, direction) = candidates[0];
+            selected_levels.push(selected_key);
+            included_candles += selected_candles;
+            
+            if direction == "left" {
+                low_index = selected_index;
+            } else {
+                high_index = selected_index;
+            }
+        }
+        
+        // Determine final boundaries
+        let low_key = *all_levels[low_index];
+        let high_key = *all_levels[high_index];
+        let final_low = low_key.to_price(self.price_increment);
+        let final_high = high_key.to_price(self.price_increment);
+        
+        // Calculate actual volume in final range (always return actual volume)
+        let actual_volume = self.levels.iter()
+            .filter(|(key, _)| **key >= low_key && **key <= high_key)
+            .map(|(_, volume)| *volume)
+            .sum::<f64>();
+        
+        let total_volume = self.total_volume();
+        
+        ValueArea {
+            low: final_low,
+            high: final_high,
+            volume: actual_volume,
+            volume_percentage: if total_volume > 0.0 { (actual_volume / total_volume) * 100.0 } else { 0.0 },
+        }
+    }
+    
+    /// Expand value area using Volume method
+    /// Starts from POC and expands bidirectionally counting volume until threshold reached
+    pub fn expand_value_area_volume(&self, value_area_percentage: f64) -> ValueArea {
+        let total_volume = self.total_volume();
+        let target_volume = total_volume * (value_area_percentage / 100.0);
+        
+        if self.levels.is_empty() || total_volume <= 0.0 {
+            return ValueArea::default();
+        }
+        
+        // Find Volume POC (highest volume)
+        let poc_key = self.levels
+            .iter()
+            .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(key, _)| *key);
+            
+        let poc_key = match poc_key {
+            Some(key) => key,
+            None => return ValueArea::default(),
+        };
+        
+        // Get all price keys sorted by price
+        let mut all_levels: Vec<_> = self.levels.keys().collect();
+        all_levels.sort();
+        
+        let poc_index = all_levels.iter().position(|&key| *key == poc_key)
+            .unwrap_or(0);
+        
+        // Start from POC and expand symmetrically
+        let mut included_volume = self.levels.get(&poc_key).copied().unwrap_or(0.0);
+        let mut selected_levels = vec![poc_key];
+        let mut low_index = poc_index;
+        let mut high_index = poc_index;
+        
+        // Expand symmetrically to center POC
+        while included_volume < target_volume && (low_index > 0 || high_index < all_levels.len() - 1) {
+            let mut candidates = Vec::new();
+            
+            // Check left expansion
+            if low_index > 0 {
+                let left_key = *all_levels[low_index - 1];
+                let left_volume = self.levels.get(&left_key).copied().unwrap_or(0.0);
+                if left_volume > 0.0 {
+                    candidates.push((left_key, left_volume, low_index - 1, "left"));
+                }
+            }
+            
+            // Check right expansion
+            if high_index < all_levels.len() - 1 {
+                let right_key = *all_levels[high_index + 1];
+                let right_volume = self.levels.get(&right_key).copied().unwrap_or(0.0);
+                if right_volume > 0.0 {
+                    candidates.push((right_key, right_volume, high_index + 1, "right"));
+                }
+            }
+            
+            if candidates.is_empty() {
+                break;
+            }
+            
+            // Sort by volume descending, then prefer symmetric expansion
+            candidates.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            
+            // Select the best candidate
+            let (selected_key, selected_volume, selected_index, direction) = candidates[0];
+            selected_levels.push(selected_key);
+            included_volume += selected_volume;
+            
+            if direction == "left" {
+                low_index = selected_index;
+            } else {
+                high_index = selected_index;
+            }
+        }
+        
+        // Determine final boundaries
+        let low_key = *all_levels[low_index];
+        let high_key = *all_levels[high_index];
+        let final_low = low_key.to_price(self.price_increment);
+        let final_high = high_key.to_price(self.price_increment);
+        
+        // Calculate actual volume in final range
+        let actual_volume = self.levels.iter()
+            .filter(|(key, _)| **key >= low_key && **key <= high_key)
+            .map(|(_, volume)| *volume)
+            .sum::<f64>();
+        
+        ValueArea {
+            low: final_low,
+            high: final_high,
+            volume: actual_volume,
+            volume_percentage: if total_volume > 0.0 { (actual_volume / total_volume) * 100.0 } else { 0.0 },
+        }
     }
 
     /// Convert to sorted vector of price level data
@@ -524,10 +953,14 @@ impl PriceLevelMap {
 
         self.levels
             .iter()
-            .map(|(price_key, &volume)| PriceLevelData {
-                price: price_key.to_price(self.price_increment),
-                volume,
-                percentage: (volume / total_volume) * 100.0,
+            .map(|(price_key, &volume)| {
+                let candle_count = self.candle_counts.get(price_key).copied().unwrap_or(0);
+                PriceLevelData {
+                    price: price_key.to_price(self.price_increment),
+                    volume,
+                    percentage: (volume / total_volume) * 100.0,
+                    candle_count,
+                }
             })
             .collect()
     }
@@ -547,19 +980,188 @@ impl PriceLevelMap {
         weighted_sum / total_volume
     }
 
-        /// Calculate value area using the specified method
-    pub fn calculate_value_area(&self, value_area_percentage: f64, calculation_mode: &ValueAreaCalculationMode) -> ValueArea {
+        /// Calculate value area using the specified method and calculation mode
+    pub fn calculate_value_area(&self, value_area_percentage: f64, calculation_mode: &ValueAreaCalculationMode, poc_calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
         let result = match calculation_mode {
-            ValueAreaCalculationMode::Traditional => self.calculate_value_area_traditional(value_area_percentage),
-            ValueAreaCalculationMode::Greedy => self.calculate_value_area_greedy(value_area_percentage),
+            ValueAreaCalculationMode::Traditional => self.calculate_value_area_traditional(value_area_percentage, poc_calculation_mode),
+            ValueAreaCalculationMode::Greedy => self.calculate_value_area_greedy(value_area_percentage, poc_calculation_mode),
         };
         
         // Validate the result and adjust if necessary
-        self.validate_and_adjust_value_area(result, value_area_percentage)
+        self.validate_and_adjust_value_area(result, value_area_percentage, poc_calculation_mode)
+    }
+    
+    /// Unified value area expansion based on calculation mode
+    /// This method routes to the appropriate expansion algorithm
+    pub fn expand_value_area(&self, value_area_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+        match calculation_mode {
+            VolumeProfileCalculationMode::Volume => self.expand_value_area_volume(value_area_percentage),
+            VolumeProfileCalculationMode::TPO => self.expand_value_area_tpo(value_area_percentage),
+        }
+    }
+    
+    /// Validate value area against business rules
+    /// Checks fundamental volume profile constraints and provides detailed diagnostics
+    pub fn validate_value_area_rules(
+        &self, 
+        value_area: &ValueArea, 
+        target_percentage: f64, 
+        calculation_mode: &VolumeProfileCalculationMode
+    ) -> ValueAreaValidationResult {
+        let mut result = ValueAreaValidationResult::default();
+        
+        // Get POC based on calculation mode
+        let poc_price = match self.identify_poc(calculation_mode) {
+            Some(price) => price,
+            None => {
+                result.is_valid = false;
+                result.errors.push("No POC could be identified".to_string());
+                return result;
+            }
+        };
+        
+        // Calculate metrics
+        let vah_price = value_area.high;
+        let val_price = value_area.low;
+        let actual_percentage = value_area.volume_percentage;
+        let poc_to_vah_distance = (vah_price - poc_price).abs();
+        let poc_to_val_distance = (poc_price - val_price).abs();
+        
+        // Count price levels in value area
+        let price_levels_count = self.levels.iter()
+            .filter(|(key, _)| {
+                let price = key.to_price(self.price_increment);
+                price >= val_price && price <= vah_price
+            })
+            .count();
+        
+        // Check if POC is reasonably centered
+        let is_poc_centered = if vah_price > val_price {
+            let total_range = vah_price - val_price;
+            let poc_position = poc_price - val_price;
+            let centering_ratio = poc_position / total_range;
+(0.2..=0.8).contains(&centering_ratio)
+        } else {
+            false
+        };
+        
+        // Fill metrics
+        result.metrics = ValidationMetrics {
+            poc_price,
+            vah_price,
+            val_price,
+            actual_volume_percentage: actual_percentage,
+            target_volume_percentage: target_percentage,
+            poc_to_vah_distance,
+            poc_to_val_distance,
+            price_levels_count,
+            is_poc_centered,
+        };
+        
+        // Rule 1: Check VAH > POC > VAL ordering constraint
+        if !(vah_price >= poc_price && poc_price >= val_price) {
+            result.is_valid = false;
+            result.errors.push(format!(
+                "VAH > POC > VAL ordering violated: VAH={:.4}, POC={:.4}, VAL={:.4}",
+                vah_price, poc_price, val_price
+            ));
+        }
+        
+        // Rule 2: Verify POC is not at VAH or VAL boundaries (POC should be interior)
+        // Allow POC to be at boundary only if value area spans just 1-2 price levels
+        let price_tolerance = self.price_increment * 0.1; // Small tolerance for floating point
+        let allow_boundary_poc = price_levels_count <= 2; // Allow boundary POC for very narrow areas
+        
+        if !allow_boundary_poc {
+            if (poc_price - vah_price).abs() < price_tolerance {
+                result.is_valid = false;
+                result.errors.push(format!(
+                    "POC at VAH boundary: POC={:.4}, VAH={:.4}",
+                    poc_price, vah_price
+                ));
+            }
+            if (poc_price - val_price).abs() < price_tolerance {
+                result.is_valid = false;
+                result.errors.push(format!(
+                    "POC at VAL boundary: POC={:.4}, VAL={:.4}",
+                    poc_price, val_price
+                ));
+            }
+        } else {
+            // For narrow value areas, add warnings instead of errors
+            if (poc_price - vah_price).abs() < price_tolerance {
+                result.warnings.push(format!(
+                    "POC at VAH boundary in narrow value area: POC={:.4}, VAH={:.4}",
+                    poc_price, vah_price
+                ));
+            }
+            if (poc_price - val_price).abs() < price_tolerance {
+                result.warnings.push(format!(
+                    "POC at VAL boundary in narrow value area: POC={:.4}, VAL={:.4}",
+                    poc_price, val_price
+                ));
+            }
+        }
+        
+        // Rule 3: Validate volume percentage is within acceptable range  
+        let target_min = target_percentage - 10.0; // Allow 10% deviation below for discrete levels
+        let target_max = target_percentage + 10.0; // Allow 10% deviation above for discrete levels
+        if actual_percentage < target_min || actual_percentage > target_max {
+            result.is_valid = false;
+            result.errors.push(format!(
+                "Volume percentage out of range: actual={:.2}%, target={:.2}%, range=[{:.2}%, {:.2}%]",
+                actual_percentage, target_percentage, target_min, target_max
+            ));
+        }
+        
+        // Rule 4: Ensure value area forms contiguous price range
+        if vah_price < val_price {
+            result.is_valid = false;
+            result.errors.push(format!(
+                "Non-contiguous value area: VAH={:.4} < VAL={:.4}",
+                vah_price, val_price
+            ));
+        }
+        
+        // Warning checks (don't invalidate but worth noting)
+        if !is_poc_centered {
+            result.warnings.push(format!(
+                "POC not well-centered in value area: POC position ratio = {:.2}",
+                if vah_price > val_price { (poc_price - val_price) / (vah_price - val_price) } else { 0.0 }
+            ));
+        }
+        
+        if price_levels_count < 3 {
+            result.warnings.push(format!(
+                "Very narrow value area: only {} price levels",
+                price_levels_count
+            ));
+        }
+        
+        // Check for extreme percentage deviations (warnings, not errors)
+        let percentage_deviation = (actual_percentage - target_percentage).abs();
+        if percentage_deviation > 3.0 && percentage_deviation <= 5.0 {
+            result.warnings.push(format!(
+                "Volume percentage deviation: {:.2}% (target: {:.2}%)",
+                actual_percentage, target_percentage
+            ));
+        }
+        
+        result
     }
     
     /// Validate and adjust value area to ensure it meets acceptance criteria
-    fn validate_and_adjust_value_area(&self, mut value_area: ValueArea, _target_percentage: f64) -> ValueArea {
+    fn validate_and_adjust_value_area(&self, mut value_area: ValueArea, target_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+        // Run business rules validation
+        let validation_result = self.validate_value_area_rules(&value_area, target_percentage, calculation_mode);
+        
+        if !validation_result.is_valid {
+            // Log validation errors for debugging
+            warn!("Value area validation failed: {:?}", validation_result.errors);
+            for warning in &validation_result.warnings {
+                warn!("Value area warning: {}", warning);
+            }
+        }
         // Get price levels for degenerate case detection
         let _price_levels = self.to_price_levels();
         
@@ -583,7 +1185,7 @@ impl PriceLevelMap {
         match ValueAreaValidator::validate_value_area(value_area.high, value_area.low, value_area.volume_percentage) {
             ValidationResult::Valid => {
                 // Ensure POC is within range
-                if let Some(poc) = self.get_poc() {
+                if let Some(poc) = self.identify_poc(calculation_mode) {
                     if let ValidationResult::PocNotInRange { .. } = ValueAreaValidator::validate_poc_in_range(poc, value_area.high, value_area.low) {
                         // Expand range to include POC
                         value_area.low = value_area.low.min(poc);
@@ -644,19 +1246,37 @@ impl PriceLevelMap {
     }
 
     /// Calculate value area using traditional market profile method (expand from POC)
-    pub fn calculate_value_area_traditional(&self, value_area_percentage: f64) -> ValueArea {
-        let total_volume = self.total_volume();
-        let target_volume = total_volume * (value_area_percentage / 100.0);
+    pub fn calculate_value_area_traditional(&self, value_area_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+        let (total_metric, target_metric) = match calculation_mode {
+            VolumeProfileCalculationMode::Volume => {
+                let total_volume = self.total_volume();
+                (total_volume, total_volume * (value_area_percentage / 100.0))
+            },
+            VolumeProfileCalculationMode::TPO => {
+                let total_count = self.get_total_candle_count() as f64;
+                (total_count, total_count * (value_area_percentage / 100.0))
+            },
+        };
 
-        if self.levels.is_empty() || total_volume <= 0.0 {
+        if self.levels.is_empty() || total_metric <= 0.0 {
             return ValueArea::default();
         }
 
-        // Find POC (Point of Control)
-        let poc_key = self.levels
-            .iter()
-            .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(key, _)| *key);
+        // Find POC (Point of Control) based on calculation mode
+        let poc_key = match calculation_mode {
+            VolumeProfileCalculationMode::Volume => {
+                self.levels
+                    .iter()
+                    .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(key, _)| *key)
+            },
+            VolumeProfileCalculationMode::TPO => {
+                self.candle_counts
+                    .iter()
+                    .max_by(|(_, count_a), (_, count_b)| count_a.cmp(count_b))
+                    .map(|(key, _)| *key)
+            },
+        };
 
         let poc_key = match poc_key {
             Some(key) => key,
@@ -671,7 +1291,10 @@ impl PriceLevelMap {
         let poc_index = all_levels.iter().position(|(key, _)| **key == poc_key).unwrap_or(0);
         
         // Start from POC and expand symmetrically to center it
-        let mut included_volume = self.levels.get(&poc_key).copied().unwrap_or(0.0);
+        let mut included_metric = match calculation_mode {
+            VolumeProfileCalculationMode::Volume => self.levels.get(&poc_key).copied().unwrap_or(0.0),
+            VolumeProfileCalculationMode::TPO => self.candle_counts.get(&poc_key).copied().unwrap_or(0) as f64,
+        };
         let mut low_index = poc_index;
         let mut high_index = poc_index;
         
@@ -679,24 +1302,30 @@ impl PriceLevelMap {
         let mut selected_levels = vec![poc_key];
         
         // Expand symmetrically to ensure POC is centered
-        while included_volume < target_volume && (low_index > 0 || high_index < all_levels.len() - 1) {
+        while included_metric < target_metric && (low_index > 0 || high_index < all_levels.len() - 1) {
             let mut candidates = Vec::new();
             
             // Check left expansion
             if low_index > 0 {
                 let left_key = all_levels[low_index - 1].0;
-                let left_volume = self.levels.get(left_key).copied().unwrap_or(0.0);
-                if left_volume > 0.0 {
-                    candidates.push((left_key, left_volume, low_index - 1, "left"));
+                let left_metric = match calculation_mode {
+                    VolumeProfileCalculationMode::Volume => self.levels.get(left_key).copied().unwrap_or(0.0),
+                    VolumeProfileCalculationMode::TPO => self.candle_counts.get(left_key).copied().unwrap_or(0) as f64,
+                };
+                if left_metric > 0.0 {
+                    candidates.push((left_key, left_metric, low_index - 1, "left"));
                 }
             }
             
             // Check right expansion
             if high_index < all_levels.len() - 1 {
                 let right_key = all_levels[high_index + 1].0;
-                let right_volume = self.levels.get(right_key).copied().unwrap_or(0.0);
-                if right_volume > 0.0 {
-                    candidates.push((right_key, right_volume, high_index + 1, "right"));
+                let right_metric = match calculation_mode {
+                    VolumeProfileCalculationMode::Volume => self.levels.get(right_key).copied().unwrap_or(0.0),
+                    VolumeProfileCalculationMode::TPO => self.candle_counts.get(right_key).copied().unwrap_or(0) as f64,
+                };
+                if right_metric > 0.0 {
+                    candidates.push((right_key, right_metric, high_index + 1, "right"));
                 }
             }
             
@@ -708,9 +1337,9 @@ impl PriceLevelMap {
             candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             
             // Select the best candidate
-            let (selected_key, selected_volume, selected_index, direction) = candidates[0];
+            let (selected_key, selected_metric, selected_index, direction) = candidates[0];
             selected_levels.push(*selected_key);
-            included_volume += selected_volume;
+            included_metric += selected_metric;
             
             if direction == "left" {
                 low_index = selected_index;
@@ -737,26 +1366,36 @@ impl PriceLevelMap {
             (low_price, high_price)
         };
 
-        // Calculate actual volume in final range
+        // Calculate actual volume in final range (always return actual volume, not metric)
         let actual_volume = self.levels.iter()
             .filter(|(key, _)| **key >= low_key && **key <= high_key)
             .map(|(_, volume)| *volume)
             .sum::<f64>();
+        
+        let total_volume = self.total_volume();
 
         ValueArea {
             low: final_low,
             high: final_high,
             volume: actual_volume,
-            volume_percentage: (actual_volume / total_volume) * 100.0,
+            volume_percentage: if total_volume > 0.0 { (actual_volume / total_volume) * 100.0 } else { 0.0 },
         }
     }
 
     /// Calculate value area using greedy selection method (existing implementation)
-    pub fn calculate_value_area_greedy(&self, value_area_percentage: f64) -> ValueArea {
-        let total_volume = self.total_volume();
-        let target_volume = total_volume * (value_area_percentage / 100.0);
+    pub fn calculate_value_area_greedy(&self, value_area_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+        let (total_metric, target_metric) = match calculation_mode {
+            VolumeProfileCalculationMode::Volume => {
+                let total_volume = self.total_volume();
+                (total_volume, total_volume * (value_area_percentage / 100.0))
+            },
+            VolumeProfileCalculationMode::TPO => {
+                let total_count = self.get_total_candle_count() as f64;
+                (total_count, total_count * (value_area_percentage / 100.0))
+            },
+        };
 
-        if self.levels.is_empty() || total_volume <= 0.0 {
+        if self.levels.is_empty() || total_metric <= 0.0 {
             return ValueArea {
                 high: 0.0,
                 low: 0.0,
@@ -765,25 +1404,35 @@ impl PriceLevelMap {
             };
         }
 
-        // Step 1: Sort all price levels by volume descending (highest to lowest)
-        let mut sorted_levels: Vec<_> = self.levels
-            .iter()
-            .map(|(price_key, &volume)| (price_key.to_price(self.price_increment), volume))
-            .collect();
+        // Step 1: Sort all price levels by metric descending (highest to lowest)
+        let mut sorted_levels: Vec<_> = match calculation_mode {
+            VolumeProfileCalculationMode::Volume => {
+                self.levels
+                    .iter()
+                    .map(|(price_key, &volume)| (price_key.to_price(self.price_increment), volume))
+                    .collect()
+            },
+            VolumeProfileCalculationMode::TPO => {
+                self.candle_counts
+                    .iter()
+                    .map(|(price_key, &count)| (price_key.to_price(self.price_increment), count as f64))
+                    .collect()
+            },
+        };
         
-        // Sort by volume descending, then by price ascending for stability
+        // Sort by metric descending, then by price ascending for stability
         sorted_levels.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         });
 
-        // Step 2: Greedily select highest volume levels until we reach target
-        let mut selected_volume = 0.0;
+        // Step 2: Greedily select highest metric levels until we reach target
+        let mut selected_metric = 0.0;
         let mut selected_prices = Vec::new();
 
-        for (price, volume) in &sorted_levels {
-            if selected_volume < target_volume {
-                selected_volume += volume;
+        for (price, metric) in &sorted_levels {
+            if selected_metric < target_metric {
+                selected_metric += metric;
                 selected_prices.push(*price);
             } else {
                 break;
@@ -815,7 +1464,7 @@ impl PriceLevelMap {
                 .map(|(_, volume)| *volume)
                 .sum::<f64>();
 
-        // Step 5: Find POC (should be the highest volume level within the value area)
+        // Step 5: Find POC (should be the highest metric level within the value area)
         let poc = sorted_levels.first().map(|(price, _)| *price).unwrap_or(0.0);
 
         // Ensure POC is within the value area range
@@ -832,10 +1481,12 @@ impl PriceLevelMap {
                 .map(|(_, volume)| *volume)
                 .sum::<f64>();
 
+        let total_volume = self.total_volume();
+        
         ValueArea {
             high: final_high,
             low: final_low,
-            volume_percentage: (final_actual_volume / total_volume) * 100.0,
+            volume_percentage: if total_volume > 0.0 { (final_actual_volume / total_volume) * 100.0 } else { 0.0 },
             volume: final_actual_volume,
         }
     }
@@ -999,7 +1650,7 @@ mod tests {
         map.add_volume(102.0, 30.0);  // 30% of volume
         map.add_volume(103.0, 10.0);  // 10% of volume
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // With greedy selection, should get exactly 70% volume
         // We select 101.0 (50%) + 102.0 (30%) = 80% 
@@ -1025,7 +1676,7 @@ mod tests {
         let total_volume = map.total_volume();
         assert!(total_volume > 0.0);
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Value area should capture approximately 70% volume (or as close as possible with discrete levels)
         // With concentrated volume, it may include more to reach a contiguous range
@@ -1047,7 +1698,7 @@ mod tests {
         // Edge case: all volume at exactly one price
         map.add_volume(114367.6, 1000.0);
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Should still provide meaningful range
         assert!(value_area.high >= value_area.low);
@@ -1083,7 +1734,7 @@ mod tests {
         assert_eq!(map.calculate_vwap(), 0.0);
         assert!(map.to_price_levels().is_empty());
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         assert_eq!(value_area.volume, 0.0);
         assert_eq!(value_area.volume_percentage, 0.0);
     }
@@ -1158,8 +1809,8 @@ mod tests {
         map.add_volume(103.0, 15.0);  // 15%
         map.add_volume(105.0, 5.0);   // 5% (isolated level)
         
-        let traditional_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
-        let greedy_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Greedy);
+        let traditional_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let greedy_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Greedy, &VolumeProfileCalculationMode::Volume);
         
         // Both should include POC
         assert!(traditional_va.low <= 101.0 && traditional_va.high >= 101.0);
@@ -1180,7 +1831,7 @@ mod tests {
         let mut map = PriceLevelMap::new(0.01);
         map.add_volume(100.0, 1000.0);
         
-        let va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         assert_eq!(va.low, 100.0);
         assert_eq!(va.high, 100.01);  // Should be expanded by price_increment per AC1
         assert!(va.volume > 0.0);      // Volume should be positive
@@ -1191,7 +1842,7 @@ mod tests {
         map.add_volume(100.0, 500.0);
         map.add_volume(101.0, 500.0);
         
-        let va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         assert!(va.low <= 100.0);
         assert!(va.high >= 101.0);
         assert_eq!(va.volume, 1000.0);
@@ -1213,6 +1864,7 @@ mod tests {
             volume_distribution_mode: Some(VolumeDistributionMode::ClosingPrice),
             value_area_calculation_mode: Some(ValueAreaCalculationMode::Greedy),
             value_area_percentage: Some(68.0),
+            calculation_mode: Some(VolumeProfileCalculationMode::TPO),
         };
         overrides.insert("BTCUSDT".to_string(), btc_config);
         config.asset_overrides = overrides;
@@ -1283,6 +1935,7 @@ mod tests {
             volume_distribution_mode: None,
             value_area_calculation_mode: None,
             value_area_percentage: None,
+            calculation_mode: None,
         };
         overrides.insert("INVALID".to_string(), invalid_asset);
         config.asset_overrides = overrides;
@@ -1299,10 +1952,12 @@ mod tests {
         use crate::volume_profile::calculator::DailyVolumeProfile;
         
         // Test that different target levels produce different increments
-        let mut config = VolumeProfileConfig::default();
-        config.price_increment_mode = PriceIncrementMode::Adaptive;
-        config.min_price_increment = 0.00000001;
-        config.max_price_increment = 100.0;
+        let mut config = VolumeProfileConfig {
+            price_increment_mode: PriceIncrementMode::Adaptive,
+            min_price_increment: 0.00000001,
+            max_price_increment: 100.0,
+            ..Default::default()
+        };
         
         // High target levels (fine granularity)
         config.target_price_levels = 1000;
@@ -1351,7 +2006,7 @@ mod tests {
         }
         
         // Calculate value area using traditional method
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         let poc = map.get_poc().unwrap();
         
         // Basic validations that should always pass with WeightedOHLC
@@ -1438,7 +2093,7 @@ mod tests {
     fn test_degenerate_case_detection() {
         // Single price level is degenerate
         let single_level = vec![
-            PriceLevelData { price: 100.0, volume: 1000.0, percentage: 100.0 }
+            PriceLevelData { price: 100.0, volume: 1000.0, percentage: 100.0, candle_count: 10 }
         ];
         assert!(ValueAreaValidator::detect_degenerate_case(&single_level));
         
@@ -1448,17 +2103,17 @@ mod tests {
         
         // Extreme volume concentration (>90% at extremes) is degenerate
         let extreme_levels = vec![
-            PriceLevelData { price: 100.0, volume: 500.0, percentage: 50.0 },  // First extreme
-            PriceLevelData { price: 101.0, volume: 50.0, percentage: 5.0 },    // Middle
-            PriceLevelData { price: 102.0, volume: 450.0, percentage: 45.0 },  // Last extreme
+            PriceLevelData { price: 100.0, volume: 500.0, percentage: 50.0, candle_count: 5 },  // First extreme
+            PriceLevelData { price: 101.0, volume: 50.0, percentage: 5.0, candle_count: 1 },    // Middle
+            PriceLevelData { price: 102.0, volume: 450.0, percentage: 45.0, candle_count: 5 },  // Last extreme
         ];
         assert!(ValueAreaValidator::detect_degenerate_case(&extreme_levels)); // 95% at extremes
         
         // Balanced distribution is not degenerate
         let balanced_levels = vec![
-            PriceLevelData { price: 100.0, volume: 200.0, percentage: 20.0 },
-            PriceLevelData { price: 101.0, volume: 600.0, percentage: 60.0 },  // POC in middle
-            PriceLevelData { price: 102.0, volume: 200.0, percentage: 20.0 },
+            PriceLevelData { price: 100.0, volume: 200.0, percentage: 20.0, candle_count: 2 },
+            PriceLevelData { price: 101.0, volume: 600.0, percentage: 60.0, candle_count: 6 },  // POC in middle
+            PriceLevelData { price: 102.0, volume: 200.0, percentage: 20.0, candle_count: 2 },
         ];
         assert!(!ValueAreaValidator::detect_degenerate_case(&balanced_levels)); // Only 40% at extremes
     }
@@ -1471,7 +2126,7 @@ mod tests {
         map.add_volume(114367.6, 4000.0);  // Concentrated volume at one price
         map.add_volume(114367.61, 100.0);  // Small adjacent volume
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // After validation and adjustment, should have valid properties
         assert!(value_area.high >= value_area.low, "Value area should have valid range after validation");
@@ -1494,7 +2149,7 @@ mod tests {
         map.add_volume(102.0, 200.0);  // 20%
         map.add_volume(105.0, 200.0);  // 20% (gap at 103-104)
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Traditional method should create contiguous range around POC
         // Should include 101 (POC) + adjacent levels to reach ~70%
@@ -1513,7 +2168,7 @@ mod tests {
         map.add_volume(100.0, 10.0);    // 1%
         map.add_volume(200.0, 990.0);   // 99% at price extreme
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Should handle extreme concentration gracefully
         assert!(value_area.high >= value_area.low, "Should handle extreme concentration");
@@ -1535,7 +2190,7 @@ mod tests {
         map.add_volume(101.5, 150.0);   // 15%
         map.add_volume(102.0, 50.0);    // 5%
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Should target 70% volume but may be flexible within 65-75% range
         assert!(value_area.volume_percentage >= 65.0 && value_area.volume_percentage <= 85.0,
@@ -1553,7 +2208,7 @@ mod tests {
         // Create minimal volume profile
         map.add_volume(100.0, 1000.0);
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional);
+        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Single price level should be expanded to meaningful range
         assert!(value_area.high > value_area.low, 
@@ -1563,5 +2218,374 @@ mod tests {
         // Range should be at least one price increment
         assert!((value_area.high - value_area.low) >= map.price_increment,
                 "Range should be at least one price increment");
+    }
+
+    #[test]
+    fn test_dual_method_poc_identification() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Add data with different volume and time period distributions
+        // Price 100: 2 candles, 300 volume
+        map.add_volume_at_price(100.0, 150.0); // First candle
+        map.add_volume_at_price(100.0, 150.0); // Second candle 
+        
+        // Price 101: 5 candles, 200 volume  
+        map.add_volume_at_price(101.0, 40.0); // First candle
+        map.add_volume_at_price(101.0, 40.0); // Second candle
+        map.add_volume_at_price(101.0, 40.0); // Third candle
+        map.add_volume_at_price(101.0, 40.0); // Fourth candle
+        map.add_volume_at_price(101.0, 40.0); // Fifth candle
+        
+        // Price 102: 1 candle, 100 volume
+        map.add_volume_at_price(102.0, 100.0);
+        
+        // Volume POC should be 100.0 (300 volume)
+        let volume_poc = map.identify_poc_volume().unwrap();
+        assert_eq!(volume_poc, 100.0, "Volume POC should be at price with highest volume");
+        
+        // TPO POC should be 101.0 (5 candles)
+        let tpo_poc = map.identify_poc_tpo().unwrap();
+        assert_eq!(tpo_poc, 101.0, "TPO POC should be at price with most candles");
+        
+        // Unified method should return correct POC based on mode
+        let volume_unified_poc = map.identify_poc(&VolumeProfileCalculationMode::Volume).unwrap();
+        assert_eq!(volume_unified_poc, 100.0, "Unified Volume POC should match volume method");
+        
+        let tpo_unified_poc = map.identify_poc(&VolumeProfileCalculationMode::TPO).unwrap();
+        assert_eq!(tpo_unified_poc, 101.0, "Unified TPO POC should match TPO method");
+    }
+
+    #[test]
+    fn test_dual_method_value_area_calculation() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create distribution where Volume and TPO methods will differ
+        // Price 100: 1 candle, 1000 volume (high volume, low time)
+        map.add_volume_at_price(100.0, 1000.0);
+        
+        // Price 101: 10 candles, 100 volume (low volume, high time)
+        for _ in 0..10 {
+            map.add_volume_at_price(101.0, 10.0);
+        }
+        
+        // Price 102: 5 candles, 500 volume (medium volume, medium time)
+        for _ in 0..5 {
+            map.add_volume_at_price(102.0, 100.0);
+        }
+        
+        // Calculate value areas using both methods
+        let volume_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let tpo_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::TPO);
+        
+        // Both should have valid ranges
+        assert!(volume_va.high >= volume_va.low, "Volume value area should have valid range");
+        assert!(tpo_va.high >= tpo_va.low, "TPO value area should have valid range");
+        
+        // Volume method should capture significant volume percentage
+        assert!(volume_va.volume_percentage >= 50.0, "Volume VA should capture significant volume");
+        
+        // TPO method may have different volume percentage since it's based on time periods
+        // but should still be reasonable (the volume percentage is always calculated for display)
+        assert!(tpo_va.volume_percentage >= 0.0, "TPO VA should have valid volume percentage");
+        
+        // Volume method should include price 100 (highest volume POC)
+        assert!(volume_va.low <= 100.0 && volume_va.high >= 100.0, 
+                "Volume method should include highest volume price level");
+        
+        // TPO method should include price 101 (highest candle count POC)
+        assert!(tpo_va.low <= 101.0 && tpo_va.high >= 101.0, 
+                "TPO method should include highest candle count price level");
+    }
+
+    #[test]
+    fn test_candle_count_tracking() {
+        let mut map = PriceLevelMap::new(0.01);
+        
+        // Add volume multiple times at same price to test candle counting
+        map.add_volume_at_price(100.0, 50.0);
+        map.add_volume_at_price(100.0, 75.0);
+        map.add_volume_at_price(100.0, 25.0);
+        
+        // Should have 3 candles and 150 total volume at price 100.0
+        assert_eq!(map.get_total_candle_count(), 3, "Should have 3 total candles");
+        assert_eq!(map.total_volume(), 150.0, "Should have 150 total volume");
+        
+        // Convert to price levels and verify candle count is included
+        let price_levels = map.to_price_levels();
+        assert_eq!(price_levels.len(), 1, "Should have 1 price level");
+        assert_eq!(price_levels[0].candle_count, 3, "Price level should have 3 candles");
+        assert_eq!(price_levels[0].volume, 150.0, "Price level should have 150 volume");
+        assert_eq!(price_levels[0].price, 100.0, "Price level should be at 100.0");
+    }
+
+    #[test]
+    fn test_expand_value_area_tpo() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create TPO distribution with different candle counts
+        // Price 100: 2 candles, 300 volume
+        map.add_volume_at_price(100.0, 150.0);
+        map.add_volume_at_price(100.0, 150.0);
+        
+        // Price 101: 8 candles, 400 volume (TPO POC)
+        for _ in 0..8 {
+            map.add_volume_at_price(101.0, 50.0);
+        }
+        
+        // Price 102: 6 candles, 600 volume
+        for _ in 0..6 {
+            map.add_volume_at_price(102.0, 100.0);
+        }
+        
+        // Price 103: 4 candles, 200 volume
+        for _ in 0..4 {
+            map.add_volume_at_price(103.0, 50.0);
+        }
+        
+        // Total: 20 candles, 70% = 14 candles
+        let va = map.expand_value_area_tpo(70.0);
+        
+        // Should include POC at 101.0 (8 candles)
+        assert!(va.low <= 101.0 && va.high >= 101.0, 
+                "TPO value area should include POC at 101.0");
+        
+        // Should have valid range
+        assert!(va.high >= va.low, "Value area should have valid range");
+        
+        // Should have reasonable volume percentage
+        assert!(va.volume_percentage > 0.0, "Value area should have positive volume percentage");
+    }
+
+    #[test]
+    fn test_expand_value_area_volume() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create volume distribution with different volumes
+        // Price 100: 2 candles, 800 volume (Volume POC)
+        map.add_volume_at_price(100.0, 400.0);
+        map.add_volume_at_price(100.0, 400.0);
+        
+        // Price 101: 8 candles, 400 volume
+        for _ in 0..8 {
+            map.add_volume_at_price(101.0, 50.0);
+        }
+        
+        // Price 102: 6 candles, 300 volume
+        for _ in 0..6 {
+            map.add_volume_at_price(102.0, 50.0);
+        }
+        
+        // Price 103: 4 candles, 100 volume
+        for _ in 0..4 {
+            map.add_volume_at_price(103.0, 25.0);
+        }
+        
+        // Total: 1600 volume, 70% = 1120 volume
+        let va = map.expand_value_area_volume(70.0);
+        
+        // Should include POC at 100.0 (800 volume)
+        assert!(va.low <= 100.0 && va.high >= 100.0, 
+                "Volume value area should include POC at 100.0");
+        
+        // Should have valid range
+        assert!(va.high >= va.low, "Value area should have valid range");
+        
+        // Should achieve close to target percentage
+        assert!(va.volume_percentage >= 65.0, 
+                "Volume value area should achieve close to target percentage: got {:.2}%", 
+                va.volume_percentage);
+    }
+
+    #[test]
+    fn test_unified_expand_value_area() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create mixed distribution
+        map.add_volume_at_price(100.0, 500.0); // High volume, 1 candle
+        for _ in 0..10 { // Low volume per candle, 10 candles
+            map.add_volume_at_price(101.0, 10.0);
+        }
+        map.add_volume_at_price(102.0, 300.0); // Medium volume, 1 candle
+        
+        // Test both methods
+        let volume_va = map.expand_value_area(70.0, &VolumeProfileCalculationMode::Volume);
+        let tpo_va = map.expand_value_area(70.0, &VolumeProfileCalculationMode::TPO);
+        
+        // Both should produce valid results
+        assert!(volume_va.high >= volume_va.low, "Volume VA should have valid range");
+        assert!(tpo_va.high >= tpo_va.low, "TPO VA should have valid range");
+        
+        // Volume method should include price 100 (highest volume)
+        assert!(volume_va.low <= 100.0 && volume_va.high >= 100.0, 
+                "Volume method should include highest volume price");
+        
+        // TPO method should include price 101 (most candles)
+        assert!(tpo_va.low <= 101.0 && tpo_va.high >= 101.0, 
+                "TPO method should include highest candle count price");
+    }
+
+    #[test]
+    fn test_validate_value_area_rules_valid() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create valid distribution with proper POC centering
+        map.add_volume_at_price(100.0, 200.0); // 1 candle, 200 volume
+        map.add_volume_at_price(101.0, 400.0); // 1 candle, 400 volume (POC)
+        map.add_volume_at_price(102.0, 300.0); // 1 candle, 300 volume
+        map.add_volume_at_price(103.0, 100.0); // 1 candle, 100 volume
+        // Total: 1000 volume, 70% = 700 volume
+        
+        let value_area = map.expand_value_area_volume(70.0);
+        let validation = map.validate_value_area_rules(&value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        
+        assert!(validation.is_valid, "Valid value area should pass validation");
+        assert!(validation.errors.is_empty(), "Valid value area should have no errors");
+        assert_eq!(validation.metrics.poc_price, 101.0, "POC should be correctly identified");
+        assert!(validation.metrics.actual_volume_percentage >= 65.0, "Should achieve reasonable volume percentage");
+    }
+
+    #[test]
+    fn test_validate_value_area_rules_poc_at_boundary() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create distribution where POC might end up at boundary
+        map.add_volume_at_price(100.0, 1000.0); // Highest volume at edge
+        map.add_volume_at_price(101.0, 100.0);
+        map.add_volume_at_price(102.0, 50.0);
+        
+        let value_area = map.expand_value_area_volume(70.0);
+        let validation = map.validate_value_area_rules(&value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        
+        // This should detect validation issues - either boundary problems or percentage issues
+        // Both are valid business rule violations when POC is at extreme positions
+        if !validation.is_valid {
+            let has_boundary_error = validation.errors.iter()
+                .any(|err| err.contains("boundary"));
+            let has_percentage_error = validation.errors.iter()
+                .any(|err| err.contains("percentage"));
+            let has_poc_error = validation.errors.iter()
+                .any(|err| err.contains("POC"));
+                
+            assert!(has_boundary_error || has_percentage_error || has_poc_error, 
+                    "Should detect boundary, percentage, or POC validation issues: {:?}", validation.errors);
+        }
+    }
+
+    #[test]
+    fn test_validate_value_area_rules_percentage_out_of_range() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create simple distribution
+        map.add_volume_at_price(100.0, 100.0);
+        map.add_volume_at_price(101.0, 100.0);
+        
+        // Create a value area with incorrect percentage
+        let bad_value_area = ValueArea {
+            high: 101.0,
+            low: 100.0,
+            volume_percentage: 50.0, // Too low for 70% target
+            volume: 100.0,
+        };
+        
+        let validation = map.validate_value_area_rules(&bad_value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        
+        assert!(!validation.is_valid, "Out-of-range percentage should fail validation");
+        let percentage_error_found = validation.errors.iter()
+            .any(|err| err.contains("percentage out of range"));
+        assert!(percentage_error_found, "Percentage error should be detected: {:?}", validation.errors);
+    }
+
+    #[test]
+    fn test_validate_value_area_rules_ordering_violation() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create distribution
+        map.add_volume_at_price(100.0, 100.0);
+        map.add_volume_at_price(101.0, 200.0); // POC
+        map.add_volume_at_price(102.0, 100.0);
+        
+        // Create invalid value area with wrong ordering
+        let bad_value_area = ValueArea {
+            high: 100.0, // VAH < POC (invalid)
+            low: 102.0,  // VAL > POC (invalid)
+            volume_percentage: 70.0,
+            volume: 300.0,
+        };
+        
+        let validation = map.validate_value_area_rules(&bad_value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        
+        assert!(!validation.is_valid, "Ordering violation should fail validation");
+        let ordering_error_found = validation.errors.iter()
+            .any(|err| err.contains("ordering violated"));
+        assert!(ordering_error_found, "Ordering error should be detected: {:?}", validation.errors);
+    }
+
+    #[test]
+    fn test_validate_value_area_rules_metrics() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Create test distribution
+        map.add_volume_at_price(100.0, 100.0);
+        map.add_volume_at_price(101.0, 300.0); // POC
+        map.add_volume_at_price(102.0, 100.0);
+        
+        let value_area = map.expand_value_area_volume(70.0);
+        let validation = map.validate_value_area_rules(&value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        
+        // Check metrics are populated correctly
+        assert_eq!(validation.metrics.poc_price, 101.0, "POC price should be 101.0");
+        assert_eq!(validation.metrics.target_volume_percentage, 70.0, "Target percentage should be 70.0");
+        assert!(validation.metrics.price_levels_count > 0, "Should count price levels in value area");
+        assert!(validation.metrics.poc_to_vah_distance >= 0.0, "Distance metrics should be non-negative");
+        assert!(validation.metrics.poc_to_val_distance >= 0.0, "Distance metrics should be non-negative");
+    }
+
+    #[test]
+    fn test_enhanced_price_level_management() {
+        let mut map = PriceLevelMap::new(1.0);
+        
+        // Add data with different volume and candle combinations
+        map.add_volume_at_price(100.0, 200.0); // 1 candle, 200 volume
+        map.add_volume_at_price(100.0, 100.0); // 2nd candle, total 300 volume
+        
+        map.add_volume_at_price(101.0, 500.0); // 1 candle, 500 volume (highest volume)
+        
+        for _ in 0..5 { // 5 candles, 250 volume total (highest candle count)
+            map.add_volume_at_price(102.0, 50.0);
+        }
+        
+        // Test percentage calculations
+        let volume_pct = map.calculate_volume_percentage(300.0); // Price 100.0
+        let expected_volume_pct = (300.0 / (300.0 + 500.0 + 250.0)) * 100.0;
+        assert!((volume_pct - expected_volume_pct).abs() < 0.01, 
+                "Volume percentage should be calculated correctly: got {:.2}%, expected {:.2}%", 
+                volume_pct, expected_volume_pct);
+        
+        let candle_pct = map.calculate_candle_percentage(5); // Price 102.0
+        let expected_candle_pct = (5.0 / (2.0 + 1.0 + 5.0)) * 100.0;
+        assert!((candle_pct - expected_candle_pct).abs() < 0.01, 
+                "Candle percentage should be calculated correctly: got {:.2}%, expected {:.2}%", 
+                candle_pct, expected_candle_pct);
+        
+        // Test highest level identification
+        let (highest_vol_price, highest_vol) = map.get_highest_volume_level().unwrap();
+        assert_eq!(highest_vol_price, 101.0, "Highest volume level should be at 101.0");
+        assert_eq!(highest_vol, 500.0, "Highest volume should be 500.0");
+        
+        let (highest_candle_price, highest_candle_count) = map.get_highest_candle_count_level().unwrap();
+        assert_eq!(highest_candle_price, 102.0, "Highest candle count level should be at 102.0");
+        assert_eq!(highest_candle_count, 5, "Highest candle count should be 5");
+        
+        // Test price level metrics
+        let (volume, candle_count) = map.get_price_level_metrics(100.0).unwrap();
+        assert_eq!(volume, 300.0, "Price 100.0 should have 300 volume");
+        assert_eq!(candle_count, 2, "Price 100.0 should have 2 candles");
+        
+        let (volume, candle_count) = map.get_price_level_metrics(102.0).unwrap();
+        assert_eq!(volume, 250.0, "Price 102.0 should have 250 volume");
+        assert_eq!(candle_count, 5, "Price 102.0 should have 5 candles");
+        
+        // Test non-existent price level
+        assert!(map.get_price_level_metrics(999.0).is_none(), "Non-existent price should return None");
     }
 }

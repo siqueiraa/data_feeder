@@ -424,6 +424,7 @@ impl VolumeProfileDatabase {
                                     price,
                                     volume,
                                     percentage: 0.0, // Calculate if needed
+                                    candle_count: 0, // Historical data doesn't have candle count
                                 });
                             }
                         } else {
@@ -521,6 +522,7 @@ impl VolumeProfileDatabase {
                                 price,
                                 volume,
                                 percentage: 0.0, // Calculate if needed
+                                candle_count: 0, // Historical data doesn't have candle count
                             });
                         }
                     } else {
@@ -753,11 +755,13 @@ mod tests {
                     price: 50000.0,
                     volume: 1000.0,
                     percentage: 60.0,
+                    candle_count: 6,
                 },
                 PriceLevelData {
                     price: 50001.0,
                     volume: 666.67,
                     percentage: 40.0,
+                    candle_count: 4,
                 },
             ],
             total_volume: 1666.67,

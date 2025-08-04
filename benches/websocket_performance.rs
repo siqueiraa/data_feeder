@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use data_feeder::websocket::actor::WebSocketActor;
-use data_feeder::websocket::types::StreamType;
+// StreamType import removed - not used in benchmarks
 use data_feeder::historical::structs::FuturesOHLCVCandle;
 use data_feeder::common::shared_data::{shared_candle, intern_symbol};
 use std::sync::Arc;
