@@ -326,6 +326,11 @@ pub enum VolumeProfileAsk {
         symbol: String,
         date: NaiveDate,
     },
+    /// Get debug metadata for volume profile validation
+    GetDebugMetadata {
+        symbol: String,
+        date: NaiveDate,
+    },
     /// Get health status
     GetHealthStatus,
     /// Get performance statistics
@@ -345,6 +350,8 @@ pub enum VolumeProfileAsk {
 pub enum VolumeProfileReply {
     /// Volume profile data response
     VolumeProfile(Option<VolumeProfileData>),
+    /// Debug metadata response for validation and analysis
+    DebugMetadata(Option<super::structs::VolumeProfileDebugMetadata>),
     /// Health status response
     HealthStatus {
         is_healthy: bool,
@@ -1766,6 +1773,13 @@ impl VolumeProfileActor {
         let profile_key = ProfileKey::new(symbol, date);
         self.profiles.get_mut(&profile_key).map(|profile| profile.get_profile_data())
     }
+    
+    /// Get debug metadata for volume profile validation and analysis
+    fn get_debug_metadata(&self, symbol: String, date: NaiveDate) -> Option<super::structs::VolumeProfileDebugMetadata> {
+        let profile_key = ProfileKey::new(symbol, date);
+        self.profiles.get(&profile_key)
+            .and_then(|profile| profile.get_debug_metadata().cloned())
+    }
 
     /// Get health status
     fn get_health_status(&self) -> VolumeProfileReply {
@@ -2074,6 +2088,10 @@ impl Message<VolumeProfileAsk> for VolumeProfileActor {
             VolumeProfileAsk::GetVolumeProfile { symbol, date } => {
                 let profile_data = self.get_volume_profile(symbol, date);
                 Ok(VolumeProfileReply::VolumeProfile(profile_data))
+            }
+            VolumeProfileAsk::GetDebugMetadata { symbol, date } => {
+                let debug_metadata = self.get_debug_metadata(symbol, date);
+                Ok(VolumeProfileReply::DebugMetadata(debug_metadata))
             }
             VolumeProfileAsk::GetHealthStatus => {
                 Ok(self.get_health_status())
@@ -2973,6 +2991,65 @@ mod tests {
                 assert_eq!(date, NaiveDate::from_ymd_opt(2025, 1, 15).unwrap());
             }
             _ => panic!("Existing ask message pattern broken"),
+        }
+    }
+    
+    #[test]
+    fn test_debug_metadata_method_integration() {
+        let config = VolumeProfileConfig::default();
+        let actor = VolumeProfileActor::new(config).expect("Should create actor");
+        
+        // Test debug metadata request for non-existent profile
+        let debug_metadata = actor.get_debug_metadata(
+            "TESTUSDT".to_string(),
+            NaiveDate::from_ymd_opt(2025, 1, 16).unwrap()
+        );
+        
+        assert!(debug_metadata.is_none(), "Should return None for non-existent profile");
+    }
+    
+    #[test]
+    fn test_debug_metadata_message_serialization() {
+        // Test VolumeProfileAsk::GetDebugMetadata serialization
+        let debug_ask = VolumeProfileAsk::GetDebugMetadata {
+            symbol: "BTCUSDT".to_string(),
+            date: NaiveDate::from_ymd_opt(2025, 1, 16).unwrap(),
+        };
+        
+        let serialized = serde_json::to_string(&debug_ask).unwrap();
+        let deserialized: VolumeProfileAsk = serde_json::from_str(&serialized).unwrap();
+        
+        match deserialized {
+            VolumeProfileAsk::GetDebugMetadata { symbol, date } => {
+                assert_eq!(symbol, "BTCUSDT");
+                assert_eq!(date, NaiveDate::from_ymd_opt(2025, 1, 16).unwrap());
+            }
+            _ => panic!("Unexpected ask message type after deserialization"),
+        }
+        
+        // Test VolumeProfileReply::DebugMetadata serialization
+        use crate::volume_profile::structs::{VolumeProfileDebugMetadata, PrecisionMetrics, CalculationPerformance, ValidationFlags};
+        
+        let debug_metadata = VolumeProfileDebugMetadata {
+            calculation_timestamp: 1736985600000,
+            algorithm_version: "1.4.0".to_string(),
+            precision_metrics: PrecisionMetrics::default(),
+            performance_metrics: CalculationPerformance::default(),
+            validation_flags: ValidationFlags::default(),
+        };
+        
+        let debug_reply = VolumeProfileReply::DebugMetadata(Some(debug_metadata));
+        let serialized = serde_json::to_string(&debug_reply).unwrap();
+        let deserialized: VolumeProfileReply = serde_json::from_str(&serialized).unwrap();
+        
+        match deserialized {
+            VolumeProfileReply::DebugMetadata(debug_data) => {
+                assert!(debug_data.is_some(), "Should deserialize debug metadata");
+                let debug = debug_data.unwrap();
+                assert_eq!(debug.calculation_timestamp, 1736985600000);
+                assert_eq!(debug.algorithm_version, "1.4.0");
+            }
+            _ => panic!("Unexpected reply message type after deserialization"),
         }
     }
 

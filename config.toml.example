@@ -26,6 +26,9 @@ respect_config_start_date = false
 monthly_threshold_months = 3
 enable_technical_analysis = true
 
+# HTTP server settings
+health_server_port = 8080  # Port for health checks, metrics, and readiness probes
+
 # WebSocket reconnection settings
 reconnection_gap_threshold_minutes = 1
 reconnection_gap_check_delay_seconds = 5

@@ -2589,3 +2589,111 @@ mod tests {
         assert!(map.get_price_level_metrics(999.0).is_none(), "Non-existent price should return None");
     }
 }
+
+/// Debug metadata for volume profile calculations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeProfileDebugMetadata {
+    /// Timestamp when the profile was calculated
+    pub calculation_timestamp: i64,
+    /// Algorithm version identifier for calculation method
+    pub algorithm_version: String,
+    /// Precision metrics and accuracy statistics
+    pub precision_metrics: PrecisionMetrics,
+    /// Performance measurements and timing data
+    pub performance_metrics: CalculationPerformance,
+    /// Validation flags and edge case detection
+    pub validation_flags: ValidationFlags,
+}
+
+/// Precision metrics for price key conversion accuracy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrecisionMetrics {
+    /// Price range span being processed
+    pub price_range_span: f64,
+    /// Price increment used for calculations
+    pub price_increment_used: f64,
+    /// Total number of price keys generated
+    pub total_price_keys: usize,
+    /// Number of precision errors detected during conversion
+    pub precision_errors_detected: u32,
+    /// Volume conservation check (should be close to 1.0)
+    pub volume_conservation_check: f64,
+}
+
+/// Performance metrics for calculation timing and resource usage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalculationPerformance {
+    /// Time spent calculating value area in milliseconds
+    pub value_area_calculation_time_ms: f64,
+    /// Time spent on price distribution calculation in milliseconds
+    pub price_distribution_time_ms: f64,
+    /// Number of cache operations performed
+    pub cache_operations_count: u32,
+    /// Estimated memory usage in bytes
+    pub memory_usage_bytes: usize,
+    /// Number of candles processed in this calculation
+    pub candles_processed_count: u32,
+}
+
+/// Validation flags for quality checks and edge case detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationFlags {
+    /// True if degenerate value area detected (high = low)
+    pub degenerate_value_area_detected: bool,
+    /// True if unusual volume concentration pattern detected
+    pub unusual_volume_concentration: bool,
+    /// Number of rejected candles and reasons
+    pub rejected_candles_count: u32,
+    /// Specific rejection reasons for excluded candles
+    pub rejection_reasons: Vec<String>,
+    /// True if precision errors exceeded acceptable threshold
+    pub precision_errors_excessive: bool,
+}
+
+impl Default for VolumeProfileDebugMetadata {
+    fn default() -> Self {
+        Self {
+            calculation_timestamp: 0,
+            algorithm_version: "1.0".to_string(),
+            precision_metrics: PrecisionMetrics::default(),
+            performance_metrics: CalculationPerformance::default(),
+            validation_flags: ValidationFlags::default(),
+        }
+    }
+}
+
+impl Default for PrecisionMetrics {
+    fn default() -> Self {
+        Self {
+            price_range_span: 0.0,
+            price_increment_used: 0.0,
+            total_price_keys: 0,
+            precision_errors_detected: 0,
+            volume_conservation_check: 1.0,
+        }
+    }
+}
+
+impl Default for CalculationPerformance {
+    fn default() -> Self {
+        Self {
+            value_area_calculation_time_ms: 0.0,
+            price_distribution_time_ms: 0.0,
+            cache_operations_count: 0,
+            memory_usage_bytes: 0,
+            candles_processed_count: 0,
+        }
+    }
+}
+
+impl Default for ValidationFlags {
+    fn default() -> Self {
+        Self {
+            degenerate_value_area_detected: false,
+            unusual_volume_concentration: false,
+            rejected_candles_count: 0,
+            rejection_reasons: Vec::new(),
+            precision_errors_excessive: false,
+        }
+    }
+}

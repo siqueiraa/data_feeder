@@ -91,6 +91,21 @@ async fn handle_request(
                 }
             }
         }
+        (&Method::GET, "/startup") => {
+            // Startup probe - responds immediately to indicate service is starting
+            let startup_response = json!({
+                "status": "starting",
+                "service": "data_feeder",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "message": "Service is starting up"
+            });
+            
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(startup_response.to_string())))
+                .unwrap())
+        }
         _ => {
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -179,6 +194,25 @@ pub async fn start_metrics_server(
     info!("📊 Prometheus metrics available at http://{}/metrics", addr);
     info!("💚 Health check available at http://{}/health", addr);
     info!("🔍 Readiness check available at http://{}/ready", addr);
+    info!("🎯 Startup check available at http://{}/startup", addr);
+    
+    // Test the server immediately to confirm it's listening
+    let test_addr = format!("http://localhost:{}/startup", port);
+    
+    // Give the server a moment to start and test connectivity
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        match reqwest::get(&test_addr).await {
+            Ok(response) => {
+                info!("✅ Server test successful: {} {:?}", response.status(), response.version());
+            }
+            Err(e) => {
+                error!("❌ Server test failed: {}", e);
+            }
+        }
+    });
+    
+    info!("✅ Server bound and listening on {}", addr);
     
     loop {
         let (stream, _) = listener.accept().await?;

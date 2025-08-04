@@ -5,7 +5,8 @@ use tracing::{debug, info, warn};
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
 use super::structs::{
     VolumeProfileConfig, VolumeProfileData, ValueArea, 
-    PriceLevelMap, PriceIncrementMode, PriceKey, ResolvedAssetConfig
+    PriceLevelMap, PriceIncrementMode, PriceKey, ResolvedAssetConfig,
+    VolumeProfileDebugMetadata, PrecisionMetrics, CalculationPerformance, ValidationFlags
 };
 
 #[cfg(test)]
@@ -42,6 +43,8 @@ pub struct DailyVolumeProfile {
     cache_dirty: bool,
     /// Cache coordinator for enhanced cache management
     cache_coordinator: CacheCoordinator,
+    /// Debug metadata for calculation validation (optional)
+    debug_metadata: Option<VolumeProfileDebugMetadata>,
 }
 
 impl DailyVolumeProfile {
@@ -66,6 +69,7 @@ impl DailyVolumeProfile {
             cached_value_area: None,
             cache_dirty: false,
             cache_coordinator: CacheCoordinator::new(),
+            debug_metadata: None,
         }
     }
 
@@ -75,6 +79,14 @@ impl DailyVolumeProfile {
         if !self.is_candle_for_date(candle) {
             warn!("Candle timestamp {} does not belong to date {}", 
                   candle.open_time, self.date);
+            
+            // Track rejected candle in debug metadata
+            if let Some(ref mut debug) = self.debug_metadata {
+                debug.validation_flags.rejected_candles_count += 1;
+                debug.validation_flags.rejection_reasons.push(
+                    format!("Date mismatch: candle {} not for date {}", candle.open_time, self.date)
+                );
+            }
             return;
         }
 
@@ -133,7 +145,10 @@ impl DailyVolumeProfile {
     pub fn get_profile_data(&mut self) -> VolumeProfileData {
         // Recalculate cached values if needed
         if self.cache_dirty {
+            self.cache_coordinator.record_cache_miss();
             self.recalculate_caches();
+        } else {
+            self.cache_coordinator.record_cache_hit();
         }
 
         VolumeProfileData {
@@ -273,12 +288,47 @@ impl DailyVolumeProfile {
 
     /// Recalculate cached values (VWAP, POC, Value Area) using dual-method algorithm
     fn recalculate_caches(&mut self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let start_time = SystemTime::now();
+        let calculation_timestamp = start_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        
         if self.total_volume <= 0.0 {
             self.cached_vwap = Some(0.0);
             self.cached_poc = Some(0.0);
             self.cached_value_area = Some(ValueArea::default());
+            
+            // Create debug metadata for empty profile
+            self.debug_metadata = Some(VolumeProfileDebugMetadata {
+                calculation_timestamp,
+                algorithm_version: "1.4.0".to_string(),
+                precision_metrics: PrecisionMetrics {
+                    price_range_span: 0.0,
+                    price_increment_used: self.price_levels.price_increment,
+                    total_price_keys: 0,
+                    precision_errors_detected: 0,
+                    volume_conservation_check: 1.0,
+                },
+                performance_metrics: CalculationPerformance {
+                    value_area_calculation_time_ms: 0.0,
+                    price_distribution_time_ms: 0.0,
+                    cache_operations_count: 1,
+                    memory_usage_bytes: self.estimate_memory_usage(),
+                    candles_processed_count: self.candle_count,
+                },
+                validation_flags: ValidationFlags {
+                    degenerate_value_area_detected: true, // Empty profile is degenerate
+                    unusual_volume_concentration: false,
+                    rejected_candles_count: 0,
+                    rejection_reasons: vec!["No volume data available".to_string()],
+                    precision_errors_excessive: false,
+                },
+            });
         } else {
-            debug!("Recalculating volume profile caches using {} method", self.config.calculation_mode);
+            debug!("Recalculating volume profile caches using {:?} method", self.config.calculation_mode);
+            
+            // Track value area calculation timing
+            let va_start = SystemTime::now();
+            
             // Calculate VWAP
             self.cached_vwap = Some(self.price_levels.calculate_vwap());
             
@@ -293,13 +343,70 @@ impl DailyVolumeProfile {
                     &self.config.calculation_mode
                 )
             );
+            
+            let va_duration = va_start.elapsed().unwrap().as_secs_f64() * 1000.0;
+            
+            // Collect precision metrics
+            let price_range = if self.max_price > self.min_price { self.max_price - self.min_price } else { 0.0 };
+            let total_price_levels = self.price_levels.levels.len();
+            
+            // Detect edge cases
+            let value_area = self.cached_value_area.as_ref().unwrap();
+            let degenerate_va = (value_area.high - value_area.low).abs() < f64::EPSILON;
+            
+            // Check for unusual volume concentration (>80% in single price level)
+            let max_volume_at_level = self.price_levels.levels.values().fold(0.0f64, |max, &vol| max.max(vol));
+            let unusual_concentration = max_volume_at_level / self.total_volume > 0.8;
+            
+            debug!("Value area calculation: range=[{:.6}, {:.6}], volume={:.2} ({:.1}%), POC={:.6}", 
+                   value_area.low, value_area.high, value_area.volume, value_area.volume_percentage,
+                   self.cached_poc.unwrap_or(0.0));
+            
+            if degenerate_va {
+                warn!("Degenerate value area detected: VAH={:.6}, VAL={:.6}", value_area.high, value_area.low);
+            }
+            
+            if unusual_concentration {
+                debug!("Unusual volume concentration detected: {:.1}% at single price level", 
+                       (max_volume_at_level / self.total_volume) * 100.0);
+            }
+            
+            // Create comprehensive debug metadata
+            self.debug_metadata = Some(VolumeProfileDebugMetadata {
+                calculation_timestamp,
+                algorithm_version: "1.4.0".to_string(),
+                precision_metrics: PrecisionMetrics {
+                    price_range_span: price_range,
+                    price_increment_used: self.price_levels.price_increment,
+                    total_price_keys: total_price_levels,
+                    precision_errors_detected: 0, // Would be populated by price key conversion validation
+                    volume_conservation_check: self.total_volume / self.price_levels.total_volume(), // Should be close to 1.0
+                },
+                performance_metrics: CalculationPerformance {
+                    value_area_calculation_time_ms: va_duration,
+                    price_distribution_time_ms: 0.0, // Would be tracked during candle processing
+                    cache_operations_count: 3, // VWAP, POC, Value Area calculations
+                    memory_usage_bytes: self.estimate_memory_usage(),
+                    candles_processed_count: self.candle_count,
+                },
+                validation_flags: ValidationFlags {
+                    degenerate_value_area_detected: degenerate_va,
+                    unusual_volume_concentration: unusual_concentration,
+                    rejected_candles_count: 0, // Would be tracked during candle validation
+                    rejection_reasons: Vec::new(),
+                    precision_errors_excessive: false,
+                },
+            });
         }
         
         self.cache_dirty = false;
         self.cache_coordinator.reset_after_recalculation();
         
-        debug!("Recalculated volume profile caches: VWAP={:.2}, POC={:.2}", 
-               self.cached_vwap.unwrap_or(0.0), self.cached_poc.unwrap_or(0.0));
+        debug!("Recalculated volume profile caches: VWAP={:.6}, POC={:.6}, VA=[{:.6}, {:.6}]", 
+               self.cached_vwap.unwrap_or(0.0), 
+               self.cached_poc.unwrap_or(0.0),
+               self.cached_value_area.as_ref().map(|va| va.low).unwrap_or(0.0),
+               self.cached_value_area.as_ref().map(|va| va.high).unwrap_or(0.0));
     }
 
     /// Invalidate all cached calculations
@@ -327,6 +434,13 @@ pub struct CacheCoordinator {
     invalidated_before_update: bool,
     /// Track cache coherency state
     state: CacheState,
+    /// Cache hit/miss tracking for performance monitoring
+    cache_hits: u64,
+    /// Cache miss count
+    cache_misses: u64,
+    /// Timing metrics for cache operations
+    last_invalidation_time_ms: f64,
+    last_recalculation_time_ms: f64,
 }
 
 impl CacheCoordinator {
@@ -335,11 +449,19 @@ impl CacheCoordinator {
         Self {
             invalidated_before_update: false,
             state: CacheState::Valid,
+            cache_hits: 0,
+            cache_misses: 0,
+            last_invalidation_time_ms: 0.0,
+            last_recalculation_time_ms: 0.0,
         }
     }
     
     /// Invalidate cache before update operation
     pub fn invalidate_before_update(&mut self) -> CacheState {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let start_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        self.last_invalidation_time_ms = start_time.as_secs_f64() * 1000.0;
+        
         self.invalidated_before_update = true;
         self.state = CacheState::InvalidatedBeforeUpdate;
         self.state.clone()
@@ -364,8 +486,43 @@ impl CacheCoordinator {
     
     /// Reset coordinator after cache recalculation
     pub fn reset_after_recalculation(&mut self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let end_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        self.last_recalculation_time_ms = end_time.as_secs_f64() * 1000.0;
+        
         self.invalidated_before_update = false;
         self.state = CacheState::Valid;
+    }
+    
+    /// Record cache hit
+    pub fn record_cache_hit(&mut self) {
+        self.cache_hits += 1;
+    }
+    
+    /// Record cache miss
+    pub fn record_cache_miss(&mut self) {
+        self.cache_misses += 1;
+    }
+    
+    /// Get cache hit rate
+    pub fn cache_hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0.0
+        } else {
+            (self.cache_hits as f64) / (total as f64)
+        }
+    }
+    
+    /// Get cache performance metrics
+    pub fn get_cache_metrics(&self) -> CacheMetrics {
+        CacheMetrics {
+            hits: self.cache_hits,
+            misses: self.cache_misses,
+            hit_rate: self.cache_hit_rate(),
+            last_invalidation_time_ms: self.last_invalidation_time_ms,
+            last_recalculation_time_ms: self.last_recalculation_time_ms,
+        }
     }
 }
 
@@ -373,6 +530,21 @@ impl Default for CacheCoordinator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Cache performance metrics structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheMetrics {
+    /// Number of cache hits
+    pub hits: u64,
+    /// Number of cache misses
+    pub misses: u64,
+    /// Cache hit rate as percentage
+    pub hit_rate: f64,
+    /// Last invalidation timestamp in milliseconds
+    pub last_invalidation_time_ms: f64,
+    /// Last recalculation timestamp in milliseconds
+    pub last_recalculation_time_ms: f64,
 }
 
 impl DailyVolumeProfile {
@@ -425,6 +597,23 @@ impl DailyVolumeProfile {
         let string_size = self.symbol.len();
         
         base_size + price_levels_size + string_size
+    }
+    
+    /// Get cache performance metrics
+    pub fn get_cache_metrics(&self) -> CacheMetrics {
+        self.cache_coordinator.get_cache_metrics()
+    }
+    
+    /// Get debug metadata for validation and analysis
+    pub fn get_debug_metadata(&self) -> Option<&VolumeProfileDebugMetadata> {
+        self.debug_metadata.as_ref()
+    }
+    
+    /// Enable debug metadata collection
+    pub fn enable_debug_collection(&mut self) {
+        if self.debug_metadata.is_none() {
+            self.debug_metadata = Some(VolumeProfileDebugMetadata::default());
+        }
     }
 }
 
@@ -1063,12 +1252,195 @@ mod tests {
         // Cache should still be coherent (coordinator tracks the dirty marking)
         assert!(profile.cache_coordinator.validate_cache_coherency());
         
-        // Get profile data - this triggers cache recalculation
+        // Get profile data - this triggers cache recalculation (miss)
         let _data = profile.get_profile_data();
         
         // After recalculation, cache should be valid and coherent
         assert_eq!(profile.cache_coordinator.state, CacheState::Valid);
         assert!(profile.cache_coordinator.validate_cache_coherency());
+        
+        // Get profile data again - this should be a cache hit
+        let _data2 = profile.get_profile_data();
+        
+        // Verify cache metrics
+        let metrics = profile.get_cache_metrics();
+        assert_eq!(metrics.hits, 1);
+        assert_eq!(metrics.misses, 1);
+        assert_eq!(metrics.hit_rate, 0.5);
+    }
+    
+    #[test]
+    fn test_cache_performance_tracking() {
+        let mut coordinator = CacheCoordinator::new();
+        
+        // Test initial metrics
+        let initial_metrics = coordinator.get_cache_metrics();
+        assert_eq!(initial_metrics.hits, 0);
+        assert_eq!(initial_metrics.misses, 0);
+        assert_eq!(initial_metrics.hit_rate, 0.0);
+        
+        // Test cache operations with timing
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        coordinator.invalidate_before_update();
+        assert!(coordinator.last_invalidation_time_ms > 0.0);
+        
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        coordinator.reset_after_recalculation();
+        assert!(coordinator.last_recalculation_time_ms > coordinator.last_invalidation_time_ms);
+        
+        // Test hit/miss tracking
+        coordinator.record_cache_hit();
+        coordinator.record_cache_hit();
+        coordinator.record_cache_miss();
+        
+        let final_metrics = coordinator.get_cache_metrics();
+        assert_eq!(final_metrics.hits, 2);
+        assert_eq!(final_metrics.misses, 1);
+        assert!((final_metrics.hit_rate - (2.0/3.0)).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_cache_timing_integration() {
+        let config = create_test_config();
+        let mut profile = DailyVolumeProfile::new("CACHE_TEST".to_string(), 
+                                                  NaiveDate::from_ymd_opt(2025, 1, 16).unwrap(), 
+                                                  &config);
+        
+        let base_timestamp = 1736985600000;
+        let candle = create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        
+        // Add candle to make cache dirty
+        profile.add_candle(&candle);
+        
+        // Get profile data to trigger cache recalculation with timing
+        let _data = profile.get_profile_data();
+        
+        let metrics = profile.get_cache_metrics();
+        assert!(metrics.last_invalidation_time_ms > 0.0, "Should have invalidation timing");
+        assert!(metrics.last_recalculation_time_ms > 0.0, "Should have recalculation timing");
+        assert_eq!(metrics.misses, 1, "Should record cache miss");
+        
+        // Second access should be a hit
+        let _data2 = profile.get_profile_data();
+        let metrics2 = profile.get_cache_metrics();
+        assert_eq!(metrics2.hits, 1, "Should record cache hit");
+        assert_eq!(metrics2.hit_rate, 0.5, "Hit rate should be 50%");
+    }
+    
+    #[test]
+    fn test_debug_metadata_collection() {
+        let config = create_test_config();
+        let mut profile = DailyVolumeProfile::new("DEBUG_TEST".to_string(), 
+                                                  NaiveDate::from_ymd_opt(2025, 1, 16).unwrap(), 
+                                                  &config);
+        
+        // Initially no debug metadata
+        assert!(profile.get_debug_metadata().is_none());
+        
+        let base_timestamp = 1736985600000;
+        let candle = create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        
+        // Add candle and trigger calculation
+        profile.add_candle(&candle);
+        let _data = profile.get_profile_data();
+        
+        // Should now have debug metadata
+        let debug = profile.get_debug_metadata().expect("Should have debug metadata after calculation");
+        
+        // Verify metadata structure
+        assert!(debug.calculation_timestamp > 0, "Should have calculation timestamp");
+        assert_eq!(debug.algorithm_version, "1.4.0", "Should have correct algorithm version");
+        
+        // Verify precision metrics
+        assert!(debug.precision_metrics.price_range_span > 0.0, "Should have price range span");
+        assert_eq!(debug.precision_metrics.price_increment_used, 0.01, "Should track price increment");
+        assert!(debug.precision_metrics.total_price_keys > 0, "Should count price keys");
+        assert!((debug.precision_metrics.volume_conservation_check - 1.0).abs() < 0.01, 
+                "Volume conservation should be close to 1.0");
+        
+        // Verify performance metrics
+        assert!(debug.performance_metrics.value_area_calculation_time_ms >= 0.0, "Should have timing data");
+        assert_eq!(debug.performance_metrics.cache_operations_count, 3, "Should count cache operations");
+        assert_eq!(debug.performance_metrics.candles_processed_count, 1, "Should count processed candles");
+        assert!(debug.performance_metrics.memory_usage_bytes > 0, "Should estimate memory usage");
+        
+        // Verify validation flags
+        assert!(!debug.validation_flags.degenerate_value_area_detected, "Single candle should not be degenerate");
+        assert_eq!(debug.validation_flags.rejected_candles_count, 0, "Should have no rejected candles");
+        assert!(debug.validation_flags.rejection_reasons.is_empty(), "Should have no rejection reasons");
+    }
+    
+    #[test]
+    fn test_debug_metadata_edge_case_detection() {
+        let config = create_test_config();
+        let mut profile = DailyVolumeProfile::new("EDGE_TEST".to_string(), 
+                                                  NaiveDate::from_ymd_opt(2025, 1, 16).unwrap(), 
+                                                  &config);
+        
+        let base_timestamp = 1736985600000;
+        
+        // Create scenario with high volume concentration at single price
+        let high_volume_candle = create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 100.0, 100.0, 100.0, 9000.0);
+        let low_volume_candle = create_test_candle(base_timestamp + 60000, base_timestamp + 119999, 101.0, 101.0, 101.0, 101.0, 1000.0);
+        
+        profile.add_candle(&high_volume_candle);
+        profile.add_candle(&low_volume_candle);
+        
+        let _data = profile.get_profile_data();
+        let debug = profile.get_debug_metadata().expect("Should have debug metadata");
+        
+        // Should detect unusual volume concentration (90% at price 100.0)
+        assert!(debug.validation_flags.unusual_volume_concentration, 
+                "Should detect unusual volume concentration");
+    }
+    
+    #[test]
+    fn test_debug_metadata_rejected_candles() {
+        let config = create_test_config();
+        let mut profile = DailyVolumeProfile::new("REJECT_TEST".to_string(), 
+                                                  NaiveDate::from_ymd_opt(2025, 1, 16).unwrap(), 
+                                                  &config);
+        
+        // Enable debug collection before adding candles
+        profile.enable_debug_collection();
+        
+        let base_timestamp = 1736985600000;
+        let valid_candle = create_test_candle(base_timestamp, base_timestamp + 59999, 100.0, 102.0, 98.0, 101.0, 1000.0);
+        let invalid_candle = create_test_candle(base_timestamp + 25 * 60 * 60 * 1000, base_timestamp + 25 * 60 * 60 * 1000 + 59999, 100.0, 102.0, 98.0, 101.0, 500.0); // Next day + 1 hour
+        
+        // Add valid candle
+        profile.add_candle(&valid_candle);
+        assert_eq!(profile.candle_count, 1);
+        
+        // Add invalid candle (should be rejected)
+        profile.add_candle(&invalid_candle);
+        assert_eq!(profile.candle_count, 1); // Should not increase
+        
+        let debug = profile.get_debug_metadata().expect("Should have debug metadata");
+        assert_eq!(debug.validation_flags.rejected_candles_count, 1, "Should track rejected candle");
+        assert!(!debug.validation_flags.rejection_reasons.is_empty(), "Should have rejection reason");
+        assert!(debug.validation_flags.rejection_reasons[0].contains("Date mismatch"), 
+                "Should specify date mismatch reason");
+    }
+    
+    #[test]
+    fn test_debug_metadata_degenerate_value_area() {
+        let config = create_test_config();
+        let mut profile = DailyVolumeProfile::new("DEGENERATE_TEST".to_string(), 
+                                                  NaiveDate::from_ymd_opt(2025, 1, 16).unwrap(), 
+                                                  &config);
+        
+        // Create empty profile scenario
+        let _data = profile.get_profile_data();
+        let debug = profile.get_debug_metadata().expect("Should have debug metadata for empty profile");
+        
+        // Empty profile should be flagged as degenerate
+        assert!(debug.validation_flags.degenerate_value_area_detected, 
+                "Empty profile should be detected as degenerate");
+        assert!(!debug.validation_flags.rejection_reasons.is_empty(), 
+                "Should have reason for degenerate state");
+        assert!(debug.validation_flags.rejection_reasons[0].contains("No volume data"), 
+                "Should specify no volume data reason");
     }
 
     #[test]

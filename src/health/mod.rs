@@ -25,7 +25,7 @@ pub struct HealthConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
-            port: 9876,
+            port: 8080,
             timeout_seconds: 5,
         }
     }
