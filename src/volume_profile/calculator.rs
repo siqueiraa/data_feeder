@@ -326,6 +326,9 @@ impl DailyVolumeProfile {
         } else {
             debug!("Recalculating volume profile caches using {:?} method", self.config.calculation_mode);
             
+            // Force cache invalidation to ensure fresh calculations with new algorithm
+            self.invalidate_caches();
+            
             // Track value area calculation timing
             let va_start = SystemTime::now();
             
@@ -672,6 +675,7 @@ mod tests {
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
             calculation_mode: VolumeProfileCalculationMode::Volume,
             asset_overrides: std::collections::HashMap::new(),
+            historical_days: 60,
         }
     }
 

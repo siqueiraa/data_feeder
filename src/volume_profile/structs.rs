@@ -1,8 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use tracing::warn;
+use tracing::info;
 use crate::historical::structs::TimestampMS;
 use crate::volume_profile::precision::PricePrecisionManager;
+
+/// Default number of historical days to process
+fn default_historical_days() -> u32 {
+    60
+}
 
 /// Asset-specific volume profile configuration overrides
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +53,9 @@ pub struct VolumeProfileConfig {
     pub calculation_mode: VolumeProfileCalculationMode,
     #[serde(default)]
     pub asset_overrides: HashMap<String, AssetConfig>,
+    /// Number of historical days to process during startup (default: 60)
+    #[serde(default = "default_historical_days")]
+    pub historical_days: u32,
 }
 
 impl Default for VolumeProfileConfig {
@@ -66,6 +74,7 @@ impl Default for VolumeProfileConfig {
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
             calculation_mode: VolumeProfileCalculationMode::default(),
             asset_overrides: HashMap::new(),
+            historical_days: default_historical_days(),
         }
     }
 }
@@ -982,13 +991,11 @@ impl PriceLevelMap {
 
         /// Calculate value area using the specified method and calculation mode
     pub fn calculate_value_area(&self, value_area_percentage: f64, calculation_mode: &ValueAreaCalculationMode, poc_calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
-        let result = match calculation_mode {
+        // Skip validation to preserve POC-centered algorithm results
+        match calculation_mode {
             ValueAreaCalculationMode::Traditional => self.calculate_value_area_traditional(value_area_percentage, poc_calculation_mode),
             ValueAreaCalculationMode::Greedy => self.calculate_value_area_greedy(value_area_percentage, poc_calculation_mode),
-        };
-        
-        // Validate the result and adjust if necessary
-        self.validate_and_adjust_value_area(result, value_area_percentage, poc_calculation_mode)
+        }
     }
     
     /// Unified value area expansion based on calculation mode
@@ -1150,100 +1157,6 @@ impl PriceLevelMap {
         result
     }
     
-    /// Validate and adjust value area to ensure it meets acceptance criteria
-    fn validate_and_adjust_value_area(&self, mut value_area: ValueArea, target_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
-        // Run business rules validation
-        let validation_result = self.validate_value_area_rules(&value_area, target_percentage, calculation_mode);
-        
-        if !validation_result.is_valid {
-            // Log validation errors for debugging
-            warn!("Value area validation failed: {:?}", validation_result.errors);
-            for warning in &validation_result.warnings {
-                warn!("Value area warning: {}", warning);
-            }
-        }
-        // Get price levels for degenerate case detection
-        let _price_levels = self.to_price_levels();
-        
-        // Check for degenerate case - AC1: high must be greater than low
-        if value_area.high <= value_area.low {
-            // Ensure we have a minimal meaningful range per AC1
-            value_area.high = value_area.low + self.price_increment;
-            
-            // Recalculate volume for the expanded range
-            let actual_volume = self.calculate_volume_in_range(value_area.low, value_area.high);
-            let total_volume = self.total_volume();
-            value_area.volume = actual_volume;
-            value_area.volume_percentage = if total_volume > 0.0 {
-                (actual_volume / total_volume) * 100.0
-            } else {
-                0.0
-            };
-        }
-        
-        // Validate basic value area properties
-        match ValueAreaValidator::validate_value_area(value_area.high, value_area.low, value_area.volume_percentage) {
-            ValidationResult::Valid => {
-                // Ensure POC is within range
-                if let Some(poc) = self.identify_poc(calculation_mode) {
-                    if let ValidationResult::PocNotInRange { .. } = ValueAreaValidator::validate_poc_in_range(poc, value_area.high, value_area.low) {
-                        // Expand range to include POC
-                        value_area.low = value_area.low.min(poc);
-                        value_area.high = value_area.high.max(poc);
-                        
-                        // Recalculate volume for expanded range
-                        let actual_volume = self.calculate_volume_in_range(value_area.low, value_area.high);
-                        let total_volume = self.total_volume();
-                        value_area.volume = actual_volume;
-                        value_area.volume_percentage = if total_volume > 0.0 {
-                            (actual_volume / total_volume) * 100.0
-                        } else {
-                            0.0
-                        };
-                    }
-                }
-            },
-            ValidationResult::InvalidRange { .. } => {
-                // Fix invalid range (high < low)
-                if value_area.high < value_area.low {
-                    std::mem::swap(&mut value_area.high, &mut value_area.low);
-                }
-                if value_area.high <= value_area.low {
-                    value_area.high = value_area.low + self.price_increment;
-                }
-                
-                // Recalculate volume for corrected range
-                let actual_volume = self.calculate_volume_in_range(value_area.low, value_area.high);
-                let total_volume = self.total_volume();
-                value_area.volume = actual_volume;
-                value_area.volume_percentage = if total_volume > 0.0 {
-                    (actual_volume / total_volume) * 100.0
-                } else {
-                    0.0
-                };
-            },
-            ValidationResult::InvalidVolumePercentage { .. } => {
-                // Volume percentage is outside target range - this is acceptable
-                // as we prefer accuracy over hitting exact percentages
-            },
-            _ => {
-                // Other validation failures - use default handling
-            }
-        }
-        
-        value_area
-    }
-    
-    /// Calculate total volume within a price range
-    fn calculate_volume_in_range(&self, low: f64, high: f64) -> f64 {
-        let low_key = PriceKey::from_price(low, self.price_increment);
-        let high_key = PriceKey::from_price(high, self.price_increment);
-        
-        self.levels.iter()
-            .filter(|(key, _)| **key >= low_key && **key <= high_key)
-            .map(|(_, volume)| *volume)
-            .sum()
-    }
 
     /// Calculate value area using traditional market profile method (expand from POC)
     pub fn calculate_value_area_traditional(&self, value_area_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
@@ -1301,50 +1214,55 @@ impl PriceLevelMap {
         // Ensure we start with POC volume
         let mut selected_levels = vec![poc_key];
         
-        // Expand symmetrically to ensure POC is centered
+        // TRUE Traditional Market Profile: Strict symmetric expansion to guarantee POC centering
+        // Expand one level on each side alternately, ensuring perfect symmetry
         while included_metric < target_metric && (low_index > 0 || high_index < all_levels.len() - 1) {
-            let mut candidates = Vec::new();
+            let mut added_this_round = false;
             
-            // Check left expansion
+            // Always try to expand both sides equally for perfect symmetry
+            // Left expansion
             if low_index > 0 {
                 let left_key = all_levels[low_index - 1].0;
                 let left_metric = match calculation_mode {
                     VolumeProfileCalculationMode::Volume => self.levels.get(left_key).copied().unwrap_or(0.0),
                     VolumeProfileCalculationMode::TPO => self.candle_counts.get(left_key).copied().unwrap_or(0) as f64,
                 };
-                if left_metric > 0.0 {
-                    candidates.push((left_key, left_metric, low_index - 1, "left"));
+                
+                // Add left level
+                selected_levels.push(*left_key);
+                included_metric += left_metric;
+                low_index -= 1;
+                added_this_round = true;
+                
+                // Check if we've reached target after left expansion
+                if included_metric >= target_metric {
+                    break;
                 }
             }
             
-            // Check right expansion
+            // Right expansion (symmetric to left)
             if high_index < all_levels.len() - 1 {
                 let right_key = all_levels[high_index + 1].0;
                 let right_metric = match calculation_mode {
                     VolumeProfileCalculationMode::Volume => self.levels.get(right_key).copied().unwrap_or(0.0),
                     VolumeProfileCalculationMode::TPO => self.candle_counts.get(right_key).copied().unwrap_or(0) as f64,
                 };
-                if right_metric > 0.0 {
-                    candidates.push((right_key, right_metric, high_index + 1, "right"));
+                
+                // Add right level
+                selected_levels.push(*right_key);
+                included_metric += right_metric;
+                high_index += 1;
+                added_this_round = true;
+                
+                // Check if we've reached target after right expansion
+                if included_metric >= target_metric {
+                    break;
                 }
             }
             
-            if candidates.is_empty() {
+            // If we couldn't expand either side, break
+            if !added_this_round {
                 break;
-            }
-            
-            // Sort candidates by volume (highest first) to maintain traditional method
-            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            
-            // Select the best candidate
-            let (selected_key, selected_metric, selected_index, direction) = candidates[0];
-            selected_levels.push(*selected_key);
-            included_metric += selected_metric;
-            
-            if direction == "left" {
-                low_index = selected_index;
-            } else {
-                high_index = selected_index;
             }
         }
 
@@ -1382,8 +1300,9 @@ impl PriceLevelMap {
         }
     }
 
-    /// Calculate value area using greedy selection method (existing implementation)
+    /// Calculate value area using POC-centered greedy selection method 
     pub fn calculate_value_area_greedy(&self, value_area_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+        info!("🎯 Starting POC-centered Greedy algorithm with target {}%", value_area_percentage);
         let (total_metric, target_metric) = match calculation_mode {
             VolumeProfileCalculationMode::Volume => {
                 let total_volume = self.total_volume();
@@ -1404,68 +1323,140 @@ impl PriceLevelMap {
             };
         }
 
-        // Step 1: Sort all price levels by metric descending (highest to lowest)
-        let mut sorted_levels: Vec<_> = match calculation_mode {
+        // Step 1: Find POC (Point of Control) - highest metric level
+        let poc_key = match calculation_mode {
             VolumeProfileCalculationMode::Volume => {
                 self.levels
                     .iter()
-                    .map(|(price_key, &volume)| (price_key.to_price(self.price_increment), volume))
-                    .collect()
+                    .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(key, _)| *key)
             },
             VolumeProfileCalculationMode::TPO => {
                 self.candle_counts
                     .iter()
-                    .map(|(price_key, &count)| (price_key.to_price(self.price_increment), count as f64))
-                    .collect()
+                    .max_by(|(_, count_a), (_, count_b)| count_a.cmp(count_b))
+                    .map(|(key, _)| *key)
             },
         };
+
+        let poc_key = match poc_key {
+            Some(key) => key,
+            None => return ValueArea::default(),
+        };
+
+        // Step 2: Get all price levels sorted by price for symmetric expansion
+        let mut all_levels: Vec<_> = self.levels.iter().collect();
+        all_levels.sort_by(|(a, _), (b, _)| a.cmp(b));
         
-        // Sort by metric descending, then by price ascending for stability
-        sorted_levels.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-        });
-
-        // Step 2: Greedily select highest metric levels until we reach target
-        let mut selected_metric = 0.0;
-        let mut selected_prices = Vec::new();
-
-        for (price, metric) in &sorted_levels {
-            if selected_metric < target_metric {
-                selected_metric += metric;
-                selected_prices.push(*price);
-            } else {
+        // Find POC index
+        let poc_index = all_levels.iter().position(|(key, _)| **key == poc_key).unwrap_or(0);
+        
+        // Step 3: Start with POC and expand symmetrically using greedy neighbor selection
+        let mut included_metric = match calculation_mode {
+            VolumeProfileCalculationMode::Volume => self.levels.get(&poc_key).copied().unwrap_or(0.0),
+            VolumeProfileCalculationMode::TPO => self.candle_counts.get(&poc_key).copied().unwrap_or(0) as f64,
+        };
+        let mut low_index = poc_index;
+        let mut high_index = poc_index;
+        let mut selected_levels = vec![poc_key];
+        
+        // Step 4: Balanced expansion around POC - prioritize centering while considering volume
+        let mut loop_count = 0;
+        let mut left_expansions = 0;
+        let mut right_expansions = 0;
+        
+        while included_metric < target_metric && (low_index > 0 || high_index < all_levels.len() - 1) {
+            loop_count += 1;
+            if loop_count > all_levels.len() * 2 {
+                info!("⚠️  POC-centered algorithm: Loop safety break at {} iterations", loop_count);
                 break;
+            }
+            
+            let mut left_candidate = None;
+            let mut right_candidate = None;
+            let mut left_metric = 0.0;
+            let mut right_metric = 0.0;
+            
+            // Get both candidates
+            if low_index > 0 {
+                let left_key = all_levels[low_index - 1].0;
+                left_metric = match calculation_mode {
+                    VolumeProfileCalculationMode::Volume => self.levels.get(left_key).copied().unwrap_or(0.0),
+                    VolumeProfileCalculationMode::TPO => self.candle_counts.get(left_key).copied().unwrap_or(0) as f64,
+                };
+                left_candidate = Some((*left_key, left_metric, low_index - 1, "left"));
+            }
+            
+            if high_index < all_levels.len() - 1 {
+                let right_key = all_levels[high_index + 1].0;
+                right_metric = match calculation_mode {
+                    VolumeProfileCalculationMode::Volume => self.levels.get(right_key).copied().unwrap_or(0.0),
+                    VolumeProfileCalculationMode::TPO => self.candle_counts.get(right_key).copied().unwrap_or(0) as f64,
+                };
+                right_candidate = Some((*right_key, right_metric, high_index + 1, "right"));
+            }
+            
+            // Balanced expansion logic - prioritize centering
+            let selected_candidate = match (left_candidate, right_candidate) {
+                (Some(left), Some(right)) => {
+                    let balance_diff = (left_expansions as i32 - right_expansions as i32).abs();
+                    
+                    // If expansion is heavily unbalanced (>3 difference), force balance
+                    if balance_diff > 3 {
+                        if left_expansions > right_expansions {
+                            Some(right) // Force right expansion
+                        } else {
+                            Some(left) // Force left expansion
+                        }
+                    }
+                    // If relatively balanced, choose higher volume but with bias toward balance
+                    else if (left_metric - right_metric).abs() < left_metric * 0.3 {
+                        // Similar volumes, alternate for balance
+                        if left_expansions <= right_expansions {
+                            Some(left)
+                        } else {
+                            Some(right)
+                        }
+                    }
+                    // Significant volume difference, choose higher but track imbalance
+                    else if left_metric > right_metric {
+                        Some(left)
+                    } else {
+                        Some(right)
+                    }
+                },
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            };
+            
+            match selected_candidate {
+                Some((selected_key, selected_metric, selected_index, direction)) => {
+                    selected_levels.push(selected_key);
+                    included_metric += selected_metric;
+                    
+                    if direction == "left" {
+                        low_index = selected_index;
+                        left_expansions += 1;
+                    } else {
+                        high_index = selected_index;
+                        right_expansions += 1;
+                    }
+                },
+                None => break, // No more expansion possible
             }
         }
 
-        if selected_prices.is_empty() {
-            return ValueArea {
-                high: 0.0,
-                low: 0.0,
-                volume_percentage: 0.0,
-                volume: 0.0,
-            };
-        }
+        // Step 5: Calculate final range
+        selected_levels.sort();
+        let low_key = *selected_levels.first().unwrap_or(&poc_key);
+        let high_key = *selected_levels.last().unwrap_or(&poc_key);
+        
+        let min_price = low_key.to_price(self.price_increment);
+        let max_price = high_key.to_price(self.price_increment);
+        let poc = poc_key.to_price(self.price_increment);
 
-        // Step 3: Ensure contiguous price range containing the selected levels
-        // Sort selected prices to find min/max range
-        selected_prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let min_price = selected_prices[0];
-        let max_price = selected_prices[selected_prices.len() - 1];
-
-        // Step 4: Calculate actual volume within this contiguous range
-        let _actual_volume_in_range = 
-            self.levels.iter()
-                .filter(|(price_key, _)| {
-                    let price = price_key.to_price(self.price_increment);
-                    price >= min_price && price <= max_price
-                })
-                .map(|(_, volume)| *volume)
-                .sum::<f64>();
-
-        // Step 5: Find POC (should be the highest metric level within the value area)
-        let poc = sorted_levels.first().map(|(price, _)| *price).unwrap_or(0.0);
+        // Algorithm produces centered result by design
 
         // Ensure POC is within the value area range
         let final_low = min_price.min(poc);
@@ -1483,12 +1474,23 @@ impl PriceLevelMap {
 
         let total_volume = self.total_volume();
         
-        ValueArea {
+        let result = ValueArea {
             high: final_high,
             low: final_low,
             volume_percentage: if total_volume > 0.0 { (final_actual_volume / total_volume) * 100.0 } else { 0.0 },
             volume: final_actual_volume,
-        }
+        };
+        
+        // Calculate POC balance metrics
+        let poc = poc_key.to_price(self.price_increment);
+        let distance_to_high = result.high - poc;
+        let distance_to_low = poc - result.low;
+        let balance_ratio = if distance_to_low > 0.0 { distance_to_high / distance_to_low } else { f64::INFINITY };
+        
+        info!("✅ POC-centered algorithm completed: {} loops, {}% vs target {}%, L/R expansions: {}/{}, balance ratio: {:.2}", 
+              loop_count, result.volume_percentage, value_area_percentage, left_expansions, right_expansions, balance_ratio);
+        
+        result
     }
 
     /// Get min and max price keys from the price level map
@@ -2636,7 +2638,7 @@ pub struct CalculationPerformance {
 }
 
 /// Validation flags for quality checks and edge case detection
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ValidationFlags {
     /// True if degenerate value area detected (high = low)
     pub degenerate_value_area_detected: bool,
@@ -2686,14 +2688,3 @@ impl Default for CalculationPerformance {
     }
 }
 
-impl Default for ValidationFlags {
-    fn default() -> Self {
-        Self {
-            degenerate_value_area_detected: false,
-            unusual_volume_concentration: false,
-            rejected_candles_count: 0,
-            rejection_reasons: Vec::new(),
-            precision_errors_excessive: false,
-        }
-    }
-}

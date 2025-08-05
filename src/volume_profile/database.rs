@@ -22,104 +22,76 @@ impl VolumeProfileDatabase {
         }
     }
 
-    /// SQL to create volume profiles table (flat format - no JSON)
+    /// SQL to create volume profiles table (simple clean format)
     pub fn get_create_table_sql(&self) -> String {
-        let mut sql = format!(
+        format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
                 symbol VARCHAR(20) NOT NULL,
                 date DATE NOT NULL,
-                total_volume DECIMAL(20,8) NOT NULL,
-                vwap DECIMAL(20,8) NOT NULL,
-                poc DECIMAL(20,8) NOT NULL,
-                value_area_high DECIMAL(20,8) NOT NULL,
-                value_area_low DECIMAL(20,8) NOT NULL,
-                value_area_volume DECIMAL(20,8) NOT NULL,
-                value_area_percentage DECIMAL(8,4) NOT NULL,
-                price_increment DECIMAL(20,8) NOT NULL,
-                min_price DECIMAL(20,8) NOT NULL,
-                max_price DECIMAL(20,8) NOT NULL,
+                total_volume DOUBLE PRECISION NOT NULL,
+                vwap DOUBLE PRECISION NOT NULL,
+                poc DOUBLE PRECISION NOT NULL,
+                value_area_high DOUBLE PRECISION NOT NULL,
+                value_area_low DOUBLE PRECISION NOT NULL,
+                value_area_volume DOUBLE PRECISION NOT NULL,
+                value_area_percentage DOUBLE PRECISION NOT NULL,
+                price_increment DOUBLE PRECISION NOT NULL,
+                min_price DOUBLE PRECISION NOT NULL,
+                max_price DOUBLE PRECISION NOT NULL,
                 candle_count INTEGER NOT NULL,
                 last_updated BIGINT NOT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 
-                -- Price level columns (up to 200 levels, no JSON)
-            "#,
-            self.table_name
-        );
-        
-        // Add price level columns dynamically
-        for i in 1..=200 {
-            sql.push_str(&format!(
-                "price_{:03} DECIMAL(20,8), volume_{:03} DECIMAL(20,8){}",
-                i, i, if i == 200 { "" } else { ",\n                " }
-            ));
-        }
-        
-        sql.push_str(&format!(
-            r#"
-                
                 PRIMARY KEY (symbol, date)
             );
-
-            -- Create indexes for optimal query performance
-            CREATE INDEX IF NOT EXISTS idx_{table}_date ON {table} (date);
-            CREATE INDEX IF NOT EXISTS idx_{table}_symbol ON {table} (symbol);
-            CREATE INDEX IF NOT EXISTS idx_{table}_symbol_date ON {table} (symbol, date);
-            
-            -- Create partial index for recent data (last 30 days)
-            CREATE INDEX IF NOT EXISTS idx_{table}_recent 
-            ON {table} (symbol, date) 
-            WHERE date >= CURRENT_DATE - INTERVAL '30 days';
-
-            -- Create index on VWAP for price analysis
-            CREATE INDEX IF NOT EXISTS idx_{table}_vwap 
-            ON {table} (vwap);
-            
-            -- Create index on POC for volume analysis
-            CREATE INDEX IF NOT EXISTS idx_{table}_poc 
-            ON {table} (poc);
-            
-            -- Create composite index for common queries
-            CREATE INDEX IF NOT EXISTS idx_{table}_symbol_vwap 
-            ON {table} (symbol, vwap);
-            
-            -- Create index for value area queries
-            CREATE INDEX IF NOT EXISTS idx_{table}_value_area 
-            ON {table} (symbol, value_area_high, value_area_low);
             "#,
-            table = self.table_name
-        ));
-        
-        sql
-    }
-
-    /// SQL to create or replace the update trigger function
-    pub fn get_create_trigger_sql(&self) -> String {
-        format!(
-            r#"
-            -- Create or replace trigger function to update updated_at timestamp
-            CREATE OR REPLACE FUNCTION update_{}_updated_at()
-            RETURNS TRIGGER AS $$
-            BEGIN
-                NEW.updated_at = CURRENT_TIMESTAMP;
-                RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql;
-
-            -- Drop trigger if exists and create new one
-            DROP TRIGGER IF EXISTS trigger_update_{}_updated_at ON {};
-            CREATE TRIGGER trigger_update_{}_updated_at
-                BEFORE UPDATE ON {}
-                FOR EACH ROW
-                EXECUTE FUNCTION update_{}_updated_at();
-            "#,
-            self.table_name,
-            self.table_name, self.table_name,
-            self.table_name, self.table_name,
             self.table_name
         )
+    }
+
+    /// SQL to create indexes for the volume profiles table
+    pub fn get_create_indexes_sql(&self) -> Vec<String> {
+        vec![
+            format!("CREATE INDEX IF NOT EXISTS idx_{}_date ON {} (date);", self.table_name, self.table_name),
+            format!("CREATE INDEX IF NOT EXISTS idx_{}_symbol ON {} (symbol);", self.table_name, self.table_name),
+            format!("CREATE INDEX IF NOT EXISTS idx_{}_symbol_date ON {} (symbol, date);", self.table_name, self.table_name),
+            format!("CREATE INDEX IF NOT EXISTS idx_{}_vwap ON {} (vwap);", self.table_name, self.table_name),
+            format!("CREATE INDEX IF NOT EXISTS idx_{}_poc ON {} (poc);", self.table_name, self.table_name),
+            format!("CREATE INDEX IF NOT EXISTS idx_{}_symbol_vwap ON {} (symbol, vwap);", self.table_name, self.table_name),
+            format!("CREATE INDEX IF NOT EXISTS idx_{}_value_area ON {} (symbol, value_area_high, value_area_low);", self.table_name, self.table_name),
+        ]
+    }
+
+    /// SQL to create trigger function and trigger statements separately
+    pub fn get_create_trigger_sql(&self) -> Vec<String> {
+        vec![
+            // Create or replace trigger function
+            format!(
+                r#"CREATE OR REPLACE FUNCTION update_{}_updated_at()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.updated_at = CURRENT_TIMESTAMP;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;"#,
+                self.table_name
+            ),
+            // Drop existing trigger
+            format!(
+                "DROP TRIGGER IF EXISTS trigger_update_{}_updated_at ON {};",
+                self.table_name, self.table_name
+            ),
+            // Create new trigger
+            format!(
+                r#"CREATE TRIGGER trigger_update_{}_updated_at
+                    BEFORE UPDATE ON {}
+                    FOR EACH ROW
+                    EXECUTE FUNCTION update_{}_updated_at();"#,
+                self.table_name, self.table_name, self.table_name
+            ),
+        ]
     }
 
     /// Upsert volume profile data with flat column format (NO JSON)
@@ -130,36 +102,16 @@ impl VolumeProfileDatabase {
         date: NaiveDate,
         profile_data: &VolumeProfileData,
     ) -> Result<u64, PostgresError> {
-        let level_count = profile_data.price_levels.len().min(200);
-        debug!("Upserting volume profile: {} on {} ({} price levels)", 
-               symbol, date, level_count);
+        debug!("Upserting volume profile: {} on {}", symbol, date);
 
-        // Build dynamic SQL based on actual price level count
-        let mut sql = format!(
+        let sql = format!(
             r#"
             INSERT INTO {} (
                 symbol, date, total_volume, vwap, poc, value_area_high, value_area_low,
                 value_area_volume, value_area_percentage, price_increment, min_price, max_price,
                 candle_count, last_updated
-            "#,
-            self.table_name
-        );
-
-        // Add price level columns dynamically
-        for i in 1..=level_count {
-            sql.push_str(&format!(", price_{:03}, volume_{:03}", i, i));
-        }
-
-        sql.push_str(") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14");
-
-        // Add parameter placeholders for price levels
-        for i in 0..level_count {
-            sql.push_str(&format!(", ${}, ${}", 15 + i*2, 16 + i*2));
-        }
-
-        sql.push_str(
-            r#"
-            ) ON CONFLICT (symbol, date) 
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (symbol, date) 
             DO UPDATE SET
                 total_volume = EXCLUDED.total_volume,
                 vwap = EXCLUDED.vwap,
@@ -175,20 +127,14 @@ impl VolumeProfileDatabase {
                 last_updated = EXCLUDED.last_updated,
                 updated_at = CURRENT_TIMESTAMP
             "#,
+            self.table_name
         );
 
-        // Add price level columns to update
-        for i in 1..=level_count {
-            sql.push_str(&format!(
-                ", price_{:03} = EXCLUDED.price_{:03}, volume_{:03} = EXCLUDED.volume_{:03}",
-                i, i, i, i
-            ));
-        }
-
-        // Build parameter list
+        // Build parameter list - use f64 directly for PostgreSQL DOUBLE PRECISION compatibility
         let candle_count_param = profile_data.candle_count as i32;
         let last_updated_param = profile_data.last_updated;
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
+        
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
             &symbol,
             &date,
             &profile_data.total_volume,
@@ -205,20 +151,14 @@ impl VolumeProfileDatabase {
             &last_updated_param,
         ];
 
-        // Add price level parameters
-        for level in &profile_data.price_levels[..level_count] {
-            params.push(&level.price);
-            params.push(&level.volume);
-        }
-
         // Execute upsert
         let rows_affected = client.execute(&sql, &params[..]).await?;
 
         if rows_affected > 0 {
-            debug!("Successfully upserted flat volume profile: {} on {} ({} rows affected)", 
+            debug!("Successfully upserted volume profile: {} on {} ({} rows affected)", 
                    symbol, date, rows_affected);
         } else {
-            warn!("Flat volume profile upsert returned 0 rows affected: {} on {}", symbol, date);
+            warn!("Volume profile upsert returned 0 rows affected: {} on {}", symbol, date);
         }
 
         Ok(rows_affected)
@@ -339,9 +279,11 @@ impl VolumeProfileDatabase {
             ));
         }
 
-        // Build parameter list
+        // Build parameter list - use f64 directly for PostgreSQL DECIMAL compatibility
         let candle_count_param = profile_data.candle_count as i32;
         let last_updated_param = profile_data.last_updated;
+        
+        // Use f64 directly - PostgreSQL can handle f64 to DECIMAL conversion
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
             &symbol,
             &date,
@@ -359,10 +301,17 @@ impl VolumeProfileDatabase {
             &last_updated_param,
         ];
 
-        // Add price level parameters
+        // Add price level parameters - use f64 directly
+        let mut price_params = Vec::new();
+        let mut volume_params = Vec::new();
         for level in &profile_data.price_levels[..level_count] {
-            params.push(&level.price);
-            params.push(&level.volume);
+            price_params.push(level.price);
+            volume_params.push(level.volume);
+        }
+        
+        for i in 0..level_count {
+            params.push(&price_params[i]);
+            params.push(&volume_params[i]);
         }
 
         // Execute upsert within transaction
@@ -713,12 +662,37 @@ impl VolumeProfileDatabase {
         // Create new flat format table
         let create_sql = self.get_create_table_sql();
         client.execute(&create_sql, &[]).await?;
+        info!("✅ Volume profile table created successfully");
 
-        // Create trigger
-        let trigger_sql = self.get_create_trigger_sql();
-        client.execute(&trigger_sql, &[]).await?;
+        // Create indexes (each as separate statement)
+        let index_statements = self.get_create_indexes_sql();
+        for (i, index_sql) in index_statements.iter().enumerate() {
+            match client.execute(index_sql, &[]).await {
+                Ok(_) => {
+                    debug!("✅ Index {}/{} created successfully", i + 1, index_statements.len());
+                }
+                Err(e) => {
+                    warn!("⚠️ Failed to create index {}/{}: {} - continuing with schema creation", i + 1, index_statements.len(), e);
+                }
+            }
+        }
+        info!("✅ Volume profile indexes created ({} total)", index_statements.len());
 
-        info!("Successfully created flat volume profile table schema");
+        // Create trigger (function + trigger as separate statements)
+        let trigger_statements = self.get_create_trigger_sql();
+        for (i, trigger_sql) in trigger_statements.iter().enumerate() {
+            match client.execute(trigger_sql, &[]).await {
+                Ok(_) => {
+                    debug!("✅ Trigger statement {}/{} executed successfully", i + 1, trigger_statements.len());
+                }
+                Err(e) => {
+                    warn!("⚠️ Failed to execute trigger statement {}/{}: {} - continuing", i + 1, trigger_statements.len(), e);
+                }
+            }
+        }
+        info!("✅ Volume profile trigger setup completed ({} statements)", trigger_statements.len());
+
+        info!("✅ Volume profile table schema initialization completed");
         Ok(())
     }
 }
@@ -799,16 +773,38 @@ mod tests {
         assert!(sql.contains("vwap DECIMAL(20,8) NOT NULL"));
         assert!(sql.contains("poc DECIMAL(20,8) NOT NULL"));
         assert!(sql.contains("PRIMARY KEY (symbol, date)"));
+        
+        // Additional checks for syntax correctness
+        assert!(sql.contains("price_001 DECIMAL(20,8), volume_001 DECIMAL(20,8)"));
+        assert!(sql.contains("price_200 DECIMAL(20,8), volume_200 DECIMAL(20,8)"));
+        assert!(!sql.contains("price_201")); // Should not have more than 200 levels
+    }
+
+    #[test]
+    fn test_create_indexes_sql() {
+        let db = VolumeProfileDatabase::new();
+        let indexes = db.get_create_indexes_sql();
+        
+        assert_eq!(indexes.len(), 7); // Should have 7 indexes (removed problematic recent index)
+        assert!(indexes[0].contains("CREATE INDEX IF NOT EXISTS idx_volume_profiles_date"));
+        assert!(indexes[1].contains("CREATE INDEX IF NOT EXISTS idx_volume_profiles_symbol"));
+        assert!(indexes[2].contains("CREATE INDEX IF NOT EXISTS idx_volume_profiles_symbol_date"));
+        assert!(indexes[3].contains("CREATE INDEX IF NOT EXISTS idx_volume_profiles_vwap"));
+        assert!(indexes[4].contains("CREATE INDEX IF NOT EXISTS idx_volume_profiles_poc"));
+        assert!(indexes[5].contains("CREATE INDEX IF NOT EXISTS idx_volume_profiles_symbol_vwap"));
+        assert!(indexes[6].contains("CREATE INDEX IF NOT EXISTS idx_volume_profiles_value_area"));
     }
 
     #[test]
     fn test_create_trigger_sql() {
         let db = VolumeProfileDatabase::new();
-        let sql = db.get_create_trigger_sql();
+        let statements = db.get_create_trigger_sql();
         
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION update_volume_profiles_updated_at()"));
-        assert!(sql.contains("CREATE TRIGGER trigger_update_volume_profiles_updated_at"));
-        assert!(sql.contains("BEFORE UPDATE ON volume_profiles"));
+        assert_eq!(statements.len(), 3); // Should have 3 statements: function, drop trigger, create trigger
+        assert!(statements[0].contains("CREATE OR REPLACE FUNCTION update_volume_profiles_updated_at()"));
+        assert!(statements[1].contains("DROP TRIGGER IF EXISTS trigger_update_volume_profiles_updated_at"));
+        assert!(statements[2].contains("CREATE TRIGGER trigger_update_volume_profiles_updated_at"));
+        assert!(statements[2].contains("BEFORE UPDATE ON volume_profiles"));
     }
 
     #[test]

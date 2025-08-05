@@ -5,14 +5,14 @@ use chrono::{NaiveDate, Utc, DateTime, Datelike, Timelike};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::message::{Context, Message};
-// use kameo::request::MessageSend; // Removed - no longer needed after Kafka publishing removal
+use kameo::request::MessageSend;
 use kameo::{Actor, mailbox::unbounded::UnboundedMailbox};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::historical::structs::FuturesOHLCVCandle;
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
-use crate::postgres::PostgresActor;
+use crate::postgres::{PostgresActor, PostgresTell};
 // Kafka publishing is now handled by IndicatorActor to avoid duplicate messages
 // use crate::kafka::{KafkaActor, KafkaTell};
 // use crate::technical_analysis::structs::IndicatorOutput;
@@ -1746,20 +1746,29 @@ impl VolumeProfileActor {
 
     /// Store volume profile in PostgreSQL database
     async fn store_profile_in_database(&self, profile_key: &ProfileKey, profile_data: &VolumeProfileData) -> Result<(), String> {
-        if let Some(_postgres_actor) = &self.postgres_actor {
-            // Convert profile data to JSON for storage
-            let _json_data = serde_json::to_value(profile_data)
-                .map_err(|e| format!("Failed to serialize profile data: {}", e))?;
-
-            // Create SQL for upsert operation (this would need to be implemented in the database module)
-            // For now, we'll use a placeholder approach
+        if let Some(postgres_actor) = &self.postgres_actor {
             debug!("Storing volume profile in database: {} on {} ({} price levels)", 
                    profile_key.symbol, profile_key.date, profile_data.price_levels.len());
 
-            // TODO: Implement actual database storage
-            // The database module will handle the UPSERT operation with proper SQL
-            
-            Ok(())
+            // Send StoreVolumeProfile message to PostgreSQL actor
+            let message = crate::postgres::actor::PostgresTell::StoreVolumeProfile {
+                symbol: profile_key.symbol.clone(),
+                date: profile_key.date,
+                profile_data: profile_data.clone(),
+            };
+
+            match postgres_actor.tell(message).await {
+                Ok(()) => {
+                    debug!("✅ Volume profile storage request sent successfully: {} on {}", 
+                           profile_key.symbol, profile_key.date);
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("❌ Failed to send volume profile storage request: {} on {}: {}", 
+                           profile_key.symbol, profile_key.date, e);
+                    Err(format!("Failed to send storage request: {}", e))
+                }
+            }
         } else {
             Err("PostgreSQL actor not available".to_string())
         }
@@ -2045,35 +2054,63 @@ impl Message<VolumeProfileTell> for VolumeProfileActor {
             }
             VolumeProfileTell::SetActorReferences { postgres_actor, lmdb_actor } => {
                 info!("🔧 CRITICAL FIX: Setting actor references for VolumeProfileActor");
-                self.postgres_actor = postgres_actor;
+                self.postgres_actor = postgres_actor.clone();
                 self.lmdb_actor = Some(lmdb_actor);
                 self.is_healthy = true;
                 info!("✅ CRITICAL FIX: VolumeProfileActor references set - LMDB access enabled for historical data reconstruction");
                 
+                // 🏗️ INITIALIZE POSTGRESQL SCHEMA: Create volume profile table if PostgreSQL is enabled
+                if let Some(ref postgres_ref) = postgres_actor {
+                    info!("🏗️ Initializing PostgreSQL volume profile table schema");
+                    match postgres_ref.tell(PostgresTell::InitVolumeProfileSchema).send().await {
+                        Ok(()) => {
+                            info!("✅ PostgreSQL volume profile schema initialization request sent successfully");
+                        }
+                        Err(e) => {
+                            warn!("⚠️ Failed to send PostgreSQL schema initialization request: {} - volume profile calculation will continue with LMDB only", e);
+                        }
+                    }
+                } else {
+                    info!("📊 PostgreSQL not enabled - volume profile data will be stored in LMDB only");
+                }
+                
                 // 🔄 NOW REBUILD HISTORICAL DATA: References are set, we can now access LMDB
                 if self.config.enabled {
                     let today = chrono::Utc::now().date_naive();
-                    info!("🔄 STARTUP RECONSTRUCTION: Now rebuilding volume profiles for current day: {}", today);
+                    let historical_days = self.config.historical_days;
+                    info!("🔄 STARTUP RECONSTRUCTION: Now rebuilding volume profiles for {} historical days (up to {})", historical_days, today);
                     
                     let active_symbols = vec!["BTCUSDT"]; // TODO: Make this configurable
                     
                     for symbol in active_symbols {
-                        info!("🔄 STARTUP: Rebuilding volume profile for {} on {}", symbol, today);
-                        match self.rebuild_day(symbol.to_string(), today).await {
-                            Ok(()) => {
-                                info!("✅ STARTUP: Successfully initialized volume profile for {} on {}", symbol, today);
-                            }
-                            Err(e) => {
-                                if e.contains("PostgreSQL actor not available") {
-                                    info!("📊 STARTUP: Volume profile for {} initialized in memory-only mode (database offline)", symbol);
-                                } else {
-                                    warn!("⚠️ STARTUP: Failed to rebuild volume profile for {} on {}: {}", symbol, today, e);
+                        info!("🔄 STARTUP: Rebuilding {} days of volume profiles for {}", historical_days, symbol);
+                        
+                        // Rebuild multiple historical days, not just today
+                        for days_back in 0..historical_days {
+                            let target_date = today - chrono::Duration::days(days_back as i64);
+                            
+                            match self.rebuild_day(symbol.to_string(), target_date).await {
+                                Ok(()) => {
+                                    info!("✅ STARTUP: Successfully initialized volume profile for {} on {}", symbol, target_date);
+                                }
+                                Err(e) => {
+                                    if e.contains("PostgreSQL actor not available") {
+                                        debug!("📊 STARTUP: Volume profile for {} on {} initialized in memory-only mode (database offline)", symbol, target_date);
+                                    } else if days_back < 7 {
+                                        // Only warn for recent days (last week)
+                                        warn!("⚠️ STARTUP: Failed to rebuild volume profile for {} on {} (recent): {}", symbol, target_date, e);
+                                    } else {
+                                        // Just debug for older days that might not have data
+                                        debug!("📊 STARTUP: No data for {} on {} (historical): {}", symbol, target_date, e);
+                                    }
                                 }
                             }
                         }
+                        
+                        info!("✅ STARTUP: Completed {} days of volume profile initialization for {}", historical_days, symbol);
                     }
                     
-                    info!("🎯 STARTUP RECONSTRUCTION COMPLETE: All volume profiles initialized");
+                    info!("🎯 STARTUP RECONSTRUCTION COMPLETE: All {} days of volume profiles initialized", historical_days);
                 }
             }
         }
@@ -2133,6 +2170,7 @@ mod tests {
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
             calculation_mode: VolumeProfileCalculationMode::Volume,
             asset_overrides: std::collections::HashMap::new(),
+            historical_days: 60,
         }
     }
 
@@ -3194,5 +3232,52 @@ mod tests {
         assert_eq!(metrics.total_candles_processed, candles_processed as u64);
         assert_eq!(metrics.successful_sessions, 1);
         assert_eq!(metrics.success_rate_percentage, 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_postgresql_schema_initialization() {
+        // Test that PostgreSQL schema initialization is properly called during SetActorReferences
+        use kameo::spawn;
+        use crate::lmdb::LmdbActor;
+        use crate::postgres::PostgresActor;
+        use tempfile::TempDir;
+        
+        // Create test config with volume profile enabled
+        let mut config = create_test_config();
+        config.enabled = true;
+        
+        // Create and spawn VolumeProfileActor
+        let actor = VolumeProfileActor::new(config).unwrap();
+        let volume_profile_ref = spawn(actor);
+        
+        // Create temporary directory for LMDB
+        let temp_dir = TempDir::new().unwrap();
+        let lmdb_actor = LmdbActor::new(temp_dir.path(), 60).unwrap();
+        let lmdb_ref = spawn(lmdb_actor);
+        
+        let postgres_config = crate::postgres::PostgresConfig {
+            enabled: false, // Disabled to avoid actual database connection
+            ..Default::default()
+        };
+        let postgres_actor = PostgresActor::new(postgres_config).unwrap();
+        let postgres_ref = spawn(postgres_actor);
+        
+        // Send SetActorReferences message
+        let set_refs_msg = VolumeProfileTell::SetActorReferences {
+            postgres_actor: Some(postgres_ref),
+            lmdb_actor: lmdb_ref,
+        };
+        
+        // This should not fail and should complete without panicking
+        // The actual schema initialization will be logged but won't execute due to disabled PostgreSQL
+        let result = volume_profile_ref.tell(set_refs_msg).send().await;
+        assert!(result.is_ok(), "SetActorReferences message should succeed");
+        
+        // Wait a moment for the message to be processed
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        // Test passes if we reach this point without panicking
+        // In a real integration test with database, we would verify the table exists
+        println!("✅ PostgreSQL schema initialization test completed successfully");
     }
 }

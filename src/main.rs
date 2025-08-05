@@ -205,7 +205,11 @@ impl DataFeederConfig {
             periodic_gap_check_window_minutes: toml_config.application.periodic_gap_check_window_minutes,
             postgres_config: toml_config.database,
             kafka_config: toml_config.kafka.unwrap_or_default(),
-            volume_profile_config: toml_config.volume_profile.unwrap_or_default(),
+            volume_profile_config: {
+                let mut vp_config = toml_config.volume_profile.unwrap_or_default();
+                vp_config.historical_days = historical_validation_days;
+                vp_config
+            },
             // Historical validation tracking
             historical_validation_complete: false, // Start with Phase 1 unless forced
             recent_monitoring_days: 60, // Monitor last 60 days in Phase 2

@@ -9,7 +9,10 @@ use tokio_postgres::NoTls;
 use tracing::{error, info, warn};
 
 use crate::historical::structs::FuturesOHLCVCandle;
+use crate::volume_profile::database::VolumeProfileDatabase;
+use crate::volume_profile::structs::VolumeProfileData;
 use super::errors::PostgresError;
+use chrono::NaiveDate;
 
 /// PostgreSQL configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +62,14 @@ pub enum PostgresTell {
     },
     /// Health check message
     HealthCheck,
+    /// Initialize volume profile table schema
+    InitVolumeProfileSchema,
+    /// Store volume profile data
+    StoreVolumeProfile {
+        symbol: String,
+        date: NaiveDate,
+        profile_data: VolumeProfileData,
+    },
 }
 
 /// PostgreSQL actor messages for asking (request-response)
@@ -628,6 +639,59 @@ impl Message<PostgresTell> for PostgresActor {
                     error!("Health check batch flush failed: {}", e);
                 } else {
                     info!("✅ [PostgresActor] HealthCheck completed successfully");
+                }
+            }
+            PostgresTell::InitVolumeProfileSchema => {
+                info!("🏗️ [PostgresActor] Initializing volume profile table schema");
+                
+                if let Some(ref pool) = self.pool {
+                    match pool.get().await {
+                        Ok(client) => {
+                            let db = VolumeProfileDatabase::new();
+                            match db.create_flat_table_schema(&client).await {
+                                Ok(()) => {
+                                    info!("✅ [PostgresActor] Volume profile table schema initialized successfully");
+                                }
+                                Err(e) => {
+                                    error!("❌ [PostgresActor] Failed to initialize volume profile table schema: {}", e);
+                                    self.last_error = Some(format!("Schema initialization failed: {}", e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("❌ [PostgresActor] Failed to get database client for schema initialization: {}", e);
+                            self.last_error = Some(format!("Client acquisition failed: {}", e));
+                        }
+                    }
+                } else {
+                    warn!("⚠️ [PostgresActor] PostgreSQL pool not available - schema initialization skipped");
+                }
+            }
+            PostgresTell::StoreVolumeProfile { symbol, date, profile_data } => {
+                info!("💾 [PostgresActor] Storing volume profile: {} on {}", symbol, date);
+                
+                if let Some(ref pool) = self.pool {
+                    match pool.get().await {
+                        Ok(client) => {
+                            let db = VolumeProfileDatabase::new();
+                            match db.upsert_volume_profile(&client, &symbol, date, &profile_data).await {
+                                Ok(rows_affected) => {
+                                    info!("✅ [PostgresActor] Volume profile stored successfully: {} on {} ({} rows affected)", 
+                                          symbol, date, rows_affected);
+                                }
+                                Err(e) => {
+                                    error!("❌ [PostgresActor] Failed to store volume profile: {} on {}: {}", symbol, date, e);
+                                    self.last_error = Some(format!("Volume profile storage failed: {}", e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("❌ [PostgresActor] Failed to get database client for volume profile storage: {}", e);
+                            self.last_error = Some(format!("Client acquisition failed: {}", e));
+                        }
+                    }
+                } else {
+                    warn!("⚠️ [PostgresActor] PostgreSQL pool not available - volume profile storage skipped");
                 }
             }
         }
