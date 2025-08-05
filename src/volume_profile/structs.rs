@@ -1362,8 +1362,8 @@ impl PriceLevelMap {
         
         // Step 4: Balanced expansion around POC - prioritize centering while considering volume
         let mut loop_count = 0;
-        let mut left_expansions = 0;
-        let mut right_expansions = 0;
+        let mut left_expansions: i32 = 0;
+        let mut right_expansions: i32 = 0;
         
         while included_metric < target_metric && (low_index > 0 || high_index < all_levels.len() - 1) {
             loop_count += 1;
@@ -1399,7 +1399,7 @@ impl PriceLevelMap {
             // Balanced expansion logic - prioritize centering
             let selected_candidate = match (left_candidate, right_candidate) {
                 (Some(left), Some(right)) => {
-                    let balance_diff = (left_expansions as i32 - right_expansions as i32).abs();
+                    let balance_diff = (left_expansions - right_expansions).abs();
                     
                     // If expansion is heavily unbalanced (>3 difference), force balance
                     if balance_diff > 3 {

@@ -13,3 +13,7 @@ pub mod tokio_metrics;
 pub mod queue;
 pub mod volume_profile;
 pub mod logging;
+pub mod profiling;
+pub mod performance;
+pub mod system_resources;
+pub mod adaptive_config;

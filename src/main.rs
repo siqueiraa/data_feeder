@@ -15,6 +15,8 @@ use data_feeder::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 use data_feeder::metrics::{init_metrics};
 use data_feeder::metrics_server::start_metrics_server;
 use data_feeder::logging::{LoggingConfig, LogRotation, init_dual_logging, log_system_info, cleanup_old_logs};
+use data_feeder::system_resources::SystemResources;
+use data_feeder::adaptive_config::{AdaptiveConfig, AdaptiveConfigToml};
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
@@ -82,6 +84,7 @@ struct TomlConfig {
     pub volume_profile: Option<VolumeProfileConfig>,
     pub logging: Option<LoggingTomlConfig>,
     pub historical_validation: Option<HistoricalValidationTomlConfig>,
+    pub adaptive: Option<AdaptiveConfigToml>,
 }
 
 /// Production configuration (converted from TOML)
@@ -120,6 +123,8 @@ struct DataFeederConfig {
     pub historical_validation_skip_empty_days: bool, // Skip days with no data
     // Logging configuration
     pub logging_config: LoggingConfig,
+    // Adaptive configuration based on system resources
+    pub adaptive_config: AdaptiveConfig,
 }
 
 impl DataFeederConfig {
@@ -133,6 +138,15 @@ impl DataFeederConfig {
     
     /// Convert TOML configuration to DataFeederConfig
     fn from_toml_config(toml_config: TomlConfig) -> Self {
+        // Detect system resources first (before any configuration processing)
+        let system_resources = SystemResources::detect_and_cache()
+            .expect("Failed to detect system resources");
+        
+        // Generate adaptive configuration based on system resources and TOML overrides
+        let adaptive_config = AdaptiveConfig::from_system_resources(
+            system_resources,
+            toml_config.adaptive.clone(),
+        );
         let mut symbols = toml_config.application.symbols.clone();
         if symbols.is_empty() {
             symbols = vec!["BTCUSDT".to_string()];
@@ -221,6 +235,8 @@ impl DataFeederConfig {
             historical_validation_skip_empty_days,
             // Logging configuration
             logging_config,
+            // Adaptive configuration
+            adaptive_config,
         }
     }
 }
@@ -262,6 +278,17 @@ impl Default for DataFeederConfig {
             historical_validation_skip_empty_days: true,
             // Logging configuration
             logging_config: LoggingConfig::default(),
+            // Adaptive configuration - use static defaults for Default implementation
+            adaptive_config: {
+                // Try to detect resources, but fall back to static config if detection fails
+                match SystemResources::detect_and_cache() {
+                    Ok(resources) => AdaptiveConfig::from_system_resources(resources, None),
+                    Err(_) => {
+                        warn!("Failed to detect system resources in Default impl, using static config");
+                        AdaptiveConfig::default_static_config()
+                    }
+                }
+            },
         }
     }
 }
@@ -537,6 +564,15 @@ async fn main() {
         storage_path = %config.storage_path.display(),
         log_dir = %config.logging_config.log_dir,
         "🔧 System configuration logged for debugging"
+    );
+    
+    // Log adaptive configuration information  
+    info!(
+        adaptive_worker_threads = config.adaptive_config.thread_pools.worker_threads,
+        adaptive_database_batch_size = config.adaptive_config.processing.database_batch_size,
+        adaptive_websocket_buffer_mb = config.adaptive_config.buffers.websocket_buffer_size / (1024 * 1024),
+        adaptive_memory_intensive_enabled = config.adaptive_config.memory.enable_memory_intensive_features,
+        "⚙️ Adaptive configuration applied successfully"
     );
 
     info!("🚀 Starting Data Feeder - Production Mode");

@@ -44,6 +44,11 @@ pub struct MetricsRegistry {
     // Error Tracking
     pub error_count_by_type: IntCounterVec,
     pub panic_count_total: IntCounterVec,
+    
+    // CPU Performance Metrics (NEW)
+    pub cpu_usage_percent: IntGaugeVec,
+    pub component_cpu_time_nanos: IntCounterVec,
+    pub operation_duration_histogram: HistogramVec,
 }
 
 impl MetricsRegistry {
@@ -175,6 +180,25 @@ impl MetricsRegistry {
             &["component", "location"]
         )?;
         
+        // CPU Performance Metrics (NEW)
+        let cpu_usage_percent = IntGaugeVec::new(
+            Opts::new("cpu_usage_percent", "Current CPU usage percentage by component"),
+            &["component", "thread"]
+        )?;
+        
+        let component_cpu_time_nanos = IntCounterVec::new(
+            Opts::new("component_cpu_time_nanos", "Total CPU time consumed by component in nanoseconds"),
+            &["component", "operation"]
+        )?;
+        
+        let operation_duration_histogram = HistogramVec::new(
+            HistogramOpts::new(
+                "operation_duration_seconds",
+                "Duration of operations across all components"
+            ).buckets(vec![0.000001, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0]),
+            &["component", "operation"]
+        )?;
+        
         // Register all metrics
         registry.register(Box::new(indicator_processing_duration.clone()))?;
         registry.register(Box::new(indicator_processing_total.clone()))?;
@@ -196,12 +220,17 @@ impl MetricsRegistry {
         registry.register(Box::new(error_count_by_type.clone()))?;
         registry.register(Box::new(panic_count_total.clone()))?;
         
+        // Register CPU performance metrics
+        registry.register(Box::new(cpu_usage_percent.clone()))?;
+        registry.register(Box::new(component_cpu_time_nanos.clone()))?;
+        registry.register(Box::new(operation_duration_histogram.clone()))?;
+        
         let _total_metrics = if tokio_metrics_collector.is_some() { 
-            info!("Prometheus metrics registry initialized with {} business metrics + tokio task metrics", 19);
-            19 + 9 // 19 business metrics + 9 tokio task metrics
+            info!("Prometheus metrics registry initialized with {} business metrics + tokio task metrics", 22);
+            22 + 9 // 22 business metrics + 9 tokio task metrics
         } else {
-            info!("Prometheus metrics registry initialized with {} business metrics (tokio metrics disabled)", 19);
-            19
+            info!("Prometheus metrics registry initialized with {} business metrics (tokio metrics disabled)", 22);
+            22
         };
         
         // Add some initial test data to verify metrics are working
@@ -227,6 +256,9 @@ impl MetricsRegistry {
             t_digest_memory_bytes,
             error_count_by_type,
             panic_count_total,
+            cpu_usage_percent,
+            component_cpu_time_nanos,
+            operation_duration_histogram,
         };
         
         // Add some test data so metrics show up immediately
@@ -316,6 +348,27 @@ impl MetricsRegistry {
     pub fn tokio_metrics_collector(&self) -> Option<&TokioMetricsCollector> {
         self.tokio_metrics_collector.as_ref()
     }
+    
+    /// Record CPU usage for a component
+    pub fn record_cpu_usage(&self, component: &str, thread: &str, cpu_percent: i64) {
+        self.cpu_usage_percent
+            .with_label_values(&[component, thread])
+            .set(cpu_percent);
+    }
+    
+    /// Record CPU time consumed by a component operation
+    pub fn record_cpu_time(&self, component: &str, operation: &str, cpu_time_nanos: u64) {
+        self.component_cpu_time_nanos
+            .with_label_values(&[component, operation])
+            .inc_by(cpu_time_nanos);
+    }
+    
+    /// Record operation duration for histogram analysis
+    pub fn record_operation_duration(&self, component: &str, operation: &str, duration_seconds: f64) {
+        self.operation_duration_histogram
+            .with_label_values(&[component, operation])
+            .observe(duration_seconds);
+    }
 }
 
 impl Default for MetricsRegistry {
@@ -367,6 +420,24 @@ macro_rules! record_simd_op {
     ($operation:expr, $vector_size:expr) => {
         if let Some(metrics) = $crate::metrics::get_metrics() {
             metrics.record_simd_operation($operation, $vector_size);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! record_cpu_usage {
+    ($component:expr, $thread:expr, $cpu_percent:expr) => {
+        if let Some(metrics) = $crate::metrics::get_metrics() {
+            metrics.record_cpu_usage($component, $thread, $cpu_percent);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! record_operation_duration {
+    ($component:expr, $operation:expr, $duration_seconds:expr) => {
+        if let Some(metrics) = $crate::metrics::get_metrics() {
+            metrics.record_operation_duration($component, $operation, $duration_seconds);
         }
     };
 }

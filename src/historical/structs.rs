@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 pub type TimestampMS = i64;
 pub type Seconds = u64;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FuturesOHLCVCandle {
     pub open_time: TimestampMS,
     pub close_time: TimestampMS,

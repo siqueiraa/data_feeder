@@ -17,9 +17,10 @@ use tracing::{debug, error, info, warn};
 use crate::common::shared_data::{
     SharedCandle, SharedSymbol, shared_candle, intern_symbol
 };
+use crate::common::object_pool::init_global_pools;
 use crate::historical::structs::FuturesOHLCVCandle;
 use crate::postgres::{PostgresActor, PostgresTell};
-use crate::websocket::binance::kline::parse_any_kline_message;
+use crate::websocket::optimized_parser::parse_any_kline_message_optimized;
 use crate::websocket::connection::{ConnectionManager, normalize_symbols};
 use crate::websocket::types::{
     ConnectionStats, ConnectionStatus, StreamSubscription, StreamType, WebSocketError,
@@ -612,7 +613,7 @@ impl WebSocketActor {
             let message_handler = |message: String| {
                 let actor_ref = actor_ref_for_connection.clone();
                 async move {
-                    match parse_any_kline_message(&message) {
+                    match parse_any_kline_message_optimized(&message) {
                         Ok(kline_event) => {
                             debug!("🔍 Parsed kline message for {} (closed: {})", kline_event.symbol, kline_event.kline.is_completed());
                             
@@ -773,6 +774,11 @@ impl Actor for WebSocketActor {
         info!("🚀 Starting WebSocket Actor");
         info!("📁 LMDB storage path: {}", self.base_path.display());
         info!("🌐 Target exchange: Binance Futures");
+        
+        // Initialize global object pools for performance optimization
+        let pools = init_global_pools();
+        info!("⚡ Initialized global object pools for WebSocket actor");
+        debug!("📊 Object pools initialized: {}", pools.stats_report());
 
         // Start adaptive health check task
         let actor_ref_clone = actor_ref.clone();

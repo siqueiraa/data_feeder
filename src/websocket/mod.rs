@@ -2,6 +2,7 @@ pub mod actor;
 pub mod binance;
 pub mod connection;
 pub mod types;
+pub mod optimized_parser;
 
 #[cfg(test)]
 pub mod tests;
