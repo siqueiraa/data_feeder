@@ -834,7 +834,8 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
             config.storage_path.clone(), 
             300, // 5min health check timeout
             config.reconnection_gap_threshold_minutes,
-            config.reconnection_gap_check_delay_seconds
+            config.reconnection_gap_check_delay_seconds,
+            &config.adaptive_config,
         ).map_err(|e| format!("Failed to create WebSocket actor: {}", e))?;
         
         // Note: We'll set other actor references later
@@ -927,7 +928,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     let historical_start = std::time::Instant::now();
     let historical_actor = {
         let csv_temp_path = config.storage_path.join("temp_csv"); // Temporary staging within main storage
-        let mut actor = HistoricalActor::new(&config.symbols, &config.timeframes, &config.storage_path, &csv_temp_path)
+        let mut actor = HistoricalActor::new(&config.symbols, &config.timeframes, &config.storage_path, &csv_temp_path, &config.adaptive_config)
             .map_err(|e| format!("Failed to create HistoricalActor: {}", e))?;
         if let Some(ref postgres_ref) = postgres_actor {
             actor.set_postgres_actor(postgres_ref.clone());

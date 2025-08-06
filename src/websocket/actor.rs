@@ -14,6 +14,7 @@ use kameo::{Actor, mailbox::unbounded::UnboundedMailbox};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
+use crate::adaptive_config::AdaptiveConfig;
 use crate::common::shared_data::{
     SharedCandle, SharedSymbol, shared_candle, intern_symbol
 };
@@ -178,8 +179,8 @@ pub struct WebSocketActor {
 
 impl WebSocketActor {
     /// Create a new WebSocket actor with default settings
-    pub fn new(base_path: PathBuf) -> Result<Self, WebSocketError> {
-        Self::new_with_config(base_path, 300, 2, 5) // 5min max idle, 2min gap threshold, 5s delay
+    pub fn new(base_path: PathBuf, adaptive_config: &AdaptiveConfig) -> Result<Self, WebSocketError> {
+        Self::new_with_config(base_path, 300, 2, 5, adaptive_config) // 5min max idle, 2min gap threshold, 5s delay
     }
 
     /// Set the API actor reference for gap filling
@@ -207,7 +208,8 @@ impl WebSocketActor {
         base_path: PathBuf, 
         max_idle_secs: u64,
         gap_threshold_minutes: u32,
-        gap_check_delay_seconds: u32
+        gap_check_delay_seconds: u32,
+        adaptive_config: &AdaptiveConfig,
     ) -> Result<Self, WebSocketError> {
         let connection_manager = ConnectionManager::new_binance_futures();
         
@@ -216,14 +218,14 @@ impl WebSocketActor {
                 .map_err(|e| WebSocketError::Unknown(format!("Failed to create base path: {}", e)))?;
         }
 
-        // Initialize queue system for non-blocking operations with CPU-aware worker allocation
-        let cpu_count = num_cpus::get();
+        // Initialize queue system for non-blocking operations using adaptive configuration
+        let worker_threads = adaptive_config.get_worker_thread_count();
         let task_config = QueueConfig {
-            max_workers: cpu_count.max(2).min(4), // 1x CPU cores, min 2, max 4
+            max_workers: worker_threads.max(1), // Use adaptive config, minimum 1
             ..QueueConfig::default()
         };
         let db_config = QueueConfig {
-            max_workers: (cpu_count / 2).max(1).min(2), // 0.5x CPU cores, min 1, max 2
+            max_workers: (worker_threads / 2).max(1), // Half of adaptive threads, minimum 1
             batch_size: 10, // Batch candles for better performance
             batch_timeout: Duration::from_millis(100),
             ..QueueConfig::default()

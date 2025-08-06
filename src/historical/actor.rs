@@ -13,6 +13,7 @@ use rustc_hash::FxHashMap;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 use rayon::prelude::*;
+use crate::adaptive_config::AdaptiveConfig;
 use crate::queue::{TaskQueue, IoQueue, DatabaseQueue, RateLimitingQueue, Priority};
 use crate::queue::types::QueueConfig;
 
@@ -44,7 +45,7 @@ pub struct HistoricalActor {
 }
 
 impl HistoricalActor {
-    pub fn new(_symbols: &[String], _timeframes: &[Seconds], _base_path: &Path, csv_path: &Path) -> Result<Self, HistoricalDataError> {
+    pub fn new(_symbols: &[String], _timeframes: &[Seconds], _base_path: &Path, csv_path: &Path, adaptive_config: &AdaptiveConfig) -> Result<Self, HistoricalDataError> {
         // Create CSV directory
         if !csv_path.exists() {
             info!("📁 Creating CSV directory at: {}", csv_path.display());
@@ -52,22 +53,20 @@ impl HistoricalActor {
                 .with_io_context("Failed to create CSV directory")?;
         }
 
-        // Initialize queue system for non-blocking operations with CPU-aware worker allocation
-        let cpu_count = num_cpus::get();
-        let task_workers = (cpu_count * 2).max(2).min(8); // 2x CPU cores, min 2, max 8
-        let io_workers = cpu_count.max(2).min(4); // 1x CPU cores, min 2, max 4
-        let db_workers = (cpu_count / 2).max(1).min(2); // 0.5x CPU cores, min 1, max 2
+        // Initialize queue system for non-blocking operations using adaptive configuration
+        let worker_threads = adaptive_config.get_worker_thread_count();
+        let io_threads = adaptive_config.thread_pools.io_threads;
         
         let task_config = QueueConfig {
-            max_workers: task_workers,
+            max_workers: worker_threads.max(1), // Use adaptive config, minimum 1
             ..QueueConfig::default()
         };
         let io_config = QueueConfig {
-            max_workers: io_workers,
+            max_workers: io_threads.max(1), // Use adaptive IO threads, minimum 1
             ..QueueConfig::default()
         };
         let db_config = QueueConfig {
-            max_workers: db_workers,
+            max_workers: (worker_threads / 2).max(1), // Half of adaptive threads, minimum 1
             ..QueueConfig::default()
         };
         
@@ -88,7 +87,7 @@ impl HistoricalActor {
 
         info!("HistoricalActor initialized - LMDB operations will be delegated to LmdbActor");
         info!("🚀 Queue system initialized: {} CPU workers, {} I/O workers, {} DB workers, 1200 req/min rate limit", 
-              task_workers, io_workers, db_workers);
+               worker_threads, io_threads, (worker_threads / 2).max(1));
 
         Ok(Self { 
             csv_path: csv_path.to_path_buf(),
