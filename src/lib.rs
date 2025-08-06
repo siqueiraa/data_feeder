@@ -17,3 +17,4 @@ pub mod profiling;
 pub mod performance;
 pub mod system_resources;
 pub mod adaptive_config;
+pub mod deployment_validation;

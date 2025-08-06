@@ -94,3 +94,37 @@ value_area_percentage = 70.0        # Percentage of volume to include in value a
 # Micro-cap altcoins with ultra-precise adaptive ranges
 "PEPEUSDT" = { price_increment_mode = "Adaptive", min_price_increment = 0.00000001, max_price_increment = 0.000001, calculation_mode = "TPO" }
 "SHIBUSDT" = { price_increment_mode = "Adaptive", min_price_increment = 0.00000001, max_price_increment = 0.00001, calculation_mode = "TPO" }
+
+[adaptive]
+# Adaptive resource configuration system
+enabled = true  # Enable adaptive configuration based on system resources
+
+# Manual overrides for adaptive configuration
+# (all parameters are optional - omit to use adaptive values)
+[adaptive.overrides]
+# Thread pool overrides
+# worker_threads = 8       # Override worker thread count
+# io_threads = 16          # Override I/O thread count
+# cpu_threads = 4          # Override CPU-intensive thread count
+# network_threads = 2      # Override network thread count
+
+# Buffer size overrides (in MB for convenience)
+# websocket_buffer_mb = 16    # WebSocket message buffer (MB)
+# database_buffer_mb = 64     # Database batch buffer (MB)
+# file_io_buffer_mb = 32      # File I/O buffer (MB)
+# network_buffer_mb = 8       # Network buffer (MB)
+
+# Processing batch size overrides
+# database_batch_size = 2000  # Database batch size (number of records)
+# api_batch_size = 100        # API request batch size
+# file_chunk_size = 16384     # File processing chunk size
+# memory_chunk_size = 8192    # Memory processing chunk size
+
+# Memory management overrides
+# max_memory_usage_percent = 75.0         # Maximum memory usage (0-100%)
+# cleanup_threshold_percent = 65.0        # Memory cleanup threshold (0-100%)
+# cache_size_mb = 512                     # Cache size limit (MB)
+# enable_memory_intensive_features = true # Enable memory-intensive features
+
+# Disable adaptive configuration entirely (use static defaults)
+# disable_adaptive = false

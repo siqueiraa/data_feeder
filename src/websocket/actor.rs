@@ -69,6 +69,10 @@ pub enum WebSocketTell {
     SetVolumeProfileActor {
         volume_profile_actor: ActorRef<VolumeProfileActor>,
     },
+    /// Set the API actor reference for gap filling
+    SetApiActor {
+        api_actor: ActorRef<crate::api::ApiActor>,
+    },
     /// Flush pending batches to prevent candles from getting stuck
     FlushBatches,
 }
@@ -609,6 +613,7 @@ impl WebSocketActor {
 
         let mut connection_manager = self.connection_manager.clone();
         let actor_ref_for_connection = actor_ref.clone();
+        let gap_check_delay = self.gap_check_delay_seconds;
         let handle = tokio::spawn(async move {
             let message_handler = |message: String| {
                 let actor_ref = actor_ref_for_connection.clone();
@@ -654,7 +659,29 @@ impl WebSocketActor {
                 }
             };
 
-            if let Err(e) = connection_manager.connect_with_retry(&url, message_handler).await {
+            // Note: Gap detection is handled by the reconnection callback
+            
+            // Reconnection callback - triggers gap detection after successful reconnection
+            let reconnection_callback = {
+                let actor_ref_for_gap = actor_ref_for_connection.clone();
+                move |is_reconnection: bool| {
+                    if is_reconnection {
+                        info!("🔄 WebSocket reconnected successfully - scheduling gap detection");
+                        let actor_ref_gap = actor_ref_for_gap.clone();
+                        tokio::spawn(async move {
+                            // Wait for connection to stabilize
+                            tokio::time::sleep(std::time::Duration::from_secs(gap_check_delay as u64)).await;
+                            
+                            // Trigger gap detection
+                            if let Err(e) = actor_ref_gap.tell(WebSocketTell::CheckReconnectionGap).send().await {
+                                error!("Failed to trigger reconnection gap check: {}", e);
+                            }
+                        });
+                    }
+                }
+            };
+
+            if let Err(e) = connection_manager.connect_with_retry_and_callback(&url, message_handler, reconnection_callback).await {
                 error!("WebSocket connection failed permanently: {}", e);
             }
         });
@@ -761,6 +788,30 @@ impl WebSocketActor {
     pub fn has_lmdb_actor(&self) -> bool {
         self.lmdb_actor.is_some()
     }
+
+    /// Get gap threshold minutes (for testing)
+    #[cfg(test)]
+    pub fn gap_threshold_minutes(&self) -> u32 {
+        self.gap_threshold_minutes
+    }
+
+    /// Get gap check delay seconds (for testing)
+    #[cfg(test)]
+    pub fn gap_check_delay_seconds(&self) -> u32 {
+        self.gap_check_delay_seconds
+    }
+
+    /// Set last processed candle time (for testing)
+    #[cfg(test)]
+    pub fn set_last_processed_candle_time(&mut self, timestamp: Option<i64>) {
+        self.last_processed_candle_time = timestamp;
+    }
+
+    /// Set last activity time (for testing)
+    #[cfg(test)]
+    pub fn set_last_activity_time(&mut self, timestamp: Option<i64>) {
+        self.last_activity_time = timestamp;
+    }
 }
 
 impl Actor for WebSocketActor {
@@ -783,7 +834,7 @@ impl Actor for WebSocketActor {
         // Start adaptive health check task
         let actor_ref_clone = actor_ref.clone();
         tokio::spawn(async move {
-            let base_interval = Duration::from_secs(60);
+            let base_interval = Duration::from_secs(30); // More frequent base check
             let mut current_interval = base_interval;
             let mut consecutive_healthy_checks = 0u32;
             
@@ -799,13 +850,13 @@ impl Actor for WebSocketActor {
                 consecutive_healthy_checks += 1;
                 current_interval = if consecutive_healthy_checks > 10 {
                     // Connection is stable, reduce frequency
-                    Duration::from_secs(120) // 2 minutes
+                    Duration::from_secs(60) // 1 minute (reduced from 2 minutes)
                 } else if consecutive_healthy_checks > 5 {
                     // Connection is becoming stable
-                    Duration::from_secs(90) // 1.5 minutes
+                    Duration::from_secs(45) // 45 seconds (reduced from 1.5 minutes)
                 } else {
                     // Connection might be unstable, check more frequently
-                    Duration::from_secs(30) // 30 seconds
+                    Duration::from_secs(20) // 20 seconds (reduced from 30 seconds)
                 };
                 
                 debug!("📡 Health check interval adapted to {:?} (healthy checks: {})", 
@@ -885,8 +936,41 @@ impl Message<WebSocketTell> for WebSocketActor {
                 }
             }
             WebSocketTell::ProcessCandle { symbol, candle, is_closed } => {
+                let now = chrono::Utc::now().timestamp_millis();
+                
+                // Check for real-time gap if we have previous activity
+                if let Some(last_activity) = self.last_activity_time {
+                    let gap_duration_ms = now - last_activity;
+                    let expected_message_interval_ms = 5000; // Expect message at least every 5 seconds
+                    
+                    if gap_duration_ms > expected_message_interval_ms {
+                        let gap_duration_seconds = gap_duration_ms / 1000;
+                        let gap_duration_minutes = gap_duration_ms / (60 * 1000);
+                        
+                        // Use different thresholds for warning vs. gap filling
+                        let real_time_warning_threshold_ms = 30000; // 30 seconds - warn about potential issues
+                        let gap_fill_threshold_ms = (self.gap_threshold_minutes as i64) * 60 * 1000; // Full threshold for gap filling
+                        
+                        if gap_duration_ms > gap_fill_threshold_ms {
+                            warn!("🕳️ Real-time gap detected: {} minutes since last message - triggering gap fill", gap_duration_minutes);
+                            
+                            // Trigger immediate gap detection for gaps exceeding fill threshold
+                            let actor_ref = ctx.actor_ref().clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = actor_ref.tell(WebSocketTell::CheckReconnectionGap).send().await {
+                                    error!("Failed to trigger real-time gap detection: {}", e);
+                                }
+                            });
+                        } else if gap_duration_ms > real_time_warning_threshold_ms {
+                            warn!("⚠️ Message flow interruption detected: {} seconds gap (below fill threshold of {} minutes)", gap_duration_seconds, self.gap_threshold_minutes);
+                        } else {
+                            info!("📡 Message flow resumed after {} seconds", gap_duration_seconds);
+                        }
+                    }
+                }
+                
                 // Update activity timestamp - this proves we're receiving messages
-                self.last_activity_time = Some(chrono::Utc::now().timestamp_millis());
+                self.last_activity_time = Some(now);
                 
                 // Track last processed candle time for gap detection (only closed candles)
                 if is_closed {
@@ -1116,6 +1200,11 @@ impl Message<WebSocketTell> for WebSocketActor {
                 info!("📨 Setting Volume Profile actor reference for WebSocketActor");
                 self.volume_profile_actor = Some(volume_profile_actor);
                 info!("✅ Volume Profile actor reference successfully set in WebSocketActor - daily volume profiles enabled");
+            }
+            WebSocketTell::SetApiActor { api_actor } => {
+                info!("📨 Setting API actor reference for WebSocketActor");
+                self.api_actor = Some(api_actor);
+                info!("✅ API actor reference successfully set in WebSocketActor - gap filling enabled");
             }
             WebSocketTell::FlushBatches => {
                 // Force flush any pending batches to prevent stuck candles

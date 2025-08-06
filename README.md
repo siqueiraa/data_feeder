@@ -26,7 +26,7 @@ The Cryptocurrency Data Feeder is a robust, production-ready system designed to 
 
 ### 📊 **Smart Data Management**
 - **Intelligent Path Selection**: Automatically chooses optimal data sources (monthly vs daily)
-- **Gap Detection**: Identifies and fills missing data periods
+- **Gap Detection**: Automatically identifies and fills missing data periods, including post-reconnection gap detection
 - **LMDB Storage**: Lightning-fast memory-mapped database for primary storage
 - **PostgreSQL Support**: Optional relational database integration
 - **Data Integrity**: SHA256 checksums and certified range tracking
@@ -35,7 +35,7 @@ The Cryptocurrency Data Feeder is a robust, production-ready system designed to 
 - **WebSocket Streaming**: Live market data from Binance Futures
 - **Multi-timeframe Analysis**: 1m, 5m, 15m, 1h, 4h technical indicators
 - **Kafka Integration**: Real-time publishing of analysis results
-- **Auto-reconnection**: Robust connection management with gap recovery
+- **Auto-reconnection**: Robust connection management with automatic post-reconnection gap detection and recovery
 
 ### 🎯 **Technical Analysis**
 - **EMA Indicators**: 21 and 89-period exponential moving averages

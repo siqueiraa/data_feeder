@@ -1028,6 +1028,17 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         warn!("⚠️  Volume Profile actor not available for WebSocket integration");
     }
     
+    // Connect WebSocketActor to API Actor for gap filling
+    info!("🔗 Connecting WebSocketActor to API Actor for gap filling...");
+    let set_api_msg = WebSocketTell::SetApiActor {
+        api_actor: api_actor.clone(),
+    };
+    if let Err(e) = ws_actor.tell(set_api_msg).send().await {
+        error!("Failed to set API actor on WebSocketActor: {}", e);
+    } else {
+        info!("✅ Connected WebSocketActor to API Actor - gap filling enabled");
+    }
+    
     // Allow actors to initialize
     sleep(Duration::from_millis(500)).await;
     

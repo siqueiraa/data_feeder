@@ -14,7 +14,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::metrics::get_metrics;
-use crate::health::{HealthDependencies, check_kafka_health, check_postgres_health};
+use crate::health::{HealthDependencies, check_kafka_health, check_postgres_health, validate_performance_across_environments};
+use crate::deployment_validation::{validate_deployment, quick_deployment_check};
 use serde_json::json;
 use std::sync::Arc;
 use chrono;
@@ -106,6 +107,98 @@ async fn handle_request(
                 .body(Full::new(Bytes::from(startup_response.to_string())))
                 .unwrap())
         }
+        (&Method::GET, "/validate") => {
+            // Resource-aware validation endpoint (AC: 2, 3)
+            match validate_performance_across_environments() {
+                Ok(validation_result) => {
+                    let status_code = match validation_result["overall_status"].as_str() {
+                        Some("healthy") => StatusCode::OK,
+                        Some("warning") => StatusCode::OK, 
+                        Some("degraded") => StatusCode::PARTIAL_CONTENT,
+                        _ => StatusCode::SERVICE_UNAVAILABLE,
+                    };
+                    
+                    Ok(Response::builder()
+                        .status(status_code)
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from(validation_result.to_string())))
+                        .unwrap())
+                }
+                Err(e) => {
+                    error!("Validation check failed: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from(json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        }).to_string())))
+                        .unwrap())
+                }
+            }
+        }
+        (&Method::GET, "/deploy/validate") => {
+            // Full deployment validation endpoint (AC: 3, 6)
+            match validate_deployment().await {
+                Ok(validation_result) => {
+                    let status_code = match validation_result.overall_status {
+                        crate::deployment_validation::ValidationStatus::Passed => StatusCode::OK,
+                        crate::deployment_validation::ValidationStatus::Warning => StatusCode::OK,
+                        crate::deployment_validation::ValidationStatus::Failed => StatusCode::BAD_REQUEST,
+                        crate::deployment_validation::ValidationStatus::Error => StatusCode::INTERNAL_SERVER_ERROR,
+                    };
+                    
+                    Ok(Response::builder()
+                        .status(status_code)
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from(serde_json::to_string(&validation_result).unwrap_or_else(|_| "{}".to_string()))))
+                        .unwrap())
+                }
+                Err(e) => {
+                    error!("Deployment validation failed: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from(json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        }).to_string())))
+                        .unwrap())
+                }
+            }
+        }
+        (&Method::GET, "/deploy/check") => {
+            // Quick deployment check for CI/CD (AC: 3, 6)
+            match quick_deployment_check().await {
+                Ok(is_deployable) => {
+                    let status_code = if is_deployable { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+                    
+                    Ok(Response::builder()
+                        .status(status_code)
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from(json!({
+                            "deployable": is_deployable,
+                            "message": if is_deployable { "System ready for deployment" } else { "Deployment not recommended" },
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        }).to_string())))
+                        .unwrap())
+                }
+                Err(e) => {
+                    error!("Quick deployment check failed: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::from(json!({
+                            "deployable": false,
+                            "error": e.to_string(),
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        }).to_string())))
+                        .unwrap())
+                }
+            }
+        }
         _ => {
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -195,6 +288,9 @@ pub async fn start_metrics_server(
     info!("💚 Health check available at http://{}/health", addr);
     info!("🔍 Readiness check available at http://{}/ready", addr);
     info!("🎯 Startup check available at http://{}/startup", addr);
+    info!("✅ Resource validation available at http://{}/validate", addr);
+    info!("🚀 Deployment validation available at http://{}/deploy/validate", addr);
+    info!("⚡ Quick deployment check available at http://{}/deploy/check", addr);
     
     // Test the server immediately to confirm it's listening
     let test_addr = format!("http://localhost:{}/startup", port);

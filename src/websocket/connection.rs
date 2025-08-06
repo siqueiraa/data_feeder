@@ -93,11 +93,26 @@ impl ConnectionManager {
     pub async fn connect_with_retry<F, Fut>(
         &mut self,
         url: &str,
-        mut message_handler: F,
+        message_handler: F,
     ) -> Result<(), WebSocketError>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = Result<(), WebSocketError>>,
+    {
+        self.connect_with_retry_and_callback(url, message_handler, |_| {}).await
+    }
+
+    /// Connect to WebSocket with automatic reconnection and reconnection callback
+    pub async fn connect_with_retry_and_callback<F, Fut, C>(
+        &mut self,
+        url: &str,
+        mut message_handler: F,
+        reconnection_callback: C,
+    ) -> Result<(), WebSocketError>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<(), WebSocketError>>,
+        C: Fn(bool) + Clone,
     {
         let mut attempt = 0;
 
@@ -112,6 +127,11 @@ impl ConnectionManager {
             match self.connect_once(url, &mut message_handler).await {
                 Ok(_) => {
                     info!("WebSocket connection completed normally");
+                    
+                    // Call reconnection callback if this was a reconnection (not first connection)
+                    let is_reconnection = attempt > 1;
+                    reconnection_callback.clone()(is_reconnection);
+                    
                     if attempt > self.max_reconnect_attempts {
                         break;
                     }

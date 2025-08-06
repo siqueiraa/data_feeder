@@ -49,6 +49,13 @@ pub struct MetricsRegistry {
     pub cpu_usage_percent: IntGaugeVec,
     pub component_cpu_time_nanos: IntCounterVec,
     pub operation_duration_histogram: HistogramVec,
+    
+    // Resource-Aware Metrics (AC: 1, 4, 5)
+    pub system_resource_utilization: IntGaugeVec,
+    pub adaptive_config_effectiveness: IntGaugeVec,
+    pub resource_pattern_detection: IntCounterVec,
+    pub configuration_adaptation_events: IntCounterVec,
+    pub resource_threshold_breaches: IntCounterVec,
 }
 
 impl MetricsRegistry {
@@ -199,6 +206,32 @@ impl MetricsRegistry {
             &["component", "operation"]
         )?;
         
+        // Resource-Aware Metrics
+        let system_resource_utilization = IntGaugeVec::new(
+            Opts::new("system_resource_utilization_percent", "System resource utilization percentage"),
+            &["resource_type", "environment"]
+        )?;
+        
+        let adaptive_config_effectiveness = IntGaugeVec::new(
+            Opts::new("adaptive_config_effectiveness_score", "Effectiveness score of adaptive configuration (0-100)"),
+            &["config_type", "resource_profile"]
+        )?;
+        
+        let resource_pattern_detection = IntCounterVec::new(
+            Opts::new("resource_pattern_detection_total", "Total resource usage patterns detected"),
+            &["pattern_type", "severity", "environment"]
+        )?;
+        
+        let configuration_adaptation_events = IntCounterVec::new(
+            Opts::new("configuration_adaptation_events_total", "Total configuration adaptation events"),
+            &["adaptation_type", "trigger_cause", "success"]
+        )?;
+        
+        let resource_threshold_breaches = IntCounterVec::new(
+            Opts::new("resource_threshold_breaches_total", "Total resource threshold breach events"),
+            &["threshold_type", "breach_level", "recovery_action"]
+        )?;
+        
         // Register all metrics
         registry.register(Box::new(indicator_processing_duration.clone()))?;
         registry.register(Box::new(indicator_processing_total.clone()))?;
@@ -225,12 +258,19 @@ impl MetricsRegistry {
         registry.register(Box::new(component_cpu_time_nanos.clone()))?;
         registry.register(Box::new(operation_duration_histogram.clone()))?;
         
+        // Register resource-aware metrics
+        registry.register(Box::new(system_resource_utilization.clone()))?;
+        registry.register(Box::new(adaptive_config_effectiveness.clone()))?;
+        registry.register(Box::new(resource_pattern_detection.clone()))?;
+        registry.register(Box::new(configuration_adaptation_events.clone()))?;
+        registry.register(Box::new(resource_threshold_breaches.clone()))?;
+        
         let _total_metrics = if tokio_metrics_collector.is_some() { 
-            info!("Prometheus metrics registry initialized with {} business metrics + tokio task metrics", 22);
-            22 + 9 // 22 business metrics + 9 tokio task metrics
+            info!("Prometheus metrics registry initialized with {} business metrics + tokio task metrics", 27);
+            27 + 9 // 27 business metrics + 9 tokio task metrics
         } else {
-            info!("Prometheus metrics registry initialized with {} business metrics (tokio metrics disabled)", 22);
-            22
+            info!("Prometheus metrics registry initialized with {} business metrics (tokio metrics disabled)", 27);
+            27
         };
         
         // Add some initial test data to verify metrics are working
@@ -259,6 +299,11 @@ impl MetricsRegistry {
             cpu_usage_percent,
             component_cpu_time_nanos,
             operation_duration_histogram,
+            system_resource_utilization,
+            adaptive_config_effectiveness,
+            resource_pattern_detection,
+            configuration_adaptation_events,
+            resource_threshold_breaches,
         };
         
         // Add some test data so metrics show up immediately
@@ -271,6 +316,14 @@ impl MetricsRegistry {
         metrics_registry.memory_pool_allocations_total
             .with_label_values(&["test_pool", "startup"])
             .inc();
+            
+        // Initialize new resource-aware metrics with test data
+        metrics_registry.system_resource_utilization
+            .with_label_values(&["memory", "startup"])
+            .set(50);
+        metrics_registry.adaptive_config_effectiveness
+            .with_label_values(&["thread_pool", "standard"])
+            .set(85);
         
         Ok(metrics_registry)
     }
@@ -369,6 +422,42 @@ impl MetricsRegistry {
             .with_label_values(&[component, operation])
             .observe(duration_seconds);
     }
+    
+    /// Record system resource utilization for monitoring
+    pub fn record_system_resource_utilization(&self, resource_type: &str, environment: &str, utilization_percent: i64) {
+        self.system_resource_utilization
+            .with_label_values(&[resource_type, environment])
+            .set(utilization_percent);
+    }
+    
+    /// Record adaptive configuration effectiveness score
+    pub fn record_adaptive_config_effectiveness(&self, config_type: &str, resource_profile: &str, effectiveness_score: i64) {
+        self.adaptive_config_effectiveness
+            .with_label_values(&[config_type, resource_profile])
+            .set(effectiveness_score);
+    }
+    
+    /// Record resource pattern detection events
+    pub fn record_resource_pattern_detection(&self, pattern_type: &str, severity: &str, environment: &str) {
+        self.resource_pattern_detection
+            .with_label_values(&[pattern_type, severity, environment])
+            .inc();
+    }
+    
+    /// Record configuration adaptation events
+    pub fn record_configuration_adaptation(&self, adaptation_type: &str, trigger_cause: &str, success: bool) {
+        let success_str = if success { "success" } else { "failure" };
+        self.configuration_adaptation_events
+            .with_label_values(&[adaptation_type, trigger_cause, success_str])
+            .inc();
+    }
+    
+    /// Record resource threshold breach events
+    pub fn record_resource_threshold_breach(&self, threshold_type: &str, breach_level: &str, recovery_action: &str) {
+        self.resource_threshold_breaches
+            .with_label_values(&[threshold_type, breach_level, recovery_action])
+            .inc();
+    }
 }
 
 impl Default for MetricsRegistry {
@@ -438,6 +527,51 @@ macro_rules! record_operation_duration {
     ($component:expr, $operation:expr, $duration_seconds:expr) => {
         if let Some(metrics) = $crate::metrics::get_metrics() {
             metrics.record_operation_duration($component, $operation, $duration_seconds);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! record_resource_utilization {
+    ($resource_type:expr, $environment:expr, $utilization_percent:expr) => {
+        if let Some(metrics) = $crate::metrics::get_metrics() {
+            metrics.record_system_resource_utilization($resource_type, $environment, $utilization_percent);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! record_config_effectiveness {
+    ($config_type:expr, $resource_profile:expr, $effectiveness_score:expr) => {
+        if let Some(metrics) = $crate::metrics::get_metrics() {
+            metrics.record_adaptive_config_effectiveness($config_type, $resource_profile, $effectiveness_score);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! record_resource_pattern {
+    ($pattern_type:expr, $severity:expr, $environment:expr) => {
+        if let Some(metrics) = $crate::metrics::get_metrics() {
+            metrics.record_resource_pattern_detection($pattern_type, $severity, $environment);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! record_config_adaptation {
+    ($adaptation_type:expr, $trigger_cause:expr, $success:expr) => {
+        if let Some(metrics) = $crate::metrics::get_metrics() {
+            metrics.record_configuration_adaptation($adaptation_type, $trigger_cause, $success);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! record_threshold_breach {
+    ($threshold_type:expr, $breach_level:expr, $recovery_action:expr) => {
+        if let Some(metrics) = $crate::metrics::get_metrics() {
+            metrics.record_resource_threshold_breach($threshold_type, $breach_level, $recovery_action);
         }
     };
 }
