@@ -20,6 +20,7 @@ use crate::common::shared_data::{
 };
 use crate::common::object_pool::init_global_pools;
 use crate::historical::structs::FuturesOHLCVCandle;
+#[cfg(feature = "postgres")]
 use crate::postgres::{PostgresActor, PostgresTell};
 use crate::websocket::optimized_parser::parse_any_kline_message_optimized;
 use crate::websocket::connection::{ConnectionManager, normalize_symbols};
@@ -27,6 +28,7 @@ use crate::websocket::types::{
     ConnectionStats, ConnectionStatus, StreamSubscription, StreamType, WebSocketError,
 };
 use crate::lmdb::messages::LmdbActorTell;
+#[cfg(feature = "volume_profile")]
 use crate::volume_profile::{VolumeProfileActor, VolumeProfileTell};
 
 /// WebSocket actor messages for telling (fire-and-forget)
@@ -63,10 +65,12 @@ pub enum WebSocketTell {
         lmdb_actor: ActorRef<crate::lmdb::LmdbActor>,
     },
     /// Set the PostgreSQL actor reference for dual storage
+    #[cfg(feature = "postgres")]
     SetPostgresActor {
         postgres_actor: ActorRef<crate::postgres::PostgresActor>,
     },
     /// Set the Volume Profile actor reference for daily volume profiles
+    #[cfg(feature = "volume_profile")]
     SetVolumeProfileActor {
         volume_profile_actor: ActorRef<VolumeProfileActor>,
     },
@@ -154,11 +158,17 @@ pub struct WebSocketActor {
     /// API actor reference for gap filling
     api_actor: Option<ActorRef<crate::api::ApiActor>>,
     /// PostgreSQL actor reference for dual storage
+    #[cfg(feature = "postgres")]
     postgres_actor: Option<ActorRef<PostgresActor>>,
+    #[cfg(not(feature = "postgres"))]
+    postgres_actor: Option<()>,
     /// TimeFrame actor reference for direct real-time forwarding
     timeframe_actor: Option<ActorRef<crate::technical_analysis::actors::timeframe::TimeFrameActor>>,
     /// Volume Profile actor reference for daily volume profile calculation
+    #[cfg(feature = "volume_profile")]
     volume_profile_actor: Option<ActorRef<VolumeProfileActor>>,
+    #[cfg(not(feature = "volume_profile"))]
+    volume_profile_actor: Option<()>,
     /// Gap detection configuration
     gap_threshold_minutes: u32,
     gap_check_delay_seconds: u32,
@@ -189,6 +199,7 @@ impl WebSocketActor {
     }
     
     /// Set the PostgreSQL actor reference for dual storage
+    #[cfg(feature = "postgres")]
     pub fn set_postgres_actor(&mut self, postgres_actor: ActorRef<PostgresActor>) {
         self.postgres_actor = Some(postgres_actor);
     }
@@ -199,6 +210,7 @@ impl WebSocketActor {
     }
     
     /// Set the Volume Profile actor reference for daily volume profile calculation
+    #[cfg(feature = "volume_profile")]
     pub fn set_volume_profile_actor(&mut self, volume_profile_actor: ActorRef<VolumeProfileActor>) {
         self.volume_profile_actor = Some(volume_profile_actor);
     }
@@ -519,6 +531,7 @@ impl WebSocketActor {
                 }
 
                 // Forward closed candles to VolumeProfileActor for real-time volume profile calculation
+                #[cfg(feature = "volume_profile")]
                 if let Some(volume_profile_actor) = &self.volume_profile_actor {
                     for candle in &closed_candles {
                         let volume_profile_msg = VolumeProfileTell::ProcessCandle {
@@ -533,6 +546,10 @@ impl WebSocketActor {
                                   symbol, candle.open_time, candle.volume);
                         }
                     }
+                }
+                #[cfg(not(feature = "volume_profile"))]
+                {
+                    debug!("Volume profile feature disabled, not forwarding {} closed candles for {}", closed_candles.len(), symbol);
                 }
             }
         } else {
@@ -1046,12 +1063,14 @@ impl Message<WebSocketTell> for WebSocketActor {
                                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                                         .unwrap_or_else(|| format!("INVALID_TIME({})", candle_arc.close_time));
                                     
+                                    #[cfg(feature = "postgres")]
                                     let postgres_msg = PostgresTell::StoreCandle {
                                         symbol: symbol_owned.clone(),
                                         candle: (*candle_arc).clone(), // Dereference Arc and clone candle data
                                         source: "WebSocketActor".to_string(),
                                     };
                                     
+                                    #[cfg(feature = "postgres")]
                                     if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
                                         warn!("❌ PostgreSQL storage failed for {}: {}", symbol_owned, e);
                                     } else {
@@ -1083,6 +1102,7 @@ impl Message<WebSocketTell> for WebSocketActor {
                     }
                     
                     // Background Volume Profile forwarding (only for closed candles)
+                    #[cfg(feature = "volume_profile")]
                     if is_closed {
                         if let Some(volume_profile_actor) = volume_profile_actor {
                             let msg = VolumeProfileTell::ProcessCandle {
@@ -1096,6 +1116,10 @@ impl Message<WebSocketTell> for WebSocketActor {
                                 debug!("📊 Background Volume Profile forwarding completed: {} @ {}", symbol_owned, candle_arc.close_time);
                             }
                         }
+                    }
+                    #[cfg(not(feature = "volume_profile"))]
+                    if is_closed {
+                        debug!("Volume profile feature disabled, not forwarding closed candle for {}", symbol_owned);
                     }
                 });
                 
@@ -1194,11 +1218,13 @@ impl Message<WebSocketTell> for WebSocketActor {
                 self.lmdb_actor = Some(lmdb_actor);
                 info!("✅ LMDB actor reference successfully set in WebSocketActor - centralized storage enabled");
             }
+            #[cfg(feature = "postgres")]
             WebSocketTell::SetPostgresActor { postgres_actor } => {
                 info!("📨 Setting PostgreSQL actor reference for WebSocketActor");
                 self.postgres_actor = Some(postgres_actor);
                 info!("✅ PostgreSQL actor reference successfully set in WebSocketActor - dual storage enabled");
             }
+            #[cfg(feature = "volume_profile")]
             WebSocketTell::SetVolumeProfileActor { volume_profile_actor } => {
                 info!("📨 Setting Volume Profile actor reference for WebSocketActor");
                 self.volume_profile_actor = Some(volume_profile_actor);

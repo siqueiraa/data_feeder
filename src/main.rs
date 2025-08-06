@@ -7,8 +7,11 @@ use data_feeder::technical_analysis::{
     TechnicalAnalysisConfig, TimeFrameActor, IndicatorActor, 
     TimeFrameAsk, IndicatorAsk
 };
+#[cfg(feature = "postgres")]
 use data_feeder::postgres::{PostgresActor, PostgresConfig};
+#[cfg(feature = "kafka")]
 use data_feeder::kafka::{KafkaActor, KafkaConfig};
+#[cfg(feature = "volume_profile")]
 use data_feeder::volume_profile::{VolumeProfileActor, VolumeProfileConfig, VolumeProfileTell};
 use data_feeder::health::HealthDependencies;
 use data_feeder::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
@@ -20,6 +23,71 @@ use data_feeder::adaptive_config::{AdaptiveConfig, AdaptiveConfigToml};
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
+
+// Stub configurations for disabled features
+#[cfg(not(feature = "postgres"))]
+#[derive(Debug, Clone)]
+struct PostgresConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+}
+
+#[cfg(not(feature = "postgres"))]
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "localhost".to_string(),
+            port: 5432,
+        }
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
+#[derive(Debug, Clone)]
+struct KafkaConfig {
+    pub enabled: bool,
+}
+
+#[cfg(not(feature = "kafka"))]
+impl Default for KafkaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+        }
+    }
+}
+
+#[cfg(not(feature = "volume_profile"))]
+#[derive(Debug, Clone)]
+struct VolumeProfileConfig {
+    pub enabled: bool,
+    pub historical_days: u32,
+}
+
+#[cfg(not(feature = "volume_profile"))]
+impl Default for VolumeProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            historical_days: 60,
+        }
+    }
+}
+
+// Stub actor types for disabled features
+#[cfg(not(feature = "postgres"))]
+struct PostgresActor;
+
+#[cfg(not(feature = "kafka"))]
+struct KafkaActor;
+
+#[cfg(not(feature = "volume_profile"))]
+struct VolumeProfileActor;
+
+#[cfg(not(feature = "volume_profile"))]
+struct VolumeProfileTell;
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
@@ -77,10 +145,13 @@ struct HistoricalValidationTomlConfig {
 /// Full TOML configuration structure
 #[derive(Debug, Clone, Deserialize)]
 struct TomlConfig {
+    #[cfg(feature = "postgres")]
     pub database: PostgresConfig,
     pub application: ApplicationConfig,
     pub technical_analysis: TechnicalAnalysisTomlConfig,
+    #[cfg(feature = "kafka")]
     pub kafka: Option<KafkaConfig>,
+    #[cfg(feature = "volume_profile")]
     pub volume_profile: Option<VolumeProfileConfig>,
     pub logging: Option<LoggingTomlConfig>,
     pub historical_validation: Option<HistoricalValidationTomlConfig>,
@@ -107,10 +178,13 @@ struct DataFeederConfig {
     pub periodic_gap_check_interval_minutes: u32, // How often to check for gaps (default: 5)
     pub periodic_gap_check_window_minutes: u32, // How far back to scan for gaps (default: 30)
     // PostgreSQL configuration
+    #[cfg(feature = "postgres")]
     pub postgres_config: PostgresConfig,
     // Kafka configuration
+    #[cfg(feature = "kafka")]
     pub kafka_config: KafkaConfig,
     // Volume Profile configuration
+    #[cfg(feature = "volume_profile")]
     pub volume_profile_config: VolumeProfileConfig,
     // Historical validation tracking
     pub historical_validation_complete: bool, // Tracks completion of Phase 1 (full historical validation)
@@ -217,8 +291,11 @@ impl DataFeederConfig {
             periodic_gap_detection_enabled: toml_config.application.periodic_gap_detection_enabled,
             periodic_gap_check_interval_minutes: toml_config.application.periodic_gap_check_interval_minutes,
             periodic_gap_check_window_minutes: toml_config.application.periodic_gap_check_window_minutes,
+            #[cfg(feature = "postgres")]
             postgres_config: toml_config.database,
+            #[cfg(feature = "kafka")]
             kafka_config: toml_config.kafka.unwrap_or_default(),
+            #[cfg(feature = "volume_profile")]
             volume_profile_config: {
                 let mut vp_config = toml_config.volume_profile.unwrap_or_default();
                 vp_config.historical_days = historical_validation_days;
@@ -264,8 +341,11 @@ impl Default for DataFeederConfig {
             periodic_gap_detection_enabled: true, // Enable periodic gap detection
             periodic_gap_check_interval_minutes: 5, // Check every 5 minutes
             periodic_gap_check_window_minutes: 30, // Scan last 30 minutes
+            #[cfg(feature = "postgres")]
             postgres_config: PostgresConfig::default(),
+            #[cfg(feature = "kafka")]
             kafka_config: KafkaConfig::default(),
+            #[cfg(feature = "volume_profile")]
             volume_profile_config: VolumeProfileConfig::default(),
             // Historical validation defaults - start with Phase 1 (full validation)
             historical_validation_complete: true, // Always start with full historical validation
@@ -549,21 +629,36 @@ async fn main() {
     log_system_info();
     
     // Log configuration information for debugging
+    #[cfg(feature = "postgres")]
+    let postgres_enabled = config.postgres_config.enabled;
+    #[cfg(not(feature = "postgres"))]
+    let postgres_enabled = false;
+    
+    #[cfg(feature = "kafka")]
+    let kafka_enabled = config.kafka_config.enabled;
+    #[cfg(not(feature = "kafka"))]
+    let kafka_enabled = false;
+    
+    #[cfg(feature = "volume_profile")]
+    let volume_profile_enabled = config.volume_profile_config.enabled;
+    #[cfg(not(feature = "volume_profile"))]
+    let volume_profile_enabled = false;
+    
     info!(
-        symbols_count = config.symbols.len(),
-        timeframes = ?config.timeframes,
-        gap_detection = config.gap_detection_enabled,
-        postgres_enabled = config.postgres_config.enabled,
-        kafka_enabled = config.kafka_config.enabled,
-        volume_profile_enabled = config.volume_profile_config.enabled,
-        technical_analysis = config.enable_technical_analysis,
-        historical_validation_enabled = config.historical_validation_enabled,
-        historical_validation_days = config.historical_validation_days,
-        historical_validation_parallel = config.historical_validation_parallel,
-        historical_validation_skip_empty = config.historical_validation_skip_empty_days,
-        storage_path = %config.storage_path.display(),
-        log_dir = %config.logging_config.log_dir,
-        "🔧 System configuration logged for debugging"
+        "🔧 System configuration logged for debugging - symbols: {}, timeframes: {:?}, gap_detection: {}, postgres: {}, kafka: {}, volume_profile: {}, technical_analysis: {}, historical_validation: {} ({} days, parallel: {}, skip_empty: {}), storage: {}, logs: {}",
+        config.symbols.len(),
+        config.timeframes,
+        config.gap_detection_enabled,
+        postgres_enabled,
+        kafka_enabled,
+        volume_profile_enabled,
+        config.enable_technical_analysis,
+        config.historical_validation_enabled,
+        config.historical_validation_days,
+        config.historical_validation_parallel,
+        config.historical_validation_skip_empty_days,
+        config.storage_path.display(),
+        config.logging_config.log_dir
     );
     
     // Log adaptive configuration information  
@@ -593,12 +688,15 @@ async fn main() {
     info!("⚙️ Configuration: {} symbols, {} timeframes: {:?}", 
           config.symbols.len(), config.timeframes.len(), config.timeframes);
     
+    #[cfg(feature = "postgres")]
     if config.postgres_config.enabled {
         info!("🐘 PostgreSQL storage enabled - {}:{}", 
               config.postgres_config.host, config.postgres_config.port);
     } else {
         info!("🚫 PostgreSQL storage disabled");
     }
+    #[cfg(not(feature = "postgres"))]
+    info!("🚫 PostgreSQL feature disabled at compile time");
     
     // Start the production data pipeline
     if let Err(e) = run_data_pipeline(config).await {
@@ -812,15 +910,31 @@ async fn run_data_pipeline(config: DataFeederConfig) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+// Type aliases for conditional actor types
+#[cfg(feature = "postgres")]
+type PostgresActorRef = Option<ActorRef<PostgresActor>>;
+#[cfg(not(feature = "postgres"))]
+type PostgresActorRef = Option<()>;
+
+#[cfg(feature = "kafka")]
+type KafkaActorRef = Option<ActorRef<KafkaActor>>;
+#[cfg(not(feature = "kafka"))]
+type KafkaActorRef = Option<()>;
+
+#[cfg(feature = "volume_profile")]
+type VolumeProfileActorRef = Option<ActorRef<VolumeProfileActor>>;
+#[cfg(not(feature = "volume_profile"))]
+type VolumeProfileActorRef = Option<()>;
+
 /// Launch basic actors (without TA actors) 
 async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     ActorRef<LmdbActor>,
     ActorRef<HistoricalActor>, 
     ActorRef<ApiActor>, 
     ActorRef<WebSocketActor>,
-    Option<ActorRef<PostgresActor>>,
-    Option<ActorRef<KafkaActor>>,
-    Option<ActorRef<VolumeProfileActor>>
+    PostgresActorRef,
+    KafkaActorRef,
+    VolumeProfileActorRef
 ), Box<dyn std::error::Error + Send + Sync>> {
     
     info!("🎭 Launching actor system with phased startup...");
@@ -866,6 +980,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     // Create futures for independent actors
     let postgres_future = async {
         let postgres_start = std::time::Instant::now();
+        #[cfg(feature = "postgres")]
         let postgres_actor = if config.postgres_config.enabled {
             info!("🐘 Creating PostgreSQL actor...");
             let actor = PostgresActor::new(config.postgres_config.clone())
@@ -875,6 +990,11 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
             info!("🚫 PostgreSQL actor disabled");
             None
         };
+        #[cfg(not(feature = "postgres"))]
+        let postgres_actor = {
+            info!("🚫 PostgreSQL feature disabled at compile time");
+            None
+        };
         let postgres_elapsed = postgres_start.elapsed();
         info!("✅ PostgreSQL actor setup in {:?}", postgres_elapsed);
         Ok::<_, String>(postgres_actor)
@@ -882,6 +1002,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     
     let kafka_future = async {
         let kafka_start = std::time::Instant::now();
+        #[cfg(feature = "kafka")]
         let kafka_actor = if config.kafka_config.enabled {
             info!("📨 Creating Kafka actor...");
             let actor = KafkaActor::new(config.kafka_config.clone())
@@ -891,6 +1012,11 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
             info!("🚫 Kafka actor disabled");
             None
         };
+        #[cfg(not(feature = "kafka"))]
+        let kafka_actor = {
+            info!("🚫 Kafka feature disabled at compile time");
+            None
+        };
         let kafka_elapsed = kafka_start.elapsed();
         info!("✅ Kafka actor setup in {:?}", kafka_elapsed);
         Ok::<_, String>(kafka_actor)
@@ -898,6 +1024,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
 
     let volume_profile_future = async {
         let volume_profile_start = std::time::Instant::now();
+        #[cfg(feature = "volume_profile")]
         let volume_profile_actor = if config.volume_profile_config.enabled {
             info!("📊 Creating Volume Profile actor...");
             let actor = VolumeProfileActor::new(config.volume_profile_config.clone())
@@ -905,6 +1032,11 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
             Some(kameo::spawn(actor))
         } else {
             info!("🚫 Volume Profile actor disabled");
+            None
+        };
+        #[cfg(not(feature = "volume_profile"))]
+        let volume_profile_actor = {
+            info!("🚫 Volume Profile feature disabled at compile time");
             None
         };
         let volume_profile_elapsed = volume_profile_start.elapsed();
@@ -930,6 +1062,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
         let csv_temp_path = config.storage_path.join("temp_csv"); // Temporary staging within main storage
         let mut actor = HistoricalActor::new(&config.symbols, &config.timeframes, &config.storage_path, &csv_temp_path, &config.adaptive_config)
             .map_err(|e| format!("Failed to create HistoricalActor: {}", e))?;
+        #[cfg(feature = "postgres")]
         if let Some(ref postgres_ref) = postgres_actor {
             actor.set_postgres_actor(postgres_ref.clone());
         }
@@ -945,6 +1078,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     let api_actor = {
         let mut actor = ApiActor::new(lmdb_actor.clone())
             .map_err(|e| format!("Failed to create API actor: {}", e))?;
+        #[cfg(feature = "postgres")]
         if let Some(ref postgres_ref) = postgres_actor {
             actor.set_postgres_actor(postgres_ref.clone());
         }
@@ -961,6 +1095,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     info!("🔧 PHASE 5: Setting up Volume Profile actor references...");
     
     // Set up VolumeProfileActor references if enabled
+    #[cfg(feature = "volume_profile")]
     if let Some(ref volume_profile_ref) = volume_profile_actor {
         // Get mutable reference through the actor system
         if let Err(e) = volume_profile_ref.tell(VolumeProfileTell::HealthCheck).send().await {
@@ -1000,6 +1135,7 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     }
     
     // 🐘 Connect WebSocket actor to PostgreSQL actor for dual storage
+    #[cfg(feature = "postgres")]
     if let Some(ref postgres_ref) = postgres_actor {
         info!("🔗 Connecting WebSocketActor to PostgreSQL for dual storage...");
         let set_postgres_msg = WebSocketTell::SetPostgresActor {
@@ -1013,8 +1149,11 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     } else {
         warn!("⚠️  PostgreSQL actor not available for WebSocket dual storage");
     }
+    #[cfg(not(feature = "postgres"))]
+    info!("🚫 PostgreSQL feature disabled - skipping WebSocket dual storage");
     
     // 📊 Connect WebSocket actor to Volume Profile actor for daily volume profiles
+    #[cfg(feature = "volume_profile")]
     if let Some(ref volume_profile_ref) = volume_profile_actor {
         info!("🔗 Connecting WebSocketActor to Volume Profile for daily volume profiles...");
         let set_volume_profile_msg = WebSocketTell::SetVolumeProfileActor {
@@ -1028,6 +1167,8 @@ async fn launch_basic_actors(config: &DataFeederConfig) -> Result<(
     } else {
         warn!("⚠️  Volume Profile actor not available for WebSocket integration");
     }
+    #[cfg(not(feature = "volume_profile"))]
+    info!("🚫 Volume Profile feature disabled - skipping WebSocket integration");
     
     // Connect WebSocketActor to API Actor for gap filling
     info!("🔗 Connecting WebSocketActor to API Actor for gap filling...");
@@ -1065,9 +1206,9 @@ struct TaActorReferences<'a> {
     lmdb_actor: &'a ActorRef<LmdbActor>,
     api_actor: &'a ActorRef<ApiActor>,
     _ws_actor: &'a ActorRef<WebSocketActor>,
-    _postgres_actor: &'a Option<ActorRef<PostgresActor>>,
-    kafka_actor: &'a Option<ActorRef<KafkaActor>>,
-    volume_profile_actor: &'a Option<ActorRef<VolumeProfileActor>>,
+    _postgres_actor: &'a PostgresActorRef,
+    kafka_actor: &'a KafkaActorRef,
+    volume_profile_actor: &'a VolumeProfileActorRef,
 }
 
 /// Launch Technical Analysis actors after gap filling is complete
@@ -1090,6 +1231,7 @@ async fn launch_ta_actors(
         let actor_ref = kameo::spawn(actor);
         
         // Set Kafka actor reference if available
+        #[cfg(feature = "kafka")]
         if let Some(ref kafka_ref) = actors.kafka_actor {
             use data_feeder::technical_analysis::actors::indicator::IndicatorTell;
             let set_kafka_msg = IndicatorTell::SetKafkaActor {
@@ -1103,6 +1245,7 @@ async fn launch_ta_actors(
         }
         
         // Set Volume Profile actor reference if available
+        #[cfg(feature = "volume_profile")]
         if let Some(ref volume_profile_ref) = actors.volume_profile_actor {
             use data_feeder::technical_analysis::actors::indicator::IndicatorTell;
             let set_volume_profile_msg = IndicatorTell::SetVolumeProfileActor {
@@ -1214,9 +1357,9 @@ struct MonitoringActorReferences {
     historical_actor: ActorRef<HistoricalActor>,
     api_actor: ActorRef<ApiActor>,
     ws_actor: ActorRef<WebSocketActor>,
-    _postgres_actor: Option<ActorRef<PostgresActor>>,
+    _postgres_actor: PostgresActorRef,
     ta_actors: Option<(ActorRef<TimeFrameActor>, ActorRef<IndicatorActor>)>,
-    _volume_profile_actor: Option<ActorRef<VolumeProfileActor>>,
+    _volume_profile_actor: VolumeProfileActorRef,
 }
 
 /// Main continuous monitoring loop (WebSocket already running)

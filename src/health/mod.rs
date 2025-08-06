@@ -11,7 +11,9 @@ use warp::Filter;
 use serde_json::json;
 use tracing::{info, warn, error};
 
+#[cfg(feature = "kafka")]
 use crate::kafka::actor::KafkaActor;
+#[cfg(feature = "postgres")]
 use crate::postgres::actor::PostgresActor;
 use crate::system_resources::SystemResources;
 use kameo::actor::ActorRef;
@@ -35,8 +37,14 @@ impl Default for HealthConfig {
 /// Health check dependencies
 #[derive(Clone)]
 pub struct HealthDependencies {
+    #[cfg(feature = "kafka")]
     pub kafka_actor: Option<ActorRef<KafkaActor>>,
+    #[cfg(not(feature = "kafka"))]
+    pub kafka_actor: Option<()>,
+    #[cfg(feature = "postgres")]
     pub postgres_actor: Option<ActorRef<PostgresActor>>,
+    #[cfg(not(feature = "postgres"))]
+    pub postgres_actor: Option<()>,
 }
 
 /// Resource environment classification
@@ -122,6 +130,7 @@ async fn check_readiness(
     let checks = status["checks"].as_object_mut().unwrap();
 
     // Check Kafka health if available
+    #[cfg(feature = "kafka")]
     if let Some(kafka_actor) = &dependencies.kafka_actor {
         match check_kafka_health(kafka_actor).await {
             Ok(kafka_status) => {
@@ -141,8 +150,15 @@ async fn check_readiness(
             "status": "not_configured"
         }));
     }
+    #[cfg(not(feature = "kafka"))]
+    {
+        checks.insert("kafka".to_string(), json!({
+            "status": "feature_disabled"
+        }));
+    }
 
     // Check PostgreSQL health if available
+    #[cfg(feature = "postgres")]
     if let Some(postgres_actor) = &dependencies.postgres_actor {
         match check_postgres_health(postgres_actor).await {
             Ok(postgres_status) => {
@@ -160,6 +176,12 @@ async fn check_readiness(
     } else {
         checks.insert("postgres".to_string(), json!({
             "status": "not_configured"
+        }));
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        checks.insert("postgres".to_string(), json!({
+            "status": "feature_disabled"
         }));
     }
 
@@ -201,6 +223,7 @@ async fn check_readiness(
 }
 
 /// Check Kafka actor health
+#[cfg(feature = "kafka")]
 pub async fn check_kafka_health(
     kafka_actor: &ActorRef<KafkaActor>
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -240,6 +263,7 @@ pub async fn check_kafka_health(
 }
 
 /// Check PostgreSQL actor health
+#[cfg(feature = "postgres")]
 pub async fn check_postgres_health(
     postgres_actor: &ActorRef<PostgresActor>
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {

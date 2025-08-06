@@ -13,6 +13,7 @@ use crate::api::binance::BinanceKlinesClient;
 use crate::api::types::{ApiConfig, ApiError, ApiRequest, ApiStats};
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
+#[cfg(feature = "postgres")]
 use crate::postgres::{PostgresActor, PostgresTell};
 
 /// API actor messages for telling (fire-and-forget)
@@ -85,7 +86,10 @@ pub struct ApiActor {
     /// LmdbActor reference for storage operations
     lmdb_actor: ActorRef<LmdbActor>,
     /// PostgreSQL actor reference for dual storage
+    #[cfg(feature = "postgres")]
     postgres_actor: Option<ActorRef<PostgresActor>>,
+    #[cfg(not(feature = "postgres"))]
+    postgres_actor: Option<()>,
 }
 
 impl ApiActor {
@@ -108,6 +112,7 @@ impl ApiActor {
     }
 
     /// Set the PostgreSQL actor reference for dual storage
+    #[cfg(feature = "postgres")]
     pub fn set_postgres_actor(&mut self, postgres_actor: ActorRef<PostgresActor>) {
         self.postgres_actor = Some(postgres_actor);
     }
@@ -203,22 +208,29 @@ impl ApiActor {
                       candles_len, symbol, interval, start_timestamp, end_timestamp);
                 
                 // First send a health check to verify the PostgreSQL actor is responsive
-                info!("🏥 [ApiActor] Sending health check to PostgreSQL actor first");
-                if let Err(e) = postgres_actor.tell(PostgresTell::HealthCheck).send().await {
-                    error!("❌ [ApiActor] PostgreSQL health check failed: {}", e);
-                    return Err(ApiError::Network(format!("PostgreSQL health check failed: {}", e)));
+                #[cfg(feature = "postgres")]
+                {
+                    info!("🏥 [ApiActor] Sending health check to PostgreSQL actor first");
+                    if let Err(e) = postgres_actor.tell(PostgresTell::HealthCheck).send().await {
+                        error!("❌ [ApiActor] PostgreSQL health check failed: {}", e);
+                        return Err(ApiError::Network(format!("PostgreSQL health check failed: {}", e)));
+                    }
+                    
+                    let postgres_msg = PostgresTell::StoreBatch {
+                        candles: candles_vec,
+                        source: "ApiActor".to_string(),
+                    };
+                    
+                    if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
+                        warn!("❌ [ApiActor] Failed to store API batch to PostgreSQL for {}: {}", symbol, e);
+                    } else {
+                        info!("✅ [ApiActor] Successfully sent {} API candles to PostgreSQL for {} (range: {} - {})", 
+                              candles_len, symbol, start_timestamp, end_timestamp);
+                    }
                 }
-                
-                let postgres_msg = PostgresTell::StoreBatch {
-                    candles: candles_vec,
-                    source: "ApiActor".to_string(),
-                };
-                
-                if let Err(e) = postgres_actor.tell(postgres_msg).send().await {
-                    warn!("❌ [ApiActor] Failed to store API batch to PostgreSQL for {}: {}", symbol, e);
-                } else {
-                    info!("✅ [ApiActor] Successfully sent {} API candles to PostgreSQL for {} (range: {} - {})", 
-                          candles_len, symbol, start_timestamp, end_timestamp);
+                #[cfg(not(feature = "postgres"))]
+                {
+                    tracing::debug!("PostgreSQL feature disabled, not storing API batch for {}", symbol);
                 }
             }
         } else {

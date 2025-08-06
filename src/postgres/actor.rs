@@ -9,7 +9,9 @@ use tokio_postgres::NoTls;
 use tracing::{error, info, warn};
 
 use crate::historical::structs::FuturesOHLCVCandle;
+#[cfg(feature = "volume_profile")]
 use crate::volume_profile::database::VolumeProfileDatabase;
+#[cfg(feature = "volume_profile")]
 use crate::volume_profile::structs::VolumeProfileData;
 use super::errors::PostgresError;
 use chrono::NaiveDate;
@@ -65,6 +67,7 @@ pub enum PostgresTell {
     /// Initialize volume profile table schema
     InitVolumeProfileSchema,
     /// Store volume profile data
+    #[cfg(feature = "volume_profile")]
     StoreVolumeProfile {
         symbol: String,
         date: NaiveDate,
@@ -647,15 +650,22 @@ impl Message<PostgresTell> for PostgresActor {
                 if let Some(ref pool) = self.pool {
                     match pool.get().await {
                         Ok(client) => {
-                            let db = VolumeProfileDatabase::new();
-                            match db.create_flat_table_schema(&client).await {
-                                Ok(()) => {
-                                    info!("✅ [PostgresActor] Volume profile table schema initialized successfully");
+                            #[cfg(feature = "volume_profile")]
+                            {
+                                let db = VolumeProfileDatabase::new();
+                                match db.create_flat_table_schema(&client).await {
+                                    Ok(()) => {
+                                        info!("✅ [PostgresActor] Volume profile table schema initialized successfully");
+                                    }
+                                    Err(e) => {
+                                        error!("❌ [PostgresActor] Failed to initialize volume profile table schema: {}", e);
+                                        self.last_error = Some(format!("Schema initialization failed: {}", e));
+                                    }
                                 }
-                                Err(e) => {
-                                    error!("❌ [PostgresActor] Failed to initialize volume profile table schema: {}", e);
-                                    self.last_error = Some(format!("Schema initialization failed: {}", e));
-                                }
+                            }
+                            #[cfg(not(feature = "volume_profile"))]
+                            {
+                                info!("✅ [PostgresActor] Volume profile feature disabled - skipping schema initialization");
                             }
                         }
                         Err(e) => {
@@ -667,6 +677,7 @@ impl Message<PostgresTell> for PostgresActor {
                     warn!("⚠️ [PostgresActor] PostgreSQL pool not available - schema initialization skipped");
                 }
             }
+            #[cfg(feature = "volume_profile")]
             PostgresTell::StoreVolumeProfile { symbol, date, profile_data } => {
                 info!("💾 [PostgresActor] Storing volume profile: {} on {}", symbol, date);
                 

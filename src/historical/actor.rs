@@ -19,6 +19,7 @@ use crate::queue::types::QueueConfig;
 
 use super::errors::HistoricalDataError;
 use super::structs::{FuturesOHLCVCandle, TimeRange, TimestampMS, Seconds, FuturesExchangeTrade};
+#[cfg(feature = "postgres")]
 use crate::postgres::{PostgresActor, PostgresTell};
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
 use crate::common::error_utils::ErrorContext;
@@ -32,7 +33,10 @@ use super::utils::{
 
 pub struct HistoricalActor {
     csv_path: PathBuf,
+    #[cfg(feature = "postgres")]
     postgres_actor: Option<ActorRef<PostgresActor>>,
+    #[cfg(not(feature = "postgres"))]
+    postgres_actor: Option<()>,
     lmdb_actor: Option<ActorRef<LmdbActor>>,
     // Volume profile validation system
     // Queue system for non-blocking operations
@@ -101,6 +105,7 @@ impl HistoricalActor {
     }
 
     /// Set the PostgreSQL actor reference for dual storage
+    #[cfg(feature = "postgres")]
     pub fn set_postgres_actor(&mut self, postgres_actor: ActorRef<PostgresActor>) {
         self.postgres_actor = Some(postgres_actor);
     }
@@ -296,24 +301,32 @@ impl HistoricalActor {
             info!("🔄 [HistoricalActor] Sending batch of {} historical candles to PostgreSQL for {} (range: {} - {})", 
                   candles_len, symbol_owned, start_timestamp, end_timestamp);
             
+            #[cfg(feature = "postgres")]
             let postgres_msg = PostgresTell::StoreBatch {
                 candles: candles_vec,
                 source: "HistoricalActor".to_string(),
             };
             
-            let postgres_ref = postgres_actor.clone();
-            let symbol_for_log = symbol_owned.clone();
-            let start_log = start_timestamp.clone();
-            let end_log = end_timestamp.clone();
-            tokio::spawn(async move {
-                info!("🚀 [HistoricalActor] Spawned task sending {} candles to PostgreSQL for {}", candles_len, symbol_for_log);
-                if let Err(e) = postgres_ref.tell(postgres_msg).send().await {
-                    error!("❌ [HistoricalActor] Failed to store historical batch to PostgreSQL for {}: {}", symbol_owned, e);
-                } else {
-                    info!("✅ [HistoricalActor] Successfully sent {} historical candles to PostgreSQL for {} (range: {} - {})", 
-                          candles_len, symbol_for_log, start_log, end_log);
-                }
-            });
+            #[cfg(feature = "postgres")]
+            {
+                let postgres_ref = postgres_actor.clone();
+                let symbol_for_log = symbol_owned.clone();
+                let start_log = start_timestamp.clone();
+                let end_log = end_timestamp.clone();
+                tokio::spawn(async move {
+                    info!("🚀 [HistoricalActor] Spawned task sending {} candles to PostgreSQL for {}", candles_len, symbol_for_log);
+                    if let Err(e) = postgres_ref.tell(postgres_msg).send().await {
+                        error!("❌ [HistoricalActor] Failed to store historical batch to PostgreSQL for {}: {}", symbol_owned, e);
+                    } else {
+                        info!("✅ [HistoricalActor] Successfully sent {} historical candles to PostgreSQL for {} (range: {} - {})", 
+                              candles_len, symbol_for_log, start_log, end_log);
+                    }
+                });
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                debug!("PostgreSQL feature disabled, not storing historical batch for {}", symbol_owned);
+            }
         } else {
             warn!("⚠️  [HistoricalActor] PostgreSQL actor not available for storing {} historical candles", candles.len());
         }

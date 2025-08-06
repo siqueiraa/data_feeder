@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::historical::structs::FuturesOHLCVCandle;
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
+#[cfg(feature = "postgres")]
 use crate::postgres::{PostgresActor, PostgresTell};
 // Kafka publishing is now handled by IndicatorActor to avoid duplicate messages
 // use crate::kafka::{KafkaActor, KafkaTell};
@@ -293,7 +294,10 @@ pub enum VolumeProfileTell {
     ProcessRetryQueue,
     /// Set actor references for PostgreSQL and LMDB access (not serializable)
     SetActorReferences {
+        #[cfg(feature = "postgres")]
         postgres_actor: Option<ActorRef<PostgresActor>>,
+        #[cfg(not(feature = "postgres"))]
+        postgres_actor: Option<()>,
         lmdb_actor: ActorRef<LmdbActor>,
     },
 }
@@ -1102,7 +1106,10 @@ pub struct VolumeProfileActor {
     /// Active volume profiles (one per symbol-date combination)
     profiles: HashMap<ProfileKey, DailyVolumeProfile>,
     /// Reference to PostgreSQL actor
+    #[cfg(feature = "postgres")]
     postgres_actor: Option<ActorRef<PostgresActor>>,
+    #[cfg(not(feature = "postgres"))]
+    postgres_actor: Option<()>,
     /// Kafka publishing removed - now handled by IndicatorActor to avoid duplicate messages
     // kafka_actor: Option<ActorRef<KafkaActor>>,
     /// Reference to LMDB actor for historical data
@@ -1182,7 +1189,10 @@ impl VolumeProfileActor {
     /// Set actor references after creation
     pub fn set_actors(
         &mut self,
+        #[cfg(feature = "postgres")]
         postgres_actor: Option<ActorRef<PostgresActor>>,
+        #[cfg(not(feature = "postgres"))]
+        postgres_actor: Option<()>,
         // kafka_actor: Option<ActorRef<KafkaActor>>, // Removed - now handled by IndicatorActor
         lmdb_actor: Option<ActorRef<LmdbActor>>,
     ) {
@@ -1754,12 +1764,14 @@ impl VolumeProfileActor {
                    profile_key.symbol, profile_key.date, profile_data.price_levels.len());
 
             // Send StoreVolumeProfile message to PostgreSQL actor
+            #[cfg(feature = "postgres")]
             let message = crate::postgres::actor::PostgresTell::StoreVolumeProfile {
                 symbol: profile_key.symbol.clone(),
                 date: profile_key.date,
                 profile_data: profile_data.clone(),
             };
 
+            #[cfg(feature = "postgres")]
             match postgres_actor.tell(message).await {
                 Ok(()) => {
                     debug!("✅ Volume profile storage request sent successfully: {} on {}", 
@@ -1771,6 +1783,12 @@ impl VolumeProfileActor {
                            profile_key.symbol, profile_key.date, e);
                     Err(format!("Failed to send storage request: {}", e))
                 }
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                debug!("PostgreSQL feature disabled, not storing volume profile for {} on {}", 
+                       profile_key.symbol, profile_key.date);
+                Ok(())
             }
         } else {
             Err("PostgreSQL actor not available".to_string())
@@ -2063,6 +2081,7 @@ impl Message<VolumeProfileTell> for VolumeProfileActor {
                 info!("✅ CRITICAL FIX: VolumeProfileActor references set - LMDB access enabled for historical data reconstruction");
                 
                 // 🏗️ INITIALIZE POSTGRESQL SCHEMA: Create volume profile table if PostgreSQL is enabled
+                #[cfg(feature = "postgres")]
                 if let Some(ref postgres_ref) = postgres_actor {
                     info!("🏗️ Initializing PostgreSQL volume profile table schema");
                     match postgres_ref.tell(PostgresTell::InitVolumeProfileSchema).send().await {
@@ -2075,6 +2094,10 @@ impl Message<VolumeProfileTell> for VolumeProfileActor {
                     }
                 } else {
                     info!("📊 PostgreSQL not enabled - volume profile data will be stored in LMDB only");
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    info!("📊 PostgreSQL feature disabled - volume profile data will be stored in LMDB only");
                 }
                 
                 // 🔄 NOW REBUILD HISTORICAL DATA: References are set, we can now access LMDB

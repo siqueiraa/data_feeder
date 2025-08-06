@@ -14,7 +14,11 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::metrics::get_metrics;
-use crate::health::{HealthDependencies, check_kafka_health, check_postgres_health, validate_performance_across_environments};
+#[cfg(feature = "kafka")]
+use crate::health::check_kafka_health;
+#[cfg(feature = "postgres")]
+use crate::health::check_postgres_health;
+use crate::health::{HealthDependencies, validate_performance_across_environments};
 use crate::deployment_validation::{validate_deployment, quick_deployment_check};
 use serde_json::json;
 use std::sync::Arc;
@@ -220,6 +224,7 @@ async fn check_readiness(dependencies: Arc<HealthDependencies>) -> Result<String
     let checks = status["checks"].as_object_mut().unwrap();
 
     // Check Kafka health if available
+    #[cfg(feature = "kafka")]
     if let Some(kafka_actor) = &dependencies.kafka_actor {
         match check_kafka_health(kafka_actor).await {
             Ok(kafka_status) => {
@@ -239,8 +244,15 @@ async fn check_readiness(dependencies: Arc<HealthDependencies>) -> Result<String
             "status": "not_configured"
         }));
     }
+    #[cfg(not(feature = "kafka"))]
+    {
+        checks.insert("kafka".to_string(), json!({
+            "status": "feature_disabled"
+        }));
+    }
 
     // Check PostgreSQL health if available
+    #[cfg(feature = "postgres")]
     if let Some(postgres_actor) = &dependencies.postgres_actor {
         match check_postgres_health(postgres_actor).await {
             Ok(postgres_status) => {
@@ -258,6 +270,12 @@ async fn check_readiness(dependencies: Arc<HealthDependencies>) -> Result<String
     } else {
         checks.insert("postgres".to_string(), json!({
             "status": "not_configured"
+        }));
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        checks.insert("postgres".to_string(), json!({
+            "status": "feature_disabled"
         }));
     }
 

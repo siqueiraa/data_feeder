@@ -1,22 +1,32 @@
+#[cfg(feature = "postgres")]
 use chrono::NaiveDate;
+#[cfg(feature = "postgres")]
 use tokio_postgres::{Client, Error as PostgresError};
+#[cfg(feature = "postgres")]
 use tracing::{debug, error, info, warn};
+#[cfg(feature = "postgres")]
 use rust_decimal::Decimal;
+#[cfg(feature = "postgres")]
 use rust_decimal::prelude::ToPrimitive;
+#[cfg(feature = "postgres")]
 use std::convert::TryFrom;
 
+#[cfg(feature = "postgres")]
 use super::structs::{VolumeProfileData, ValueArea, PriceLevelData};
+#[cfg(feature = "postgres")]
 use crate::historical::structs::TimestampMS;
 
 // Remove the custom error conversion - we'll handle this differently
 
 /// Database operations for volume profiles
+#[cfg(feature = "postgres")]
 #[derive(Debug, Clone)]
 pub struct VolumeProfileDatabase {
     /// Table name for volume profiles
     table_name: String,
 }
 
+#[cfg(feature = "postgres")]
 impl VolumeProfileDatabase {
     /// Create new database operations handler
     pub fn new() -> Self {
@@ -723,6 +733,7 @@ impl VolumeProfileDatabase {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl Default for VolumeProfileDatabase {
     fn default() -> Self {
         Self::new()
@@ -731,6 +742,7 @@ impl Default for VolumeProfileDatabase {
 
 /// Database statistics for volume profiles
 #[derive(Debug, Clone)]
+#[cfg(feature = "postgres")]
 pub struct VolumeProfileDatabaseStats {
     pub total_profiles: u64,
     pub unique_symbols: u64,

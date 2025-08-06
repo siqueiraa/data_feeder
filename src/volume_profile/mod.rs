@@ -12,6 +12,7 @@ pub mod validation;
 
 pub use actor::{VolumeProfileActor, VolumeProfileTell, VolumeProfileAsk, VolumeProfileReply};
 pub use calculator::DailyVolumeProfile;
+#[cfg(feature = "postgres")]
 pub use database::VolumeProfileDatabase;
 pub use structs::{
     VolumeProfileConfig, VolumeProfileData, PriceLevelData, ValueArea,

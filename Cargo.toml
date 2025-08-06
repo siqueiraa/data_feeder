@@ -6,7 +6,7 @@ edition = "2021"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
-postgres-types = { version = "0.2", features = ["derive", "with-chrono-0_4"] }
+postgres-types = { version = "0.2", features = ["derive", "with-chrono-0_4"], optional = true }
 csv = "1.3"
 futures = "0.3"
 heed = "0.22"
@@ -27,14 +27,14 @@ tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
 futures-util = "0.3"
 serde_json = "1.0"
 simd-json = "0.13"
-tokio-postgres = "0.7"
-deadpool-postgres = "0.10"
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.10", optional = true }
 toml = "0.8"
 dashmap = "6.1"
-rdkafka = { version = "0.36", features = ["cmake-build", "ssl-vendored", "gssapi-vendored"] }
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl-vendored", "gssapi-vendored"], optional = true }
 warp = "0.3"
 tdigest = "0.2"
-rust_decimal = { version = "1.36", features = ["serde", "db-postgres"] }
+rust_decimal = { version = "1.36", features = ["serde"] }
 rust_decimal_macros = "1.36"
 prometheus = "0.13"
 hyper = { version = "1.0", features = ["full"] }
@@ -46,7 +46,11 @@ ahash = "0.8"
 libc = "0.2"
 
 [features]
-default = []
+default = ["kafka", "postgres", "volume_profile"]
+kafka = ["rdkafka"]
+postgres = ["tokio-postgres", "deadpool-postgres", "postgres-types", "rust_decimal/db-postgres"]
+volume_profile = []
+volume_profile_reprocessing = ["volume_profile"]
 postgres-tests = []
 
 [dev-dependencies]

@@ -2,7 +2,9 @@ pub mod historical;
 pub mod websocket;
 pub mod api;
 pub mod technical_analysis;
+#[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod common;
 pub mod health;
@@ -11,6 +13,7 @@ pub mod metrics;
 pub mod metrics_server;
 pub mod tokio_metrics;
 pub mod queue;
+#[cfg(feature = "volume_profile")]
 pub mod volume_profile;
 pub mod logging;
 pub mod profiling;

@@ -64,6 +64,7 @@ const _: () = {
         let _: fn(&mut SerializationBuffer, &str, Option<f64>) = SerializationBuffer::write_optional_f64;
         let _: fn(&mut SerializationBuffer, &str, &crate::technical_analysis::structs::TrendDirection) = SerializationBuffer::write_trend;
         let _: fn(&mut SerializationBuffer, &Option<crate::technical_analysis::structs::QuantileResults>) = SerializationBuffer::write_volume_quantiles;
+        #[cfg(feature = "volume_profile")]
         let _: fn(&mut SerializationBuffer, &Option<crate::volume_profile::structs::VolumeProfileData>) = SerializationBuffer::write_volume_profile;
         let _: fn(&mut SerializationBuffer, i64) = SerializationBuffer::write_i64;
         let _: fn(&mut SerializationBuffer, u32) = SerializationBuffer::write_u32;
@@ -147,7 +148,12 @@ impl SerializationBuffer {
         self.write_volume_quantiles(&output.volume_quantiles);
         
         // Volume profile data
+        #[cfg(feature = "volume_profile")]
         self.write_volume_profile(&output.volume_profile);
+        #[cfg(not(feature = "volume_profile"))]
+        {
+            // No volume profile data when feature is disabled - field contains Option<()>
+        }
         
         // Remove trailing comma if present
         if self.json_buffer.last() == Some(&b',') {
@@ -366,6 +372,7 @@ impl SerializationBuffer {
     }
     
     /// Write volume profile data structure
+    #[cfg(feature = "volume_profile")]
     #[inline(always)]
     fn write_volume_profile(&mut self, volume_profile: &Option<crate::volume_profile::structs::VolumeProfileData>) {
         if let Some(ref vp) = volume_profile {

@@ -23,7 +23,9 @@ use crate::technical_analysis::utils::{
     extract_close_prices, create_volume_records_from_candles, 
     create_quantile_records_from_candles, format_timestamp_iso
 };
+#[cfg(feature = "kafka")]
 use crate::kafka::{KafkaActor, KafkaTell};
+#[cfg(feature = "volume_profile")]
 use crate::volume_profile::{VolumeProfileAsk, VolumeProfileReply};
 
 // PHASE 3: Adaptive optimization modes based on resource pressure and production patterns
@@ -122,10 +124,12 @@ pub enum IndicatorTell {
         candles: HashMap<u64, FuturesOHLCVCandle>, // timeframe_seconds -> candle
     },
     /// Set Kafka actor reference for publishing indicators
+    #[cfg(feature = "kafka")]
     SetKafkaActor {
         kafka_actor: ActorRef<KafkaActor>,
     },
     /// Set Volume Profile actor reference for including volume profile data
+    #[cfg(feature = "volume_profile")]
     SetVolumeProfileActor {
         volume_profile_actor: ActorRef<crate::volume_profile::VolumeProfileActor>,
     },
@@ -815,13 +819,43 @@ impl SymbolIndicatorState {
     }
     
     /// PHASE 3: Fast output generation with optimized data collection and volume profile
+    #[cfg(feature = "volume_profile")]
     pub async fn generate_output_with_volume_profile(&mut self, symbol: &str, volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>) -> IndicatorOutput {
         // Use the optimized fast output generation
-        self.generate_output_optimized(symbol, volume_profile).await
+        self.generate_output_optimized_impl(symbol, volume_profile).await
     }
 
-    /// PHASE 3: Optimized output generation using pre-allocated structures and SIMD data collection
+    /// PHASE 3: Optimized output generation using pre-allocated structures and SIMD data collection  
+    #[cfg(feature = "volume_profile")]
     async fn generate_output_optimized(&mut self, symbol: &str, volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>) -> IndicatorOutput {
+        self.generate_output_optimized_impl(symbol, volume_profile).await
+    }
+
+    #[cfg(not(feature = "volume_profile"))]
+    async fn generate_output_optimized(&mut self, symbol: &str, _volume_profile: Option<()>) -> IndicatorOutput {
+        self.generate_output_optimized_impl(symbol, None).await
+    }
+
+    /// PHASE 3: Core optimized output generation implementation
+    #[cfg(feature = "volume_profile")]
+    async fn generate_output_optimized_impl(&mut self, symbol: &str, volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>) -> IndicatorOutput {
+        // Implementation with volume_profile support
+        self.generate_output_base_with_volume_profile(symbol, volume_profile).await
+    }
+
+    #[cfg(not(feature = "volume_profile"))]
+    async fn generate_output_optimized_impl(&mut self, symbol: &str, _volume_profile: Option<()>) -> IndicatorOutput {
+        // Implementation without volume_profile support - just return basic output
+        IndicatorOutput {
+            symbol: symbol.to_string(),
+            timestamp: self.last_update_time.unwrap_or(0),
+            ..Default::default()
+        }
+    }
+
+    /// Base implementation for output generation with volume profile
+    #[cfg(feature = "volume_profile")]
+    async fn generate_output_base_with_volume_profile(&mut self, symbol: &str, volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>) -> IndicatorOutput {
         use tracing::info;
         use std::time::Instant;
         
@@ -898,12 +932,15 @@ impl SymbolIndicatorState {
         output.volume_profile = volume_profile;
         
         // DEBUG: Verify volume profile assignment
+        #[cfg(feature = "volume_profile")]
         if let Some(ref vp) = output.volume_profile {
             debug!("🔍 VOLUME PROFILE ASSIGNMENT: Successfully assigned volume profile with {} price levels, total volume: {:.2}", 
                    vp.price_levels.len(), vp.total_volume);
         } else {
             debug!("🔍 VOLUME PROFILE ASSIGNMENT: No volume profile data to assign (None)");
         }
+        #[cfg(not(feature = "volume_profile"))]
+        debug!("🔍 VOLUME PROFILE ASSIGNMENT: Volume profile feature disabled");
         
         // PHASE 3: Record optimized output generation metrics
         record_simd_op!("optimized_output_generation", 1);
@@ -932,10 +969,16 @@ pub struct IndicatorActor {
     is_ready: bool,
     
     /// Optional Kafka actor reference for publishing indicators
+    #[cfg(feature = "kafka")]
     kafka_actor: Option<ActorRef<KafkaActor>>,
+    #[cfg(not(feature = "kafka"))]
+    kafka_actor: Option<()>,
     
     /// Optional Volume Profile actor reference for including volume profile data
+    #[cfg(feature = "volume_profile")]
     volume_profile_actor: Option<ActorRef<crate::volume_profile::VolumeProfileActor>>,
+    #[cfg(not(feature = "volume_profile"))]
+    volume_profile_actor: Option<()>,
 }
 
 impl IndicatorActor {
@@ -984,6 +1027,7 @@ impl IndicatorActor {
     }
 
     /// Set Kafka actor reference
+    #[cfg(feature = "kafka")]
     pub fn set_kafka_actor(&mut self, kafka_actor: ActorRef<KafkaActor>) {
         self.kafka_actor = Some(kafka_actor);
     }
@@ -1022,6 +1066,141 @@ impl IndicatorActor {
                 // - Publish via WebSocket/HTTP
             }
         }
+    }
+
+    /// Base implementation for output generation without volume profile
+    #[cfg(not(feature = "volume_profile"))]
+    async fn generate_output_base_without_volume_profile(&mut self, symbol: &str) -> IndicatorOutput {
+        use tracing::{debug, info};
+        use std::time::Instant;
+        
+        let start_total = Instant::now();
+        
+        // HOT PATH OPTIMIZATION: Pre-allocate output structure with better memory layout
+        let start_alloc = Instant::now();
+        let mut output = IndicatorOutput {
+            symbol: symbol.to_string(),
+            timestamp: self.symbol_states.get(symbol).and_then(|s| s.last_update_time).unwrap_or(0),
+            ..Default::default()
+        };
+        let alloc_time = start_alloc.elapsed();
+
+        // PHASE 3 OPTIMIZATION: CPU cache-friendly timeframe processing
+        let start_data_collection = Instant::now();
+        const TIMEFRAMES: [u64; 5] = [60, 300, 900, 3600, 14400]; // 1m, 5m, 15m, 1h, 4h
+        let mut completed_closes = Vec::with_capacity(TIMEFRAMES.len());
+        let mut ema89_values = Vec::with_capacity(TIMEFRAMES.len());
+        let mut trend_values = Vec::with_capacity(TIMEFRAMES.len());
+        
+        // Vectorized data collection - process all timeframes in batch
+        for &timeframe in &TIMEFRAMES {
+            if let Some(state) = self.symbol_states.get(symbol) {
+                let tf_idx = TimeFrameIndex::from_seconds(timeframe).map(|tf| tf.to_index());
+                if let Some(idx) = tf_idx {
+                    completed_closes.push((timeframe, state.completed_closes[idx]));
+                    
+                    // Get EMA89 value (EMA89 is at index 1 in EMA_PERIOD_COUNT) - access the field directly
+                    let ema89_value = state.emas[idx][1].as_ref().and_then(|ema| ema.current_value);
+                    ema89_values.push((timeframe, ema89_value));
+                    
+                    // For trend direction, we need to analyze based on available data
+                    // Since TrendAnalyzer doesn't have current state, use a default approach
+                    let trend_direction = crate::technical_analysis::structs::TrendDirection::Neutral;
+                    trend_values.push((timeframe, trend_direction));
+                } else {
+                    completed_closes.push((timeframe, None));
+                    ema89_values.push((timeframe, None));
+                    trend_values.push((timeframe, crate::technical_analysis::structs::TrendDirection::Neutral));
+                }
+            } else {
+                completed_closes.push((timeframe, None));
+                ema89_values.push((timeframe, None));
+                trend_values.push((timeframe, crate::technical_analysis::structs::TrendDirection::Neutral));
+            }
+        }
+        let data_collection_time = start_data_collection.elapsed();
+
+        // PHASE 3: Efficient assignment with minimal branching
+        let start_assignment = Instant::now();
+        for (timeframe, close) in completed_closes {
+            match timeframe {
+                300 => output.close_5m = close,
+                900 => output.close_15m = close,
+                3600 => output.close_60m = close,
+                14400 => output.close_4h = close,
+                _ => {}
+            }
+        }
+
+        for (timeframe, ema) in ema89_values {
+            match timeframe {
+                60 => output.ema89_1min = ema,
+                300 => output.ema89_5min = ema,
+                900 => output.ema89_15min = ema,
+                3600 => output.ema89_1h = ema,
+                14400 => output.ema89_4h = ema,
+                _ => {}
+            }
+        }
+
+        for (timeframe, trend) in trend_values {
+            match timeframe {
+                60 => output.trend_1min = trend,
+                300 => output.trend_5min = trend,
+                900 => output.trend_15min = trend,
+                3600 => output.trend_1h = trend,
+                14400 => output.trend_4h = trend,
+                _ => {}
+            }
+        }
+        let assignment_time = start_assignment.elapsed();
+
+        // Volume analysis with early termination
+        let start_volume = Instant::now();
+        if let Some(state) = self.symbol_states.get(symbol) {
+            // Get max volume info from volume tracker
+            if let Some(max_vol_data) = state.volume_tracker.get_max() {
+                // Use a simple trend calculation based on current price vs max volume price
+                let current_price = output.close_5m.or(output.close_15m).or(output.close_60m).or(output.close_4h);
+                if let Some(price) = current_price {
+                    let price_diff = price - max_vol_data.price;
+                    output.max_volume_trend = Some(if price_diff > 0.0 {
+                        crate::technical_analysis::structs::TrendDirection::Buy
+                    } else if price_diff < 0.0 {
+                        crate::technical_analysis::structs::TrendDirection::Sell
+                    } else {
+                        crate::technical_analysis::structs::TrendDirection::Neutral
+                    });
+                }
+            }
+        }
+        let volume_time = start_volume.elapsed();
+
+        // Volume quantile analysis - THE CRITICAL BOTTLENECK (4.6ms)
+        let start_quantiles = Instant::now();
+        output.volume_quantiles = self.symbol_states.get_mut(symbol)
+            .and_then(|state| state.quantile_tracker.get_quantiles());
+        let quantiles_time = start_quantiles.elapsed();
+
+        // Volume profile data assignment (feature disabled)
+        let volume_profile_time = std::time::Duration::new(0, 0);
+        output.volume_profile = None; // Always None when volume_profile feature is disabled
+        
+        // DEBUG: Volume profile feature disabled
+        debug!("🔍 VOLUME PROFILE ASSIGNMENT: Volume profile feature disabled");
+        
+        // PHASE 3: Record optimized output generation metrics
+        record_simd_op!("optimized_output_generation", 1);
+
+        let total_time = start_total.elapsed();
+        
+        // PERFORMANCE DEBUGGING: Always log detailed timing breakdown
+        if true { // Always log to verify the fix worked
+            info!("🔍 DETAILED OUTPUT TIMING BREAKDOWN: total={:?}, alloc={:?}, data_collection={:?}, assignment={:?}, volume={:?}, quantiles={:?}, volume_profile={:?}",
+                  total_time, alloc_time, data_collection_time, assignment_time, volume_time, quantiles_time, volume_profile_time);
+        }
+
+        output
     }
 }
 
@@ -1128,6 +1307,7 @@ impl Message<IndicatorTell> for IndicatorActor {
                     let _ema89_1h = state.get_ema(3600, 89);
                     
                     // Query volume profile data if volume profile actor is available
+                    #[cfg(feature = "volume_profile")]
                     let volume_profile_data = if let Some(ref volume_profile_actor) = self.volume_profile_actor {
                         // Extract date from the most recent candle (use 1-minute candle if available, fallback to any)
                         let candle_date = candles.get(&60) // Try 1-minute candle first
@@ -1167,8 +1347,18 @@ impl Message<IndicatorTell> for IndicatorActor {
                     } else {
                         None
                     };
+
+                    #[cfg(not(feature = "volume_profile"))]
+                    let volume_profile_data: Option<()> = None;
                     
-                    let output = state.generate_output_with_volume_profile(&symbol, volume_profile_data).await;
+                    // Generate output (basic version for now)
+                    let mut output = state.generate_output(&symbol).await;
+                    
+                    // Add volume profile data if available
+                    #[cfg(feature = "volume_profile")]
+                    {
+                        output.volume_profile = volume_profile_data;
+                    }
                     output_time = output_start.elapsed();
                     
                     // Optimized real-time logging with dynamic precision based on price range
@@ -1211,6 +1401,7 @@ impl Message<IndicatorTell> for IndicatorActor {
                     
                     // Move Kafka publishing to background task to avoid blocking
                     let kafka_start = std::time::Instant::now();
+                    #[cfg(feature = "kafka")]
                     if let Some(kafka_actor) = self.kafka_actor.clone() {
                         let output_arc = Arc::new(output);
                         let symbol_owned = symbol.clone();
@@ -1219,13 +1410,16 @@ impl Message<IndicatorTell> for IndicatorActor {
                             let output_data = &*output_arc;
                             
                             // DEBUG: Log the volume profile data being sent to Kafka
-                            if let Some(ref volume_profile) = output_data.volume_profile {
+                            #[cfg(feature = "volume_profile")]
+                            if let Some(ref volume_profile) = output_data.volume_profile.as_ref() {
                                 info!("🎯 KAFKA DEBUG: Sending volume profile for {} on {}: {} price levels, total volume: {:.2}, VWAP: {:.2}, POC: {:.2}", 
                                       symbol_owned, volume_profile.date, volume_profile.price_levels.len(), 
                                       volume_profile.total_volume, volume_profile.vwap, volume_profile.poc);
                                 info!("🎯 KAFKA DEBUG: Value area: high={:.2}, low={:.2}, volume_percentage={:.2}%", 
                                       volume_profile.value_area.high, volume_profile.value_area.low, volume_profile.value_area.volume_percentage);
-                            } else {
+                            } 
+                            #[cfg(feature = "volume_profile")]
+                            if output_data.volume_profile.is_none() {
                                 warn!("🚨 KAFKA DEBUG: NO VOLUME PROFILE DATA for {} - volume_profile is None!", symbol_owned);
                             }
                             
@@ -1233,7 +1427,8 @@ impl Message<IndicatorTell> for IndicatorActor {
                             let cloned_output = (*output_arc).clone();
                             
                             // DEBUG: Verify volume profile data survives cloning
-                            if let Some(ref vp) = cloned_output.volume_profile {
+                            #[cfg(feature = "volume_profile")]
+                            if let Some(ref vp) = cloned_output.volume_profile.as_ref() {
                                 debug!("🔍 KAFKA CLONE DEBUG: Volume profile data survived cloning - {} price levels, total volume: {:.2}", 
                                        vp.price_levels.len(), vp.total_volume);
                             } else {
@@ -1249,8 +1444,10 @@ impl Message<IndicatorTell> for IndicatorActor {
                                 debug!("✅ Background Kafka publish completed for {}", symbol_owned);
                             }
                         });
-                    } else {
-                        debug!("⚠️ No Kafka actor for {} indicators", symbol);
+                    }
+                    #[cfg(not(feature = "kafka"))]
+                    {
+                        debug!("⚠️ No Kafka actor for {} indicators (Kafka feature disabled)", symbol);
                     }
                     kafka_time = kafka_start.elapsed();
                 } else {
@@ -1275,12 +1472,14 @@ impl Message<IndicatorTell> for IndicatorActor {
                 }
             }
             
+            #[cfg(feature = "kafka")]
             IndicatorTell::SetKafkaActor { kafka_actor } => {
                 info!("📨 Setting Kafka actor reference for indicator publishing");
                 self.kafka_actor = Some(kafka_actor);
                 info!("✅ Kafka actor reference successfully set in IndicatorActor");
             }
             
+            #[cfg(feature = "volume_profile")]
             IndicatorTell::SetVolumeProfileActor { volume_profile_actor } => {
                 info!("📊 Setting Volume Profile actor reference for volume profile data integration");
                 self.volume_profile_actor = Some(volume_profile_actor);

@@ -1158,7 +1158,10 @@ pub struct IndicatorOutput {
     pub volume_quantiles: Option<QuantileResults>,
 
     // Daily volume profile data
+    #[cfg(feature = "volume_profile")]
     pub volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>,
+    #[cfg(not(feature = "volume_profile"))]
+    pub volume_profile: Option<()>,
 }
 
 impl Default for IndicatorOutput {
