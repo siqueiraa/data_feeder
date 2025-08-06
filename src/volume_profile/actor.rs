@@ -7,6 +7,9 @@ use kameo::error::{ActorStopReason, BoxError};
 use kameo::message::{Context, Message};
 use kameo::request::MessageSend;
 use kameo::{Actor, mailbox::unbounded::UnboundedMailbox};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
@@ -357,7 +360,7 @@ pub enum VolumeProfileReply {
         is_healthy: bool,
         profiles_count: usize,
         last_error: Option<String>,
-        memory_usage_mb: f64,
+        memory_usage_mb: Decimal,
     },
     /// Statistics response
     Statistics {
@@ -603,7 +606,7 @@ pub struct BatchPerformanceMetrics {
     /// Peak memory usage during processing
     pub peak_memory_usage_bytes: usize,
     /// Memory efficiency (items per MB)
-    pub memory_efficiency: f64,
+    pub memory_efficiency: Decimal,
 }
 
 impl Default for MemoryMonitor {
@@ -619,8 +622,8 @@ impl MemoryMonitor {
         Self {
             current_usage: 0,
             peak_usage: 0,
-            pressure_threshold: (available_memory as f64 * 0.75) as usize, // 75% of available
-            critical_threshold: (available_memory as f64 * 0.90) as usize, // 90% of available
+            pressure_threshold: ((Decimal::from(available_memory) * dec!(0.75)).round().to_usize().unwrap_or(805306368)), // 75% of available
+            critical_threshold: ((Decimal::from(available_memory) * dec!(0.90)).round().to_usize().unwrap_or(966367641)), // 90% of available
             last_check: None,
         }
     }
@@ -642,7 +645,7 @@ impl MemoryMonitor {
             MemoryPressureLevel::Critical
         } else if usage_bytes >= self.pressure_threshold {
             MemoryPressureLevel::High
-        } else if usage_bytes >= (self.pressure_threshold as f64 * 0.5) as usize {
+        } else if usage_bytes >= ((Decimal::from(self.pressure_threshold) * dec!(0.5)).round().to_usize().unwrap_or(0)) {
             MemoryPressureLevel::Medium
         } else {
             MemoryPressureLevel::Low
@@ -652,10 +655,10 @@ impl MemoryMonitor {
     /// Get memory usage statistics
     pub fn get_usage_stats(&self) -> MemoryUsageStats {
         MemoryUsageStats {
-            current_mb: self.current_usage as f64 / (1024.0 * 1024.0),
-            peak_mb: self.peak_usage as f64 / (1024.0 * 1024.0),
-            pressure_threshold_mb: self.pressure_threshold as f64 / (1024.0 * 1024.0),
-            critical_threshold_mb: self.critical_threshold as f64 / (1024.0 * 1024.0),
+            current_mb: Decimal::from(self.current_usage) / Decimal::from(1024 * 1024),
+            peak_mb: Decimal::from(self.peak_usage) / Decimal::from(1024 * 1024),
+            pressure_threshold_mb: Decimal::from(self.pressure_threshold) / Decimal::from(1024 * 1024),
+            critical_threshold_mb: Decimal::from(self.critical_threshold) / Decimal::from(1024 * 1024),
             pressure_level: self.get_current_pressure_level(),
         }
     }
@@ -666,7 +669,7 @@ impl MemoryMonitor {
             MemoryPressureLevel::Critical
         } else if self.current_usage >= self.pressure_threshold {
             MemoryPressureLevel::High
-        } else if self.current_usage >= (self.pressure_threshold as f64 * 0.5) as usize {
+        } else if self.current_usage >= (Decimal::from(self.pressure_threshold) * dec!(0.5)).to_usize().unwrap_or(0) {
             MemoryPressureLevel::Medium
         } else {
             MemoryPressureLevel::Low
@@ -686,10 +689,10 @@ pub enum MemoryPressureLevel {
 /// Memory usage statistics
 #[derive(Debug, Clone)]
 pub struct MemoryUsageStats {
-    pub current_mb: f64,
-    pub peak_mb: f64,
-    pub pressure_threshold_mb: f64,
-    pub critical_threshold_mb: f64,
+    pub current_mb: Decimal,
+    pub peak_mb: Decimal,
+    pub pressure_threshold_mb: Decimal,
+    pub critical_threshold_mb: Decimal,
     pub pressure_level: MemoryPressureLevel,
 }
 
@@ -757,7 +760,7 @@ impl BatchPerformanceMetrics {
             total_processing_time_ms: 0,
             avg_processing_time_per_item_us: 0,
             peak_memory_usage_bytes: 0,
-            memory_efficiency: 0.0,
+            memory_efficiency: dec!(0),
         }
     }
 
@@ -775,8 +778,8 @@ impl BatchPerformanceMetrics {
 
         // Calculate memory efficiency (items per MB)
         if memory_used_bytes > 0 {
-            let memory_mb = memory_used_bytes as f64 / (1024.0 * 1024.0);
-            self.memory_efficiency = items_in_batch as f64 / memory_mb;
+            let memory_mb = Decimal::from(memory_used_bytes) / Decimal::from(1024 * 1024);
+            self.memory_efficiency = Decimal::from(items_in_batch) / memory_mb;
         }
     }
 
@@ -786,12 +789,12 @@ impl BatchPerformanceMetrics {
             total_batches: self.batches_processed,
             total_items: self.items_processed,
             avg_batch_size: if self.batches_processed > 0 {
-                self.items_processed as f64 / self.batches_processed as f64
-            } else { 0.0 },
+                Decimal::from(self.items_processed) / Decimal::from(self.batches_processed)
+            } else { dec!(0) },
             avg_processing_time_per_item_us: self.avg_processing_time_per_item_us,
-            peak_memory_mb: self.peak_memory_usage_bytes as f64 / (1024.0 * 1024.0),
+            peak_memory_mb: Decimal::from(self.peak_memory_usage_bytes) / Decimal::from(1024 * 1024),
             items_per_mb: self.memory_efficiency,
-            total_processing_time_seconds: self.total_processing_time_ms as f64 / 1000.0,
+            total_processing_time_seconds: Decimal::from(self.total_processing_time_ms) / dec!(1000),
         }
     }
 }
@@ -801,11 +804,11 @@ impl BatchPerformanceMetrics {
 pub struct BatchPerformanceSummary {
     pub total_batches: u64,
     pub total_items: u64,
-    pub avg_batch_size: f64,
+    pub avg_batch_size: Decimal,
     pub avg_processing_time_per_item_us: u64,
-    pub peak_memory_mb: f64,
-    pub items_per_mb: f64,
-    pub total_processing_time_seconds: f64,
+    pub peak_memory_mb: Decimal,
+    pub items_per_mb: Decimal,
+    pub total_processing_time_seconds: Decimal,
 }
 
 impl BatchProcessingManager {
@@ -1792,7 +1795,7 @@ impl VolumeProfileActor {
 
     /// Get health status
     fn get_health_status(&self) -> VolumeProfileReply {
-        let memory_usage_mb = self.estimate_memory_usage() as f64 / (1024.0 * 1024.0);
+        let memory_usage_mb = Decimal::from(self.estimate_memory_usage()) / Decimal::from(1024 * 1024);
         
         VolumeProfileReply::HealthStatus {
             is_healthy: self.is_healthy && self.last_error.is_none(),

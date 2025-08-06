@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
+use rust_decimal_macros::dec;
 use crate::volume_profile::structs::{PriceLevelData, VolumeProfileData};
 
 /// Custom error types for volume conservation validation
@@ -6,23 +9,23 @@ use crate::volume_profile::structs::{PriceLevelData, VolumeProfileData};
 pub enum VolumeValidationError {
     /// Volume conservation violated - total doesn't match input
     VolumeConservationViolation {
-        expected: f64,
-        actual: f64,
-        difference: f64,
+        expected: Decimal,
+        actual: Decimal,
+        difference: Decimal,
     },
     /// Volume duplication detected - same volume counted multiple times
     VolumeDuplication {
-        duplicated_volume: f64,
+        duplicated_volume: Decimal,
         count: usize,
     },
     /// Missing volume - input volume not fully distributed
     MissingVolume {
-        expected: f64,
-        distributed: f64,
-        missing: f64,
+        expected: Decimal,
+        distributed: Decimal,
+        missing: Decimal,
     },
     /// Invalid volume data (negative, NaN, infinite)
-    InvalidVolumeData(f64),
+    InvalidVolumeData(Decimal),
 }
 
 impl std::fmt::Display for VolumeValidationError {
@@ -53,25 +56,26 @@ impl std::error::Error for VolumeValidationError {}
 #[derive(Debug, Clone)]
 pub struct VolumeValidationResult {
     pub is_valid: bool,
-    pub expected_volume: f64,
-    pub actual_volume: f64,
-    pub difference: f64,
-    pub percentage_error: f64,
+    pub expected_volume: Decimal,
+    pub actual_volume: Decimal,
+    pub difference: Decimal,
+    pub percentage_error: Decimal,
     pub details: Vec<String>,
 }
 
 impl VolumeValidationResult {
     /// Create a new valid result
-    pub fn valid(expected: f64, actual: f64) -> Self {
+    pub fn valid(expected: Decimal, actual: Decimal) -> Self {
         let difference = (expected - actual).abs();
-        let percentage_error = if expected != 0.0 {
-            (difference / expected.abs()) * 100.0
+        let epsilon_tolerance = dec!(0.000000000000222); // Approximate tolerance for Decimal precision
+        let percentage_error = if expected != Decimal::ZERO {
+            (difference / expected.abs()) * dec!(100.0)
         } else {
-            0.0
+            Decimal::ZERO
         };
         
         Self {
-            is_valid: difference <= f64::EPSILON * 1000.0, // Allow for floating point precision
+            is_valid: difference <= epsilon_tolerance,
             expected_volume: expected,
             actual_volume: actual,
             difference,
@@ -81,12 +85,12 @@ impl VolumeValidationResult {
     }
 
     /// Create a new invalid result
-    pub fn invalid(expected: f64, actual: f64, error: &str) -> Self {
+    pub fn invalid(expected: Decimal, actual: Decimal, error: &str) -> Self {
         let difference = (expected - actual).abs();
-        let percentage_error = if expected != 0.0 {
-            (difference / expected.abs()) * 100.0
+        let percentage_error = if expected != Decimal::ZERO {
+            (difference / expected.abs()) * dec!(100.0)
         } else {
-            0.0
+            Decimal::ZERO
         };
         
         Self {
@@ -110,10 +114,10 @@ impl VolumeValidationResult {
 pub struct DistributionMetrics {
     pub total_levels: usize,
     pub non_zero_levels: usize,
-    pub max_volume: f64,
-    pub min_volume: f64,
-    pub average_volume: f64,
-    pub volume_concentration: f64, // Gini coefficient-like measure
+    pub max_volume: Decimal,
+    pub min_volume: Decimal,
+    pub average_volume: Decimal,
+    pub volume_concentration: Decimal, // Gini coefficient-like measure
 }
 
 /// Validator for ensuring volume conservation during price level aggregation
@@ -123,21 +127,21 @@ pub struct VolumeConservationValidator;
 impl VolumeConservationValidator {
     /// Validate volume conservation across all price levels
     pub fn validate_volume_conservation(
-        expected_volume: f64,
+        expected_volume: Decimal,
         price_levels: &[PriceLevelData]
     ) -> Result<VolumeValidationResult, VolumeValidationError> {
         // Validate input volume
-        if !expected_volume.is_finite() || expected_volume < 0.0 {
+        if expected_volume.is_sign_negative() {
             return Err(VolumeValidationError::InvalidVolumeData(expected_volume));
         }
 
         // Calculate total distributed volume
-        let mut total_distributed = 0.0;
+        let mut total_distributed = Decimal::ZERO;
         let mut level_volumes = Vec::new();
         
         for level in price_levels {
             // Validate each level's volume
-            if !level.volume.is_finite() || level.volume < 0.0 {
+            if level.volume.is_sign_negative() {
                 return Err(VolumeValidationError::InvalidVolumeData(level.volume));
             }
             
@@ -147,7 +151,7 @@ impl VolumeConservationValidator {
 
         // Check for volume conservation
         let difference = (expected_volume - total_distributed).abs();
-        let tolerance = f64::EPSILON * 1000.0; // Allow for floating point precision
+        let tolerance = dec!(0.000000000000222); // Allow for Decimal precision
 
         if difference > tolerance {
             let mut result = VolumeValidationResult::invalid(
@@ -159,13 +163,21 @@ impl VolumeConservationValidator {
             
             // Add specific details about the violation
             if total_distributed < expected_volume {
-                result.add_detail(format!("Missing volume: {} ({}%)", 
-                                        expected_volume - total_distributed,
-                                        ((expected_volume - total_distributed) / expected_volume) * 100.0));
+                let missing = expected_volume - total_distributed;
+                let percentage = if expected_volume != Decimal::ZERO {
+                    (missing / expected_volume.abs()) * dec!(100.0)
+                } else {
+                    Decimal::ZERO
+                };
+                result.add_detail(format!("Missing volume: {} ({}%)", missing, percentage));
             } else {
-                result.add_detail(format!("Excess volume: {} ({}%)", 
-                                        total_distributed - expected_volume,
-                                        ((total_distributed - expected_volume) / expected_volume) * 100.0));
+                let excess = total_distributed - expected_volume;
+                let percentage = if expected_volume != Decimal::ZERO {
+                    (excess / expected_volume.abs()) * dec!(100.0)
+                } else {
+                    Decimal::ZERO
+                };
+                result.add_detail(format!("Excess volume: {} ({}%)", excess, percentage));
             }
             
             return Ok(result);
@@ -177,36 +189,33 @@ impl VolumeConservationValidator {
     /// Calculate distribution metrics for price levels
     pub fn calculate_distribution_metrics(price_levels: &[PriceLevelData]) -> DistributionMetrics {
         let total_levels = price_levels.len();
-        let non_zero_levels = price_levels.iter().filter(|l| l.volume > 0.0).count();
+        let non_zero_levels = price_levels.iter().filter(|l| l.volume > Decimal::ZERO).count();
         
-        let volumes: Vec<f64> = price_levels.iter().map(|l| l.volume).collect();
-        let total_volume: f64 = volumes.iter().sum();
+        let volumes: Vec<Decimal> = price_levels.iter().map(|l| l.volume).collect();
+        let total_volume: Decimal = volumes.iter().sum();
         
-        let max_volume = volumes.iter().fold(0.0f64, |a, &b| a.max(b));
-        let min_volume = volumes.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-        let average_volume = if total_levels > 0 { total_volume / total_levels as f64 } else { 0.0 };
+        let max_volume = volumes.iter().fold(Decimal::ZERO, |a, &b| a.max(b));
+        let min_volume = volumes.iter().fold(Decimal::MAX, |a, &b| a.min(b));
+        let average_volume = if total_levels > 0 { total_volume / Decimal::from(total_levels) } else { Decimal::ZERO };
         
         // Calculate volume concentration (Gini coefficient-like)
-        let volume_concentration = if total_volume > 0.0 {
-            let sorted_volumes = {
-                let mut v = volumes.clone();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v
-            };
+        let volume_concentration = if total_volume > Decimal::ZERO {
+            let mut sorted_volumes = volumes.clone();
+            sorted_volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             
-            let mut _cum_sum = 0.0;
-            let mut gini_numerator = 0.0;
+            let mut cum_sum = Decimal::ZERO;
+            let mut gini_numerator = Decimal::ZERO;
             
             for (i, &volume) in sorted_volumes.iter().enumerate() {
-                _cum_sum += volume;
-                gini_numerator += (i as f64 + 1.0) * volume;
+                cum_sum += volume;
+                gini_numerator += (Decimal::from(i) + Decimal::ONE) * volume;
             }
             
-            let gini = (2.0 * gini_numerator) / (total_volume * total_levels as f64) - 
-                      (total_levels as f64 + 1.0) / total_levels as f64;
-            gini.clamp(0.0, 1.0)
+            let gini = (dec!(2.0) * gini_numerator) / (total_volume * Decimal::from(total_levels)) - 
+                      (Decimal::from(total_levels) + Decimal::ONE) / Decimal::from(total_levels);
+            gini.max(Decimal::ZERO).min(Decimal::ONE)
         } else {
-            0.0
+            Decimal::ZERO
         };
 
         DistributionMetrics {
@@ -221,24 +230,24 @@ impl VolumeConservationValidator {
 
     /// Detect volume duplication across price levels
     pub fn detect_volume_duplication(
-        expected_volume: f64,
+        expected_volume: Decimal,
         price_levels: &[PriceLevelData]
     ) -> Result<(), VolumeValidationError> {
         let mut volume_counts = HashMap::new();
         
         for level in price_levels {
-            // Use rounded volume as key to handle floating point precision
-            let volume_key = (level.volume * 1000000.0).round() as i64; // 6 decimal precision
+            // Use rounded volume as key to handle decimal precision
+            let volume_key = (level.volume * dec!(1000000)).round().to_i64().unwrap_or(0); // 6 decimal precision
             *volume_counts.entry(volume_key).or_insert((0, level.volume)) = 
                 (volume_counts.get(&volume_key).map(|(count, _)| count).unwrap_or(&0) + 1, level.volume);
         }
 
         // Check for suspicious duplication patterns
         for (_, (count, volume)) in volume_counts {
-            if count > 1 && volume > 0.0 {
+            if count > 1 && volume > dec!(0) {
                 // Check if this could indicate duplication
-                let total_duplicated = volume * count as f64;
-                if total_duplicated > expected_volume * 0.1 { // More than 10% of total
+                let total_duplicated = volume * Decimal::from(count);
+                if total_duplicated > expected_volume * dec!(0.1) { // More than 10% of total
                     return Err(VolumeValidationError::VolumeDuplication {
                         duplicated_volume: volume,
                         count,
@@ -273,16 +282,16 @@ impl VolumeConservationValidator {
 
     /// Validate volume distribution accuracy
     pub fn validate_distribution_accuracy(
-        original_trades: &[(f64, f64)], // (price, volume) pairs
+        original_trades: &[(Decimal, Decimal)], // (price, volume) pairs
         price_levels: &[PriceLevelData],
-        _price_increment: f64,
+        _price_increment: Decimal,
     ) -> Result<DistributionMetrics, VolumeValidationError> {
-        let original_total: f64 = original_trades.iter().map(|(_, v)| v).sum();
-        let distributed_total: f64 = price_levels.iter().map(|l| l.volume).sum();
+        let original_total: Decimal = original_trades.iter().map(|(_, v)| *v).sum();
+        let distributed_total: Decimal = price_levels.iter().map(|l| l.volume).sum();
 
         // Validate totals match
         let difference = (original_total - distributed_total).abs();
-        let tolerance = f64::EPSILON * 1000.0;
+        let tolerance = dec!(0.0000000001); // Equivalent to f64::EPSILON * 1000.0 for Decimal
 
         if difference > tolerance {
             return Err(VolumeValidationError::VolumeConservationViolation {
@@ -297,7 +306,7 @@ impl VolumeConservationValidator {
 
     /// Generate a comprehensive validation report
     pub fn generate_validation_report(
-        expected_volume: f64,
+        expected_volume: Decimal,
         price_levels: &[PriceLevelData]
     ) -> String {
         let mut report = String::new();

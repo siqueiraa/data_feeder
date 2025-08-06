@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use tracing::info;
+use rust_decimal::{prelude::*, Decimal};
+use rust_decimal_macros::dec;
 use crate::historical::structs::TimestampMS;
 use crate::volume_profile::precision::PricePrecisionManager;
 
@@ -15,11 +17,11 @@ pub struct AssetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_increment_mode: Option<PriceIncrementMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fixed_price_increment: Option<f64>,
+    pub fixed_price_increment: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_price_increment: Option<f64>,
+    pub min_price_increment: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_price_increment: Option<f64>,
+    pub max_price_increment: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_price_levels: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,7 +29,7 @@ pub struct AssetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_area_calculation_mode: Option<ValueAreaCalculationMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub value_area_percentage: Option<f64>,
+    pub value_area_percentage: Option<Decimal>,
     /// Override calculation mode for this specific asset
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calculation_mode: Option<VolumeProfileCalculationMode>,
@@ -39,12 +41,12 @@ pub struct VolumeProfileConfig {
     pub enabled: bool,
     pub price_increment_mode: PriceIncrementMode,
     pub target_price_levels: u32,
-    pub fixed_price_increment: f64,
-    pub min_price_increment: f64,
-    pub max_price_increment: f64,
+    pub fixed_price_increment: Decimal,
+    pub min_price_increment: Decimal,
+    pub max_price_increment: Decimal,
     pub update_frequency: UpdateFrequency,
     pub batch_size: usize,
-    pub value_area_percentage: f64,
+    pub value_area_percentage: Decimal,
     pub volume_distribution_mode: VolumeDistributionMode,
     pub value_area_calculation_mode: ValueAreaCalculationMode,
     /// Calculation mode for POC and value area determination
@@ -60,16 +62,17 @@ pub struct VolumeProfileConfig {
 
 impl Default for VolumeProfileConfig {
     fn default() -> Self {
+        use rust_decimal_macros::dec;
         Self {
             enabled: true,
             price_increment_mode: PriceIncrementMode::Adaptive,
             target_price_levels: 200,
-            fixed_price_increment: 0.01,
-            min_price_increment: 0.00000001,
-            max_price_increment: 100.0,
+            fixed_price_increment: dec!(0.01),
+            min_price_increment: dec!(0.00000001),
+            max_price_increment: dec!(100.0),
             update_frequency: UpdateFrequency::EveryCandle,
             batch_size: 10,
-            value_area_percentage: 70.0,
+            value_area_percentage: dec!(70.0),
             volume_distribution_mode: VolumeDistributionMode::WeightedOHLC,
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
             calculation_mode: VolumeProfileCalculationMode::default(),
@@ -122,11 +125,11 @@ impl VolumeProfileConfig {
             return Err(format!("target_price_levels must be between 10 and 10000, got {}", self.target_price_levels));
         }
 
-        if self.fixed_price_increment <= 0.0 {
+        if self.fixed_price_increment <= Decimal::ZERO {
             return Err("fixed_price_increment must be positive".to_string());
         }
 
-        if self.min_price_increment <= 0.0 {
+        if self.min_price_increment <= Decimal::ZERO {
             return Err("min_price_increment must be positive".to_string());
         }
 
@@ -134,7 +137,8 @@ impl VolumeProfileConfig {
             return Err("max_price_increment must be greater than min_price_increment".to_string());
         }
 
-        if self.value_area_percentage < 50.0 || self.value_area_percentage > 95.0 {
+        use rust_decimal_macros::dec;
+        if self.value_area_percentage < dec!(50.0) || self.value_area_percentage > dec!(95.0) {
             return Err(format!("value_area_percentage must be between 50% and 95%, got {}%", self.value_area_percentage));
         }
 
@@ -147,13 +151,13 @@ impl VolumeProfileConfig {
             }
 
             if let Some(increment) = asset_config.fixed_price_increment {
-                if increment <= 0.0 {
+                if increment <= dec!(0.0) {
                     return Err(format!("Asset {}: fixed_price_increment must be positive", symbol));
                 }
             }
 
             if let Some(min_inc) = asset_config.min_price_increment {
-                if min_inc <= 0.0 {
+                if min_inc <= dec!(0.0) {
                     return Err(format!("Asset {}: min_price_increment must be positive", symbol));
                 }
 
@@ -165,7 +169,7 @@ impl VolumeProfileConfig {
             }
 
             if let Some(va_pct) = asset_config.value_area_percentage {
-                if !(50.0..=95.0).contains(&va_pct) {
+                if va_pct < dec!(50.0) || va_pct > dec!(95.0) {
                     return Err(format!("Asset {}: value_area_percentage must be between 50% and 95%, got {}%", symbol, va_pct));
                 }
             }
@@ -182,12 +186,12 @@ impl VolumeProfileConfig {
 pub struct ResolvedAssetConfig {
     pub price_increment_mode: PriceIncrementMode,
     pub target_price_levels: u32,
-    pub fixed_price_increment: f64,
-    pub min_price_increment: f64,
-    pub max_price_increment: f64,
+    pub fixed_price_increment: Decimal,
+    pub min_price_increment: Decimal,
+    pub max_price_increment: Decimal,
     pub volume_distribution_mode: VolumeDistributionMode,
     pub value_area_calculation_mode: ValueAreaCalculationMode,
-    pub value_area_percentage: f64,
+    pub value_area_percentage: Decimal,
     pub calculation_mode: VolumeProfileCalculationMode,
 }
 
@@ -324,19 +328,19 @@ pub struct VolumeProfileData {
     /// Individual price levels with volume data
     pub price_levels: Vec<PriceLevelData>,
     /// Total volume for the day
-    pub total_volume: f64,
+    pub total_volume: Decimal,
     /// Volume Weighted Average Price
-    pub vwap: f64,
+    pub vwap: Decimal,
     /// Point of Control (price level with highest volume)
-    pub poc: f64,
+    pub poc: Decimal,
     /// Value area (70% of volume concentration)
     pub value_area: ValueArea,
     /// Price increment used for this profile
-    pub price_increment: f64,
+    pub price_increment: Decimal,
     /// Minimum price for the day
-    pub min_price: f64,
+    pub min_price: Decimal,
     /// Maximum price for the day
-    pub max_price: f64,
+    pub max_price: Decimal,
     /// Number of 1-minute candles processed
     pub candle_count: u32,
     /// Last update timestamp
@@ -349,25 +353,25 @@ pub struct DailyVolumeProfileFlat {
     /// Trading date (YYYY-MM-DD format)
     pub date: String,
     /// Total volume for the day
-    pub total_volume: f64,
+    pub total_volume: Decimal,
     /// Volume Weighted Average Price
-    pub vwap: f64,
+    pub vwap: Decimal,
     /// Point of Control (price level with highest volume)
-    pub poc: f64,
+    pub poc: Decimal,
     /// Value area (70% of volume concentration)
     pub value_area: ValueArea,
     /// Price increment used for this profile
-    pub price_increment: f64,
+    pub price_increment: Decimal,
     /// Minimum price for the day
-    pub min_price: f64,
+    pub min_price: Decimal,
     /// Maximum price for the day
-    pub max_price: f64,
+    pub max_price: Decimal,
     /// Number of 1-minute candles processed
     pub candle_count: u32,
     /// Last update timestamp
     pub last_updated: TimestampMS,
     /// Individual price levels as (price, volume) pairs
-    pub price_levels: Vec<(f64, f64)>,
+    pub price_levels: Vec<(Decimal, Decimal)>,
 }
 
 impl From<VolumeProfileData> for DailyVolumeProfileFlat {
@@ -400,7 +404,7 @@ impl From<DailyVolumeProfileFlat> for VolumeProfileData {
                 .map(|(price, volume)| PriceLevelData {
                     price,
                     volume,
-                    percentage: 0.0, // Will be calculated based on total_volume
+                    percentage: dec!(0.0), // Will be calculated based on total_volume
                     candle_count: 0, // Will be calculated based on actual data
                 })
                 .collect(),
@@ -421,11 +425,11 @@ impl From<DailyVolumeProfileFlat> for VolumeProfileData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceLevelData {
     /// Price level
-    pub price: f64,
+    pub price: Decimal,
     /// Volume at this price level
-    pub volume: f64,
+    pub volume: Decimal,
     /// Percentage of total daily volume
-    pub percentage: f64,
+    pub percentage: Decimal,
     /// Number of candles/time periods at this price level (for TPO calculations)
     #[serde(default)]
     pub candle_count: u32,
@@ -435,13 +439,13 @@ pub struct PriceLevelData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValueArea {
     /// Highest price in value area
-    pub high: f64,
+    pub high: Decimal,
     /// Lowest price in value area
-    pub low: f64,
+    pub low: Decimal,
     /// Percentage of total volume in value area
-    pub volume_percentage: f64,
+    pub volume_percentage: Decimal,
     /// Total volume within value area
-    pub volume: f64,
+    pub volume: Decimal,
 }
 
 /// Business rules validation result for value area calculations
@@ -461,19 +465,19 @@ pub struct ValueAreaValidationResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidationMetrics {
     /// Point of Control price
-    pub poc_price: f64,
+    pub poc_price: Decimal,
     /// Value Area High price  
-    pub vah_price: f64,
+    pub vah_price: Decimal,
     /// Value Area Low price
-    pub val_price: f64,
+    pub val_price: Decimal,
     /// Actual volume percentage achieved
-    pub actual_volume_percentage: f64,
+    pub actual_volume_percentage: Decimal,
     /// Target volume percentage requested
-    pub target_volume_percentage: f64,
+    pub target_volume_percentage: Decimal,
     /// Distance from POC to VAH
-    pub poc_to_vah_distance: f64,
+    pub poc_to_vah_distance: Decimal,
     /// Distance from POC to VAL
-    pub poc_to_val_distance: f64,
+    pub poc_to_val_distance: Decimal,
     /// Number of price levels in value area
     pub price_levels_count: usize,
     /// Whether POC is properly centered
@@ -494,13 +498,13 @@ impl Default for ValueAreaValidationResult {
 impl Default for ValidationMetrics {
     fn default() -> Self {
         Self {
-            poc_price: 0.0,
-            vah_price: 0.0,
-            val_price: 0.0,
-            actual_volume_percentage: 0.0,
-            target_volume_percentage: 0.0,
-            poc_to_vah_distance: 0.0,
-            poc_to_val_distance: 0.0,
+            poc_price: Decimal::ZERO,
+            vah_price: Decimal::ZERO,
+            val_price: Decimal::ZERO,
+            actual_volume_percentage: Decimal::ZERO,
+            target_volume_percentage: Decimal::ZERO,
+            poc_to_vah_distance: Decimal::ZERO,
+            poc_to_val_distance: Decimal::ZERO,
             price_levels_count: 0,
             is_poc_centered: false,
         }
@@ -512,9 +516,9 @@ impl Default for ValidationMetrics {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationResult {
     Valid,
-    InvalidRange { high: f64, low: f64 },
-    InvalidVolumePercentage { percentage: f64 },
-    PocNotInRange { poc: f64, high: f64, low: f64 },
+    InvalidRange { high: Decimal, low: Decimal },
+    InvalidVolumePercentage { percentage: Decimal },
+    PocNotInRange { poc: Decimal, high: Decimal, low: Decimal },
     DegenerateCase { price_levels_count: usize },
 }
 
@@ -524,14 +528,16 @@ pub struct ValueAreaValidator;
 
 impl ValueAreaValidator {
     /// Validate a calculated value area against acceptance criteria
-    pub fn validate_value_area(high: f64, low: f64, volume_percentage: f64) -> ValidationResult {
+    pub fn validate_value_area(high: Decimal, low: Decimal, volume_percentage: Decimal) -> ValidationResult {
         // AC1: Value area high must be greater than value area low (no degenerate single-price areas)
         if high < low {
             return ValidationResult::InvalidRange { high, low };
         }
         
         // AC2: Volume percentage accuracy (65-75% target range)
-        if !(65.0..=75.0).contains(&volume_percentage) {
+        let min_percentage = dec!(65.0);
+        let max_percentage = dec!(75.0);
+        if volume_percentage < min_percentage || volume_percentage > max_percentage {
             return ValidationResult::InvalidVolumePercentage { percentage: volume_percentage };
         }
         
@@ -545,20 +551,20 @@ impl ValueAreaValidator {
         }
         
         // Check if 90% or more volume is at price extremes (first or last level)
-        let total_volume: f64 = price_levels.iter().map(|p| p.volume).sum();
-        if total_volume <= 0.0 {
+        let total_volume: Decimal = price_levels.iter().map(|p| p.volume).sum();
+        if total_volume <= Decimal::ZERO {
             return true;
         }
         
-        let first_volume = price_levels.first().map(|p| p.volume).unwrap_or(0.0);
-        let last_volume = price_levels.last().map(|p| p.volume).unwrap_or(0.0);
+        let first_volume = price_levels.first().map(|p| p.volume).unwrap_or(Decimal::ZERO);
+        let last_volume = price_levels.last().map(|p| p.volume).unwrap_or(Decimal::ZERO);
         let extreme_volume = first_volume + last_volume;
         
-        (extreme_volume / total_volume) > 0.9 // More than 90% at extremes is degenerate
+        (extreme_volume / total_volume) > dec!(0.9) // More than 90% at extremes is degenerate
     }
     
     /// Validate that POC is within value area range (AC3)
-    pub fn validate_poc_in_range(poc: f64, high: f64, low: f64) -> ValidationResult {
+    pub fn validate_poc_in_range(poc: Decimal, high: Decimal, low: Decimal) -> ValidationResult {
         if poc < low || poc > high {
             return ValidationResult::PocNotInRange { poc, high, low };
         }
@@ -571,18 +577,18 @@ impl ValueAreaValidator {
 #[derive(Debug, Clone)]
 pub struct PriceLevelMap {
     /// Price levels mapped to volume (using BTreeMap for sorted access)
-    pub levels: BTreeMap<PriceKey, f64>,
+    pub levels: BTreeMap<PriceKey, Decimal>,
     /// Price levels mapped to candle count for TPO calculations
     pub candle_counts: BTreeMap<PriceKey, u32>,
     /// Price increment for this profile
-    pub price_increment: f64,
+    pub price_increment: Decimal,
     /// Precision manager for consistent price-to-key mapping
     precision_manager: PricePrecisionManager,
 }
 
 impl PriceLevelMap {
     /// Create new price level map
-    pub fn new(price_increment: f64) -> Self {
+    pub fn new(price_increment: Decimal) -> Self {
         Self {
             levels: BTreeMap::new(),
             candle_counts: BTreeMap::new(),
@@ -592,21 +598,21 @@ impl PriceLevelMap {
     }
 
     /// Add volume to a specific price level
-    pub fn add_volume(&mut self, price: f64, volume: f64) {
+    pub fn add_volume(&mut self, price: Decimal, volume: Decimal) {
         let price_key = PriceKey::from_price_with_manager(price, self.price_increment, &self.precision_manager);
-        *self.levels.entry(price_key).or_insert(0.0) += volume;
+        *self.levels.entry(price_key).or_insert(Decimal::ZERO) += volume;
     }
 
     /// Add volume and increment candle count at a specific price level
-    pub fn add_volume_at_price(&mut self, price: f64, volume: f64) {
+    pub fn add_volume_at_price(&mut self, price: Decimal, volume: Decimal) {
         let price_key = PriceKey::from_price_with_manager(price, self.price_increment, &self.precision_manager);
-        *self.levels.entry(price_key).or_insert(0.0) += volume;
+        *self.levels.entry(price_key).or_insert(Decimal::ZERO) += volume;
         *self.candle_counts.entry(price_key).or_insert(0) += 1;
     }
 
     /// Distribute volume across price range using the specified distribution mode
-    pub fn distribute_candle_volume(&mut self, _open: f64, high: f64, low: f64, close: f64, volume: f64, mode: &VolumeDistributionMode) {
-        if volume <= 0.0 {
+    pub fn distribute_candle_volume(&mut self, _open: Decimal, high: Decimal, low: Decimal, close: Decimal, volume: Decimal, mode: &VolumeDistributionMode) {
+        if volume <= Decimal::ZERO {
             return;
         }
 
@@ -621,20 +627,20 @@ impl PriceLevelMap {
             },
             VolumeDistributionMode::WeightedOHLC => {
                 // Weighted: 50% close, 25% high, 25% low
-                self.add_volume_at_price(close, volume * 0.5);
-                self.add_volume_at_price(high, volume * 0.25);
-                self.add_volume_at_price(low, volume * 0.25);
+                self.add_volume_at_price(close, volume * dec!(0.5));
+                self.add_volume_at_price(high, volume * dec!(0.25));
+                self.add_volume_at_price(low, volume * dec!(0.25));
             },
             VolumeDistributionMode::HighLowWeighted => {
                 // Price action focused: 50% high, 50% low
-                self.add_volume_at_price(high, volume * 0.5);
-                self.add_volume_at_price(low, volume * 0.5);
+                self.add_volume_at_price(high, volume * dec!(0.5));
+                self.add_volume_at_price(low, volume * dec!(0.5));
             },
         }
     }
 
     /// Distribute volume uniformly across price range from low to high
-    fn distribute_volume_uniform(&mut self, high: f64, low: f64, volume: f64) {
+    fn distribute_volume_uniform(&mut self, high: Decimal, low: Decimal, volume: Decimal) {
         if high <= low {
             // Edge case: no range, assign all to single price
             self.add_volume_at_price(high, volume);
@@ -643,7 +649,7 @@ impl PriceLevelMap {
 
         // Calculate number of price levels in the range
         let range = high - low;
-        let levels_in_range = (range / self.price_increment).ceil() as i32;
+        let levels_in_range = (range / self.price_increment).ceil().to_i32().unwrap_or(1);
         
         if levels_in_range <= 1 {
             // Range is smaller than price increment
@@ -652,10 +658,10 @@ impl PriceLevelMap {
         }
 
         // Distribute volume equally across all price levels in range
-        let volume_per_level = volume / levels_in_range as f64;
+        let volume_per_level = volume / Decimal::from(levels_in_range);
         
         for i in 0..levels_in_range {
-            let price = low + (i as f64 * self.price_increment);
+            let price = low + (Decimal::from(i) * self.price_increment);
             if price <= high {
                 self.add_volume_at_price(price, volume_per_level);
             }
@@ -663,7 +669,7 @@ impl PriceLevelMap {
     }
 
     /// Get total volume across all price levels
-    pub fn total_volume(&self) -> f64 {
+    pub fn total_volume(&self) -> Decimal {
         self.levels.values().sum()
     }
 
@@ -673,32 +679,34 @@ impl PriceLevelMap {
     }
 
     /// Get total volume for percentage calculations
-    pub fn get_total_volume(&self) -> f64 {
+    pub fn get_total_volume(&self) -> Decimal {
         self.total_volume()
     }
     
     /// Calculate percentage of total volume for a given volume amount
-    pub fn calculate_volume_percentage(&self, volume: f64) -> f64 {
+    pub fn calculate_volume_percentage(&self, volume: Decimal) -> Decimal {
+        use rust_decimal_macros::dec;
         let total = self.get_total_volume();
-        if total > 0.0 {
-            (volume / total) * 100.0
+        if total > Decimal::ZERO {
+            (volume / total) * dec!(100.0)
         } else {
-            0.0
+            Decimal::ZERO
         }
     }
     
     /// Calculate percentage of total candles for a given candle count
-    pub fn calculate_candle_percentage(&self, candle_count: u32) -> f64 {
+    pub fn calculate_candle_percentage(&self, candle_count: u32) -> Decimal {
+        use rust_decimal_macros::dec;
         let total = self.get_total_candle_count();
         if total > 0 {
-            (candle_count as f64 / total as f64) * 100.0
+            (Decimal::from(candle_count) / Decimal::from(total)) * dec!(100.0)
         } else {
-            0.0
+            Decimal::ZERO
         }
     }
     
     /// Get price level with highest candle count for TPO analysis
-    pub fn get_highest_candle_count_level(&self) -> Option<(f64, u32)> {
+    pub fn get_highest_candle_count_level(&self) -> Option<(Decimal, u32)> {
         self.candle_counts
             .iter()
             .max_by(|(_, count_a), (_, count_b)| count_a.cmp(count_b))
@@ -706,7 +714,7 @@ impl PriceLevelMap {
     }
     
     /// Get price level with highest volume for Volume analysis
-    pub fn get_highest_volume_level(&self) -> Option<(f64, f64)> {
+    pub fn get_highest_volume_level(&self) -> Option<(Decimal, Decimal)> {
         self.levels
             .iter()
             .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
@@ -714,11 +722,11 @@ impl PriceLevelMap {
     }
     
     /// Get combined metrics for a specific price level
-    pub fn get_price_level_metrics(&self, price: f64) -> Option<(f64, u32)> {
+    pub fn get_price_level_metrics(&self, price: Decimal) -> Option<(Decimal, u32)> {
         let price_key = PriceKey::from_price_with_manager(price, self.price_increment, &self.precision_manager);
-        let volume = self.levels.get(&price_key).copied().unwrap_or(0.0);
+        let volume = self.levels.get(&price_key).copied().unwrap_or(dec!(0.0));
         let candle_count = self.candle_counts.get(&price_key).copied().unwrap_or(0);
-        if volume > 0.0 || candle_count > 0 {
+        if volume > dec!(0.0) || candle_count > 0 {
             Some((volume, candle_count))
         } else {
             None
@@ -726,7 +734,7 @@ impl PriceLevelMap {
     }
 
     /// Get price level with highest volume (Point of Control)
-    pub fn get_poc(&self) -> Option<f64> {
+    pub fn get_poc(&self) -> Option<Decimal> {
         self.levels
             .iter()
             .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
@@ -734,7 +742,7 @@ impl PriceLevelMap {
     }
 
     /// Identify POC using TPO method (highest candle count)
-    pub fn identify_poc_tpo(&self) -> Option<f64> {
+    pub fn identify_poc_tpo(&self) -> Option<Decimal> {
         self.candle_counts
             .iter()
             .max_by(|(_, count_a), (_, count_b)| count_a.cmp(count_b))
@@ -742,7 +750,7 @@ impl PriceLevelMap {
     }
 
     /// Identify POC using Volume method (highest actual volume)
-    pub fn identify_poc_volume(&self) -> Option<f64> {
+    pub fn identify_poc_volume(&self) -> Option<Decimal> {
         self.levels
             .iter()
             .max_by(|(_, vol_a), (_, vol_b)| vol_a.partial_cmp(vol_b).unwrap_or(std::cmp::Ordering::Equal))
@@ -750,7 +758,7 @@ impl PriceLevelMap {
     }
 
     /// Unified POC identification based on calculation mode
-    pub fn identify_poc(&self, calculation_mode: &VolumeProfileCalculationMode) -> Option<f64> {
+    pub fn identify_poc(&self, calculation_mode: &VolumeProfileCalculationMode) -> Option<Decimal> {
         match calculation_mode {
             VolumeProfileCalculationMode::Volume => self.identify_poc_volume(),
             VolumeProfileCalculationMode::TPO => self.identify_poc_tpo(),
@@ -759,11 +767,11 @@ impl PriceLevelMap {
 
     /// Expand value area using TPO (Time-Price Opportunity) method
     /// Starts from POC and expands bidirectionally counting time periods until threshold reached
-    pub fn expand_value_area_tpo(&self, value_area_percentage: f64) -> ValueArea {
-        let total_candles = self.get_total_candle_count() as f64;
-        let target_candles = total_candles * (value_area_percentage / 100.0);
+    pub fn expand_value_area_tpo(&self, value_area_percentage: Decimal) -> ValueArea {
+        let total_candles = Decimal::from(self.get_total_candle_count());
+        let target_candles = total_candles * (value_area_percentage / dec!(100.0));
         
-        if self.candle_counts.is_empty() || total_candles <= 0.0 {
+        if self.candle_counts.is_empty() || total_candles <= Decimal::ZERO {
             return ValueArea::default();
         }
         
@@ -786,7 +794,7 @@ impl PriceLevelMap {
             .unwrap_or(0);
         
         // Start from POC and expand symmetrically
-        let mut included_candles = self.candle_counts.get(&poc_key).copied().unwrap_or(0) as f64;
+        let mut included_candles = Decimal::from(self.candle_counts.get(&poc_key).copied().unwrap_or(0));
         let mut selected_levels = vec![poc_key];
         let mut low_index = poc_index;
         let mut high_index = poc_index;
@@ -798,8 +806,8 @@ impl PriceLevelMap {
             // Check left expansion
             if low_index > 0 {
                 let left_key = *all_levels[low_index - 1];
-                let left_candles = self.candle_counts.get(&left_key).copied().unwrap_or(0) as f64;
-                if left_candles > 0.0 {
+                let left_candles = Decimal::from(self.candle_counts.get(&left_key).copied().unwrap_or(0));
+                if left_candles > Decimal::ZERO {
                     candidates.push((left_key, left_candles, low_index - 1, "left"));
                 }
             }
@@ -807,8 +815,8 @@ impl PriceLevelMap {
             // Check right expansion
             if high_index < all_levels.len() - 1 {
                 let right_key = *all_levels[high_index + 1];
-                let right_candles = self.candle_counts.get(&right_key).copied().unwrap_or(0) as f64;
-                if right_candles > 0.0 {
+                let right_candles = Decimal::from(self.candle_counts.get(&right_key).copied().unwrap_or(0));
+                if right_candles > Decimal::ZERO {
                     candidates.push((right_key, right_candles, high_index + 1, "right"));
                 }
             }
@@ -844,7 +852,7 @@ impl PriceLevelMap {
         let actual_volume = self.levels.iter()
             .filter(|(key, _)| **key >= low_key && **key <= high_key)
             .map(|(_, volume)| *volume)
-            .sum::<f64>();
+            .sum::<Decimal>();
         
         let total_volume = self.total_volume();
         
@@ -852,17 +860,17 @@ impl PriceLevelMap {
             low: final_low,
             high: final_high,
             volume: actual_volume,
-            volume_percentage: if total_volume > 0.0 { (actual_volume / total_volume) * 100.0 } else { 0.0 },
+            volume_percentage: if total_volume > Decimal::ZERO { (actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
         }
     }
     
     /// Expand value area using Volume method
     /// Starts from POC and expands bidirectionally counting volume until threshold reached
-    pub fn expand_value_area_volume(&self, value_area_percentage: f64) -> ValueArea {
+    pub fn expand_value_area_volume(&self, value_area_percentage: Decimal) -> ValueArea {
         let total_volume = self.total_volume();
-        let target_volume = total_volume * (value_area_percentage / 100.0);
+        let target_volume = total_volume * (value_area_percentage / Decimal::from(100));
         
-        if self.levels.is_empty() || total_volume <= 0.0 {
+        if self.levels.is_empty() || total_volume <= Decimal::ZERO {
             return ValueArea::default();
         }
         
@@ -885,7 +893,7 @@ impl PriceLevelMap {
             .unwrap_or(0);
         
         // Start from POC and expand symmetrically
-        let mut included_volume = self.levels.get(&poc_key).copied().unwrap_or(0.0);
+        let mut included_volume = self.levels.get(&poc_key).copied().unwrap_or(Decimal::ZERO);
         let mut selected_levels = vec![poc_key];
         let mut low_index = poc_index;
         let mut high_index = poc_index;
@@ -897,8 +905,8 @@ impl PriceLevelMap {
             // Check left expansion
             if low_index > 0 {
                 let left_key = *all_levels[low_index - 1];
-                let left_volume = self.levels.get(&left_key).copied().unwrap_or(0.0);
-                if left_volume > 0.0 {
+                let left_volume = self.levels.get(&left_key).copied().unwrap_or(Decimal::ZERO);
+                if left_volume > Decimal::ZERO {
                     candidates.push((left_key, left_volume, low_index - 1, "left"));
                 }
             }
@@ -906,8 +914,8 @@ impl PriceLevelMap {
             // Check right expansion
             if high_index < all_levels.len() - 1 {
                 let right_key = *all_levels[high_index + 1];
-                let right_volume = self.levels.get(&right_key).copied().unwrap_or(0.0);
-                if right_volume > 0.0 {
+                let right_volume = self.levels.get(&right_key).copied().unwrap_or(Decimal::ZERO);
+                if right_volume > Decimal::ZERO {
                     candidates.push((right_key, right_volume, high_index + 1, "right"));
                 }
             }
@@ -943,20 +951,20 @@ impl PriceLevelMap {
         let actual_volume = self.levels.iter()
             .filter(|(key, _)| **key >= low_key && **key <= high_key)
             .map(|(_, volume)| *volume)
-            .sum::<f64>();
+            .sum::<Decimal>();
         
         ValueArea {
             low: final_low,
             high: final_high,
             volume: actual_volume,
-            volume_percentage: if total_volume > 0.0 { (actual_volume / total_volume) * 100.0 } else { 0.0 },
+            volume_percentage: if total_volume > Decimal::ZERO { (actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
         }
     }
 
     /// Convert to sorted vector of price level data
     pub fn to_price_levels(&self) -> Vec<PriceLevelData> {
         let total_volume = self.total_volume();
-        if total_volume <= 0.0 {
+        if total_volume <= Decimal::ZERO {
             return Vec::new();
         }
 
@@ -967,7 +975,7 @@ impl PriceLevelMap {
                 PriceLevelData {
                     price: price_key.to_price(self.price_increment),
                     volume,
-                    percentage: (volume / total_volume) * 100.0,
+                    percentage: (volume / total_volume) * dec!(100.0),
                     candle_count,
                 }
             })
@@ -975,13 +983,13 @@ impl PriceLevelMap {
     }
 
     /// Calculate VWAP (Volume Weighted Average Price)
-    pub fn calculate_vwap(&self) -> f64 {
+    pub fn calculate_vwap(&self) -> Decimal {
         let total_volume = self.total_volume();
-        if total_volume <= 0.0 {
-            return 0.0;
+        if total_volume <= Decimal::ZERO {
+            return Decimal::ZERO;
         }
 
-        let weighted_sum: f64 = self.levels
+        let weighted_sum: Decimal = self.levels
             .iter()
             .map(|(price_key, &volume)| price_key.to_price(self.price_increment) * volume)
             .sum();
@@ -990,7 +998,7 @@ impl PriceLevelMap {
     }
 
         /// Calculate value area using the specified method and calculation mode
-    pub fn calculate_value_area(&self, value_area_percentage: f64, calculation_mode: &ValueAreaCalculationMode, poc_calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+    pub fn calculate_value_area(&self, value_area_percentage: Decimal, calculation_mode: &ValueAreaCalculationMode, poc_calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
         // Skip validation to preserve POC-centered algorithm results
         match calculation_mode {
             ValueAreaCalculationMode::Traditional => self.calculate_value_area_traditional(value_area_percentage, poc_calculation_mode),
@@ -1000,7 +1008,7 @@ impl PriceLevelMap {
     
     /// Unified value area expansion based on calculation mode
     /// This method routes to the appropriate expansion algorithm
-    pub fn expand_value_area(&self, value_area_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+    pub fn expand_value_area(&self, value_area_percentage: Decimal, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
         match calculation_mode {
             VolumeProfileCalculationMode::Volume => self.expand_value_area_volume(value_area_percentage),
             VolumeProfileCalculationMode::TPO => self.expand_value_area_tpo(value_area_percentage),
@@ -1012,7 +1020,7 @@ impl PriceLevelMap {
     pub fn validate_value_area_rules(
         &self, 
         value_area: &ValueArea, 
-        target_percentage: f64, 
+        target_percentage: Decimal, 
         calculation_mode: &VolumeProfileCalculationMode
     ) -> ValueAreaValidationResult {
         let mut result = ValueAreaValidationResult::default();
@@ -1047,7 +1055,7 @@ impl PriceLevelMap {
             let total_range = vah_price - val_price;
             let poc_position = poc_price - val_price;
             let centering_ratio = poc_position / total_range;
-(0.2..=0.8).contains(&centering_ratio)
+(dec!(0.2)..=dec!(0.8)).contains(&centering_ratio)
         } else {
             false
         };
@@ -1076,7 +1084,7 @@ impl PriceLevelMap {
         
         // Rule 2: Verify POC is not at VAH or VAL boundaries (POC should be interior)
         // Allow POC to be at boundary only if value area spans just 1-2 price levels
-        let price_tolerance = self.price_increment * 0.1; // Small tolerance for floating point
+        let price_tolerance = self.price_increment * dec!(0.1); // Small tolerance for floating point
         let allow_boundary_poc = price_levels_count <= 2; // Allow boundary POC for very narrow areas
         
         if !allow_boundary_poc {
@@ -1111,8 +1119,8 @@ impl PriceLevelMap {
         }
         
         // Rule 3: Validate volume percentage is within acceptable range  
-        let target_min = target_percentage - 10.0; // Allow 10% deviation below for discrete levels
-        let target_max = target_percentage + 10.0; // Allow 10% deviation above for discrete levels
+        let target_min = target_percentage - dec!(10.0); // Allow 10% deviation below for discrete levels
+        let target_max = target_percentage + dec!(10.0); // Allow 10% deviation above for discrete levels
         if actual_percentage < target_min || actual_percentage > target_max {
             result.is_valid = false;
             result.errors.push(format!(
@@ -1134,7 +1142,7 @@ impl PriceLevelMap {
         if !is_poc_centered {
             result.warnings.push(format!(
                 "POC not well-centered in value area: POC position ratio = {:.2}",
-                if vah_price > val_price { (poc_price - val_price) / (vah_price - val_price) } else { 0.0 }
+                if vah_price > val_price { (poc_price - val_price) / (vah_price - val_price) } else { Decimal::ZERO }
             ));
         }
         
@@ -1147,7 +1155,7 @@ impl PriceLevelMap {
         
         // Check for extreme percentage deviations (warnings, not errors)
         let percentage_deviation = (actual_percentage - target_percentage).abs();
-        if percentage_deviation > 3.0 && percentage_deviation <= 5.0 {
+        if percentage_deviation > dec!(3.0) && percentage_deviation <= dec!(5.0) {
             result.warnings.push(format!(
                 "Volume percentage deviation: {:.2}% (target: {:.2}%)",
                 actual_percentage, target_percentage
@@ -1159,19 +1167,19 @@ impl PriceLevelMap {
     
 
     /// Calculate value area using traditional market profile method (expand from POC)
-    pub fn calculate_value_area_traditional(&self, value_area_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+    pub fn calculate_value_area_traditional(&self, value_area_percentage: Decimal, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
         let (total_metric, target_metric) = match calculation_mode {
             VolumeProfileCalculationMode::Volume => {
                 let total_volume = self.total_volume();
-                (total_volume, total_volume * (value_area_percentage / 100.0))
+                (total_volume, total_volume * (value_area_percentage / dec!(100.0)))
             },
             VolumeProfileCalculationMode::TPO => {
-                let total_count = self.get_total_candle_count() as f64;
-                (total_count, total_count * (value_area_percentage / 100.0))
+                let total_count = Decimal::from(self.get_total_candle_count());
+                (total_count, total_count * (value_area_percentage / dec!(100.0)))
             },
         };
 
-        if self.levels.is_empty() || total_metric <= 0.0 {
+        if self.levels.is_empty() || total_metric <= Decimal::ZERO {
             return ValueArea::default();
         }
 
@@ -1205,8 +1213,8 @@ impl PriceLevelMap {
         
         // Start from POC and expand symmetrically to center it
         let mut included_metric = match calculation_mode {
-            VolumeProfileCalculationMode::Volume => self.levels.get(&poc_key).copied().unwrap_or(0.0),
-            VolumeProfileCalculationMode::TPO => self.candle_counts.get(&poc_key).copied().unwrap_or(0) as f64,
+            VolumeProfileCalculationMode::Volume => self.levels.get(&poc_key).copied().unwrap_or(Decimal::ZERO),
+            VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(&poc_key).copied().unwrap_or(0)),
         };
         let mut low_index = poc_index;
         let mut high_index = poc_index;
@@ -1224,8 +1232,8 @@ impl PriceLevelMap {
             if low_index > 0 {
                 let left_key = all_levels[low_index - 1].0;
                 let left_metric = match calculation_mode {
-                    VolumeProfileCalculationMode::Volume => self.levels.get(left_key).copied().unwrap_or(0.0),
-                    VolumeProfileCalculationMode::TPO => self.candle_counts.get(left_key).copied().unwrap_or(0) as f64,
+                    VolumeProfileCalculationMode::Volume => self.levels.get(left_key).copied().unwrap_or(Decimal::ZERO),
+                    VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(left_key).copied().unwrap_or(0)),
                 };
                 
                 // Add left level
@@ -1244,8 +1252,8 @@ impl PriceLevelMap {
             if high_index < all_levels.len() - 1 {
                 let right_key = all_levels[high_index + 1].0;
                 let right_metric = match calculation_mode {
-                    VolumeProfileCalculationMode::Volume => self.levels.get(right_key).copied().unwrap_or(0.0),
-                    VolumeProfileCalculationMode::TPO => self.candle_counts.get(right_key).copied().unwrap_or(0) as f64,
+                    VolumeProfileCalculationMode::Volume => self.levels.get(right_key).copied().unwrap_or(Decimal::ZERO),
+                    VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(right_key).copied().unwrap_or(0)),
                 };
                 
                 // Add right level
@@ -1288,7 +1296,7 @@ impl PriceLevelMap {
         let actual_volume = self.levels.iter()
             .filter(|(key, _)| **key >= low_key && **key <= high_key)
             .map(|(_, volume)| *volume)
-            .sum::<f64>();
+            .sum::<Decimal>();
         
         let total_volume = self.total_volume();
 
@@ -1296,30 +1304,30 @@ impl PriceLevelMap {
             low: final_low,
             high: final_high,
             volume: actual_volume,
-            volume_percentage: if total_volume > 0.0 { (actual_volume / total_volume) * 100.0 } else { 0.0 },
+            volume_percentage: if total_volume > Decimal::ZERO { (actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
         }
     }
 
     /// Calculate value area using POC-centered greedy selection method 
-    pub fn calculate_value_area_greedy(&self, value_area_percentage: f64, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+    pub fn calculate_value_area_greedy(&self, value_area_percentage: Decimal, calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
         info!("🎯 Starting POC-centered Greedy algorithm with target {}%", value_area_percentage);
         let (total_metric, target_metric) = match calculation_mode {
             VolumeProfileCalculationMode::Volume => {
                 let total_volume = self.total_volume();
-                (total_volume, total_volume * (value_area_percentage / 100.0))
+                (total_volume, total_volume * (value_area_percentage / dec!(100.0)))
             },
             VolumeProfileCalculationMode::TPO => {
-                let total_count = self.get_total_candle_count() as f64;
-                (total_count, total_count * (value_area_percentage / 100.0))
+                let total_count = Decimal::from(self.get_total_candle_count());
+                (total_count, total_count * (value_area_percentage / dec!(100.0)))
             },
         };
 
-        if self.levels.is_empty() || total_metric <= 0.0 {
+        if self.levels.is_empty() || total_metric <= Decimal::ZERO {
             return ValueArea {
-                high: 0.0,
-                low: 0.0,
-                volume_percentage: 0.0,
-                volume: 0.0,
+                high: Decimal::ZERO,
+                low: Decimal::ZERO,
+                volume_percentage: Decimal::ZERO,
+                volume: Decimal::ZERO,
             };
         }
 
@@ -1353,8 +1361,8 @@ impl PriceLevelMap {
         
         // Step 3: Start with POC and expand symmetrically using greedy neighbor selection
         let mut included_metric = match calculation_mode {
-            VolumeProfileCalculationMode::Volume => self.levels.get(&poc_key).copied().unwrap_or(0.0),
-            VolumeProfileCalculationMode::TPO => self.candle_counts.get(&poc_key).copied().unwrap_or(0) as f64,
+            VolumeProfileCalculationMode::Volume => self.levels.get(&poc_key).copied().unwrap_or(Decimal::ZERO),
+            VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(&poc_key).copied().unwrap_or(0)),
         };
         let mut low_index = poc_index;
         let mut high_index = poc_index;
@@ -1374,15 +1382,15 @@ impl PriceLevelMap {
             
             let mut left_candidate = None;
             let mut right_candidate = None;
-            let mut left_metric = 0.0;
-            let mut right_metric = 0.0;
+            let mut left_metric = Decimal::ZERO;
+            let mut right_metric = Decimal::ZERO;
             
             // Get both candidates
             if low_index > 0 {
                 let left_key = all_levels[low_index - 1].0;
                 left_metric = match calculation_mode {
-                    VolumeProfileCalculationMode::Volume => self.levels.get(left_key).copied().unwrap_or(0.0),
-                    VolumeProfileCalculationMode::TPO => self.candle_counts.get(left_key).copied().unwrap_or(0) as f64,
+                    VolumeProfileCalculationMode::Volume => self.levels.get(left_key).copied().unwrap_or(Decimal::ZERO),
+                    VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(left_key).copied().unwrap_or(0)),
                 };
                 left_candidate = Some((*left_key, left_metric, low_index - 1, "left"));
             }
@@ -1390,8 +1398,8 @@ impl PriceLevelMap {
             if high_index < all_levels.len() - 1 {
                 let right_key = all_levels[high_index + 1].0;
                 right_metric = match calculation_mode {
-                    VolumeProfileCalculationMode::Volume => self.levels.get(right_key).copied().unwrap_or(0.0),
-                    VolumeProfileCalculationMode::TPO => self.candle_counts.get(right_key).copied().unwrap_or(0) as f64,
+                    VolumeProfileCalculationMode::Volume => self.levels.get(right_key).copied().unwrap_or(Decimal::ZERO),
+                    VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(right_key).copied().unwrap_or(0)),
                 };
                 right_candidate = Some((*right_key, right_metric, high_index + 1, "right"));
             }
@@ -1410,7 +1418,7 @@ impl PriceLevelMap {
                         }
                     }
                     // If relatively balanced, choose higher volume but with bias toward balance
-                    else if (left_metric - right_metric).abs() < left_metric * 0.3 {
+                    else if (left_metric - right_metric).abs() < left_metric * Decimal::from_str("0.3").unwrap() {
                         // Similar volumes, alternate for balance
                         if left_expansions <= right_expansions {
                             Some(left)
@@ -1470,14 +1478,14 @@ impl PriceLevelMap {
                     price >= final_low && price <= final_high
                 })
                 .map(|(_, volume)| *volume)
-                .sum::<f64>();
+                .sum::<Decimal>();
 
         let total_volume = self.total_volume();
         
         let result = ValueArea {
             high: final_high,
             low: final_low,
-            volume_percentage: if total_volume > 0.0 { (final_actual_volume / total_volume) * 100.0 } else { 0.0 },
+            volume_percentage: if total_volume > Decimal::ZERO { (final_actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
             volume: final_actual_volume,
         };
         
@@ -1485,7 +1493,7 @@ impl PriceLevelMap {
         let poc = poc_key.to_price(self.price_increment);
         let distance_to_high = result.high - poc;
         let distance_to_low = poc - result.low;
-        let balance_ratio = if distance_to_low > 0.0 { distance_to_high / distance_to_low } else { f64::INFINITY };
+        let balance_ratio = if distance_to_low > Decimal::ZERO { distance_to_high / distance_to_low } else { Decimal::MAX };
         
         info!("✅ POC-centered algorithm completed: {} loops, {}% vs target {}%, L/R expansions: {}/{}, balance ratio: {:.2}", 
               loop_count, result.volume_percentage, value_area_percentage, left_expansions, right_expansions, balance_ratio);
@@ -1505,23 +1513,23 @@ impl PriceLevelMap {
     }
 
     /// Get volume at specific price key
-    pub fn get_volume_at_key(&self, key: &PriceKey) -> f64 {
-        self.levels.get(key).copied().unwrap_or(0.0)
+    pub fn get_volume_at_key(&self, key: &PriceKey) -> Decimal {
+        self.levels.get(key).copied().unwrap_or(dec!(0.0))
     }
 
     /// Get min and max prices
-    pub fn get_price_range(&self) -> (f64, f64) {
+    pub fn get_price_range(&self) -> (Decimal, Decimal) {
         if self.levels.is_empty() {
-            return (0.0, 0.0);
+            return (dec!(0.0), dec!(0.0));
         }
 
         let min_price = self.levels.keys().next()
             .map(|key| key.to_price(self.price_increment))
-            .unwrap_or(0.0);
+            .unwrap_or(dec!(0.0));
         
         let max_price = self.levels.keys().next_back()
             .map(|key| key.to_price(self.price_increment))
-            .unwrap_or(0.0);
+            .unwrap_or(dec!(0.0));
 
         (min_price, max_price)
     }
@@ -1534,36 +1542,36 @@ pub struct PriceKey(i64);
 
 impl PriceKey {
     /// Create price key from price and increment using precision-aware mapping
-    pub fn from_price(price: f64, price_increment: f64) -> Self {
+    pub fn from_price(price: Decimal, price_increment: Decimal) -> Self {
         let precision_manager = PricePrecisionManager::default();
         let key = precision_manager.price_to_key(price, price_increment)
             .unwrap_or_else(|_| {
                 // Fallback to simple rounding only if precision manager fails
                 eprintln!("Warning: Precision manager failed, using simple rounding for price {} with increment {}", price, price_increment);
-                (price / price_increment).round() as i64
+                (price / price_increment).round().to_i64().unwrap_or(0)
             });
         Self(key)
     }
 
     /// Create price key from price and increment using the provided precision manager
-    pub fn from_price_with_manager(price: f64, price_increment: f64, precision_manager: &PricePrecisionManager) -> Self {
+    pub fn from_price_with_manager(price: Decimal, price_increment: Decimal, precision_manager: &PricePrecisionManager) -> Self {
         let key = precision_manager.price_to_key(price, price_increment)
             .unwrap_or_else(|_| {
                 // Fallback to simple rounding only if precision manager fails
                 eprintln!("Warning: Precision manager failed, using simple rounding for price {} with increment {}", price, price_increment);
-                (price / price_increment).round() as i64
+                (price / price_increment).round().to_i64().unwrap_or(0)
             });
         Self(key)
     }
 
     /// Convert price key back to price with precision validation
-    pub fn to_price(self, price_increment: f64) -> f64 {
+    pub fn to_price(self, price_increment: Decimal) -> Decimal {
         let precision_manager = PricePrecisionManager::default();
         precision_manager.key_to_price(self.0, price_increment)
             .unwrap_or_else(|_| {
                 // Fallback to simple multiplication only if precision manager fails
                 eprintln!("Warning: Precision manager failed, using simple multiplication for key {} with increment {}", self.0, price_increment);
-                self.0 as f64 * price_increment
+                Decimal::from(self.0) * price_increment
             })
     }
 
@@ -1578,7 +1586,7 @@ impl PriceKey {
     }
 
     /// Validate precision for this price key
-    pub fn validate_precision(&self, price_increment: f64) -> bool {
+    pub fn validate_precision(&self, price_increment: Decimal) -> bool {
         let precision_manager = PricePrecisionManager::default();
         let reconstructed = precision_manager.key_to_price(self.0, price_increment);
         
@@ -2611,24 +2619,24 @@ pub struct VolumeProfileDebugMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecisionMetrics {
     /// Price range span being processed
-    pub price_range_span: f64,
+    pub price_range_span: Decimal,
     /// Price increment used for calculations
-    pub price_increment_used: f64,
+    pub price_increment_used: Decimal,
     /// Total number of price keys generated
     pub total_price_keys: usize,
     /// Number of precision errors detected during conversion
     pub precision_errors_detected: u32,
     /// Volume conservation check (should be close to 1.0)
-    pub volume_conservation_check: f64,
+    pub volume_conservation_check: Decimal,
 }
 
 /// Performance metrics for calculation timing and resource usage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalculationPerformance {
     /// Time spent calculating value area in milliseconds
-    pub value_area_calculation_time_ms: f64,
+    pub value_area_calculation_time_ms: Decimal,
     /// Time spent on price distribution calculation in milliseconds
-    pub price_distribution_time_ms: f64,
+    pub price_distribution_time_ms: Decimal,
     /// Number of cache operations performed
     pub cache_operations_count: u32,
     /// Estimated memory usage in bytes
@@ -2667,11 +2675,11 @@ impl Default for VolumeProfileDebugMetadata {
 impl Default for PrecisionMetrics {
     fn default() -> Self {
         Self {
-            price_range_span: 0.0,
-            price_increment_used: 0.0,
+            price_range_span: dec!(0),
+            price_increment_used: dec!(0),
             total_price_keys: 0,
             precision_errors_detected: 0,
-            volume_conservation_check: 1.0,
+            volume_conservation_check: dec!(1),
         }
     }
 }
@@ -2679,8 +2687,8 @@ impl Default for PrecisionMetrics {
 impl Default for CalculationPerformance {
     fn default() -> Self {
         Self {
-            value_area_calculation_time_ms: 0.0,
-            price_distribution_time_ms: 0.0,
+            value_area_calculation_time_ms: dec!(0),
+            price_distribution_time_ms: dec!(0),
             cache_operations_count: 0,
             memory_usage_bytes: 0,
             candles_processed_count: 0,

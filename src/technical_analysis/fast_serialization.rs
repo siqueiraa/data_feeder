@@ -4,6 +4,7 @@
 /// bypassing serde overhead for maximum performance in hot paths.
 use crate::technical_analysis::structs::IndicatorOutput;
 use std::io::Write;
+use std::convert::TryInto;
 
 /// Compile-time validation to ensure all IndicatorOutput fields have corresponding serialization
 /// 
@@ -380,38 +381,38 @@ impl SerializationBuffer {
             
             // Total volume
             self.json_buffer.extend_from_slice(b"\"total_volume\":");
-            self.write_f64(vp.total_volume);
+            self.write_f64(vp.total_volume.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",");
             
             // VWAP
             self.json_buffer.extend_from_slice(b"\"vwap\":");
-            self.write_f64(vp.vwap);
+            self.write_f64(vp.vwap.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",");
             
             // POC (Point of Control)
             self.json_buffer.extend_from_slice(b"\"poc\":");
-            self.write_f64(vp.poc);
+            self.write_f64(vp.poc.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",");
             
             // Value area
             self.json_buffer.extend_from_slice(b"\"value_area\":{");
             self.json_buffer.extend_from_slice(b"\"high\":");
-            self.write_f64(vp.value_area.high);
+            self.write_f64(vp.value_area.high.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",\"low\":");
-            self.write_f64(vp.value_area.low);
+            self.write_f64(vp.value_area.low.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",\"volume_percentage\":");
-            self.write_f64(vp.value_area.volume_percentage);
+            self.write_f64(vp.value_area.volume_percentage.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",\"volume\":");
-            self.write_f64(vp.value_area.volume);
+            self.write_f64(vp.value_area.volume.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b"},");
             
             // Additional metadata
             self.json_buffer.extend_from_slice(b"\"price_increment\":");
-            self.write_f64(vp.price_increment);
+            self.write_f64(vp.price_increment.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",\"min_price\":");
-            self.write_f64(vp.min_price);
+            self.write_f64(vp.min_price.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",\"max_price\":");
-            self.write_f64(vp.max_price);
+            self.write_f64(vp.max_price.try_into().unwrap_or(0.0));
             self.json_buffer.extend_from_slice(b",\"candle_count\":");
             self.write_u32(vp.candle_count);
             self.json_buffer.extend_from_slice(b",\"last_updated\":");

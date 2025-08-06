@@ -1,6 +1,9 @@
 use chrono::{NaiveDate, Datelike, Timelike};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
+use rust_decimal_macros::dec;
 
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
 use super::structs::{
@@ -24,19 +27,19 @@ pub struct DailyVolumeProfile {
     /// Price level map for efficient volume tracking
     price_levels: PriceLevelMap,
     /// Total volume for the day
-    pub total_volume: f64,
+    pub total_volume: Decimal,
     /// Minimum price seen
-    min_price: f64,
+    min_price: Decimal,
     /// Maximum price seen
-    max_price: f64,
+    max_price: Decimal,
     /// Number of 1-minute candles processed
     pub candle_count: u32,
     /// Last update timestamp
     last_updated: TimestampMS,
     /// Cached VWAP (recalculated when needed)
-    cached_vwap: Option<f64>,
+    cached_vwap: Option<Decimal>,
     /// Cached POC (recalculated when needed)
-    cached_poc: Option<f64>,
+    cached_poc: Option<Decimal>,
     /// Cached value area (recalculated when needed)
     cached_value_area: Option<ValueArea>,
     /// Flag indicating if caches need recalculation
@@ -59,9 +62,9 @@ impl DailyVolumeProfile {
             date,
             config,
             price_levels: PriceLevelMap::new(price_increment),
-            total_volume: 0.0,
-            min_price: f64::MAX,
-            max_price: f64::MIN,
+            total_volume: Decimal::ZERO,
+            min_price: Decimal::MAX,
+            max_price: Decimal::MIN,
             candle_count: 0,
             last_updated: 0,
             cached_vwap: None,
@@ -100,7 +103,7 @@ impl DailyVolumeProfile {
         self.distribute_volume_across_range(candle);
         
         // Update statistics
-        self.total_volume += candle.volume;
+        self.total_volume += Decimal::try_from(candle.volume).unwrap_or(Decimal::ZERO);
         self.candle_count += 1;
         self.last_updated = candle.close_time;
         
@@ -133,9 +136,9 @@ impl DailyVolumeProfile {
     pub fn reset(&mut self) {
         let price_increment = Self::calculate_price_increment(&self.config, None);
         self.price_levels = PriceLevelMap::new(price_increment);
-        self.total_volume = 0.0;
-        self.min_price = f64::MAX;
-        self.max_price = f64::MIN;
+        self.total_volume = Decimal::ZERO;
+        self.min_price = Decimal::MAX;
+        self.max_price = Decimal::MIN;
         self.candle_count = 0;
         self.last_updated = 0;
         self.invalidate_caches();
@@ -155,12 +158,12 @@ impl DailyVolumeProfile {
             date: self.date.format("%Y-%m-%d").to_string(),
             price_levels: self.price_levels.to_price_levels(),
             total_volume: self.total_volume,
-            vwap: self.cached_vwap.unwrap_or(0.0),
-            poc: self.cached_poc.unwrap_or(0.0),
+            vwap: self.cached_vwap.unwrap_or(Decimal::ZERO),
+            poc: self.cached_poc.unwrap_or(Decimal::ZERO),
             value_area: self.cached_value_area.clone().unwrap_or_default(),
             price_increment: self.price_levels.price_increment,
-            min_price: if self.min_price == f64::MAX { 0.0 } else { self.min_price },
-            max_price: if self.max_price == f64::MIN { 0.0 } else { self.max_price },
+            min_price: if self.min_price == Decimal::MAX { Decimal::ZERO } else { self.min_price },
+            max_price: if self.max_price == Decimal::MIN { Decimal::ZERO } else { self.max_price },
             candle_count: self.candle_count,
             last_updated: self.last_updated,
         }
@@ -217,8 +220,8 @@ impl DailyVolumeProfile {
 
     /// Update min/max price range
     fn update_price_range(&mut self, candle: &FuturesOHLCVCandle) {
-        self.min_price = self.min_price.min(candle.low);
-        self.max_price = self.max_price.max(candle.high);
+        self.min_price = self.min_price.min(Decimal::try_from(candle.low).unwrap_or(Decimal::ZERO));
+        self.max_price = self.max_price.max(Decimal::try_from(candle.high).unwrap_or(Decimal::ZERO));
     }
 
     /// Distribute candle volume using the configured distribution method
@@ -233,22 +236,23 @@ impl DailyVolumeProfile {
 
         // Use the configured volume distribution method
         self.price_levels.distribute_candle_volume(
-            candle.open,
-            candle.high,
-            candle.low,
-            candle.close,
-            volume,
+            Decimal::try_from(candle.open).unwrap_or(Decimal::ZERO),
+            Decimal::try_from(candle.high).unwrap_or(Decimal::ZERO),
+            Decimal::try_from(candle.low).unwrap_or(Decimal::ZERO),
+            Decimal::try_from(candle.close).unwrap_or(Decimal::ZERO),
+            Decimal::try_from(volume).unwrap_or(Decimal::ZERO),
             &self.config.volume_distribution_mode
         );
         
         // Validate volume conservation
         let new_total = self.price_levels.total_volume();
-        let expected_total = original_total + volume;
+        let expected_total = original_total + Decimal::try_from(volume).unwrap_or(Decimal::ZERO);
         
-        // Allow reasonable floating point tolerance for financial data
+        // Allow reasonable tolerance for financial data
         // Use relative tolerance based on the magnitude of values being compared
-        let relative_tolerance = expected_total.abs() * f64::EPSILON * 1000.0;
-        let absolute_tolerance = 1e-10; // Minimum absolute tolerance for very small differences
+        let epsilon_factor = dec!(0.000000000000222); // Approximate f64::EPSILON * 1000 as Decimal
+        let relative_tolerance = expected_total.abs() * epsilon_factor;
+        let absolute_tolerance = dec!(0.0000000001); // Minimum absolute tolerance for very small differences
         let tolerance = relative_tolerance.max(absolute_tolerance);
         let difference = (new_total - expected_total).abs();
         
@@ -265,13 +269,13 @@ impl DailyVolumeProfile {
     }
 
     /// Calculate appropriate price increment based on configuration and market data
-    pub fn calculate_price_increment(config: &ResolvedAssetConfig, price_range: Option<f64>) -> f64 {
+    pub fn calculate_price_increment(config: &ResolvedAssetConfig, price_range: Option<Decimal>) -> Decimal {
         match config.price_increment_mode {
             PriceIncrementMode::Fixed => config.fixed_price_increment,
             PriceIncrementMode::Adaptive => {
                 if let Some(range) = price_range {
                     // Adaptive increment based on price range and target levels
-                    let target_levels = config.target_price_levels as f64;
+                    let target_levels = Decimal::from(config.target_price_levels);
                     let calculated_increment = range / target_levels;
                     
                     // Clamp to configured min/max bounds
@@ -280,7 +284,8 @@ impl DailyVolumeProfile {
                         .min(config.max_price_increment)
                 } else {
                     // Default to middle of range if no price data available
-                    (config.min_price_increment + config.max_price_increment) / 2.0
+                    use rust_decimal_macros::dec;
+                    (config.min_price_increment + config.max_price_increment) / dec!(2.0)
                 }
             }
         }
@@ -292,9 +297,9 @@ impl DailyVolumeProfile {
         let start_time = SystemTime::now();
         let calculation_timestamp = start_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
         
-        if self.total_volume <= 0.0 {
-            self.cached_vwap = Some(0.0);
-            self.cached_poc = Some(0.0);
+        if self.total_volume <= Decimal::ZERO {
+            self.cached_vwap = Some(Decimal::ZERO);
+            self.cached_poc = Some(Decimal::ZERO);
             self.cached_value_area = Some(ValueArea::default());
             
             // Create debug metadata for empty profile
@@ -302,15 +307,15 @@ impl DailyVolumeProfile {
                 calculation_timestamp,
                 algorithm_version: "1.4.0".to_string(),
                 precision_metrics: PrecisionMetrics {
-                    price_range_span: 0.0,
+                    price_range_span: dec!(0),
                     price_increment_used: self.price_levels.price_increment,
                     total_price_keys: 0,
                     precision_errors_detected: 0,
-                    volume_conservation_check: 1.0,
+                    volume_conservation_check: dec!(1),
                 },
                 performance_metrics: CalculationPerformance {
-                    value_area_calculation_time_ms: 0.0,
-                    price_distribution_time_ms: 0.0,
+                    value_area_calculation_time_ms: dec!(0),
+                    price_distribution_time_ms: dec!(0),
                     cache_operations_count: 1,
                     memory_usage_bytes: self.estimate_memory_usage(),
                     candles_processed_count: self.candle_count,
@@ -350,20 +355,20 @@ impl DailyVolumeProfile {
             let va_duration = va_start.elapsed().unwrap().as_secs_f64() * 1000.0;
             
             // Collect precision metrics
-            let price_range = if self.max_price > self.min_price { self.max_price - self.min_price } else { 0.0 };
+            let price_range = if self.max_price > self.min_price { self.max_price - self.min_price } else { dec!(0) };
             let total_price_levels = self.price_levels.levels.len();
             
             // Detect edge cases
             let value_area = self.cached_value_area.as_ref().unwrap();
-            let degenerate_va = (value_area.high - value_area.low).abs() < f64::EPSILON;
+            let degenerate_va = (value_area.high - value_area.low).abs() < dec!(0.000000000000222);
             
             // Check for unusual volume concentration (>80% in single price level)
-            let max_volume_at_level = self.price_levels.levels.values().fold(0.0f64, |max, &vol| max.max(vol));
-            let unusual_concentration = max_volume_at_level / self.total_volume > 0.8;
+            let max_volume_at_level = self.price_levels.levels.values().fold(dec!(0), |max, &vol| max.max(vol));
+            let unusual_concentration = max_volume_at_level / self.total_volume > dec!(0.8);
             
             debug!("Value area calculation: range=[{:.6}, {:.6}], volume={:.2} ({:.1}%), POC={:.6}", 
                    value_area.low, value_area.high, value_area.volume, value_area.volume_percentage,
-                   self.cached_poc.unwrap_or(0.0));
+                   self.cached_poc.unwrap_or(dec!(0.0)));
             
             if degenerate_va {
                 warn!("Degenerate value area detected: VAH={:.6}, VAL={:.6}", value_area.high, value_area.low);
@@ -371,7 +376,7 @@ impl DailyVolumeProfile {
             
             if unusual_concentration {
                 debug!("Unusual volume concentration detected: {:.1}% at single price level", 
-                       (max_volume_at_level / self.total_volume) * 100.0);
+                       (max_volume_at_level / self.total_volume) * dec!(100.0));
             }
             
             // Create comprehensive debug metadata
@@ -386,8 +391,8 @@ impl DailyVolumeProfile {
                     volume_conservation_check: self.total_volume / self.price_levels.total_volume(), // Should be close to 1.0
                 },
                 performance_metrics: CalculationPerformance {
-                    value_area_calculation_time_ms: va_duration,
-                    price_distribution_time_ms: 0.0, // Would be tracked during candle processing
+                    value_area_calculation_time_ms: Decimal::from_f64(va_duration).unwrap_or(dec!(0.0)),
+                    price_distribution_time_ms: dec!(0.0), // Would be tracked during candle processing
                     cache_operations_count: 3, // VWAP, POC, Value Area calculations
                     memory_usage_bytes: self.estimate_memory_usage(),
                     candles_processed_count: self.candle_count,
@@ -406,10 +411,10 @@ impl DailyVolumeProfile {
         self.cache_coordinator.reset_after_recalculation();
         
         debug!("Recalculated volume profile caches: VWAP={:.6}, POC={:.6}, VA=[{:.6}, {:.6}]", 
-               self.cached_vwap.unwrap_or(0.0), 
-               self.cached_poc.unwrap_or(0.0),
-               self.cached_value_area.as_ref().map(|va| va.low).unwrap_or(0.0),
-               self.cached_value_area.as_ref().map(|va| va.high).unwrap_or(0.0));
+               self.cached_vwap.unwrap_or(dec!(0.0)), 
+               self.cached_poc.unwrap_or(dec!(0.0)),
+               self.cached_value_area.as_ref().map(|va| va.low).unwrap_or(dec!(0.0)),
+               self.cached_value_area.as_ref().map(|va| va.high).unwrap_or(dec!(0.0)));
     }
 
     /// Invalidate all cached calculations
@@ -442,8 +447,8 @@ pub struct CacheCoordinator {
     /// Cache miss count
     cache_misses: u64,
     /// Timing metrics for cache operations
-    last_invalidation_time_ms: f64,
-    last_recalculation_time_ms: f64,
+    last_invalidation_time_ms: Decimal,
+    last_recalculation_time_ms: Decimal,
 }
 
 impl CacheCoordinator {
@@ -454,8 +459,8 @@ impl CacheCoordinator {
             state: CacheState::Valid,
             cache_hits: 0,
             cache_misses: 0,
-            last_invalidation_time_ms: 0.0,
-            last_recalculation_time_ms: 0.0,
+            last_invalidation_time_ms: dec!(0),
+            last_recalculation_time_ms: dec!(0),
         }
     }
     
@@ -463,7 +468,7 @@ impl CacheCoordinator {
     pub fn invalidate_before_update(&mut self) -> CacheState {
         use std::time::{SystemTime, UNIX_EPOCH};
         let start_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        self.last_invalidation_time_ms = start_time.as_secs_f64() * 1000.0;
+        self.last_invalidation_time_ms = Decimal::from_f64_retain(start_time.as_secs_f64() * 1000.0).unwrap_or(dec!(0));
         
         self.invalidated_before_update = true;
         self.state = CacheState::InvalidatedBeforeUpdate;
@@ -491,7 +496,7 @@ impl CacheCoordinator {
     pub fn reset_after_recalculation(&mut self) {
         use std::time::{SystemTime, UNIX_EPOCH};
         let end_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        self.last_recalculation_time_ms = end_time.as_secs_f64() * 1000.0;
+        self.last_recalculation_time_ms = Decimal::from_f64_retain(end_time.as_secs_f64() * 1000.0).unwrap_or(dec!(0));
         
         self.invalidated_before_update = false;
         self.state = CacheState::Valid;
@@ -508,12 +513,12 @@ impl CacheCoordinator {
     }
     
     /// Get cache hit rate
-    pub fn cache_hit_rate(&self) -> f64 {
+    pub fn cache_hit_rate(&self) -> Decimal {
         let total = self.cache_hits + self.cache_misses;
         if total == 0 {
-            0.0
+            dec!(0)
         } else {
-            (self.cache_hits as f64) / (total as f64)
+            Decimal::from(self.cache_hits) / Decimal::from(total)
         }
     }
     
@@ -543,11 +548,11 @@ pub struct CacheMetrics {
     /// Number of cache misses
     pub misses: u64,
     /// Cache hit rate as percentage
-    pub hit_rate: f64,
+    pub hit_rate: Decimal,
     /// Last invalidation timestamp in milliseconds
-    pub last_invalidation_time_ms: f64,
+    pub last_invalidation_time_ms: Decimal,
     /// Last recalculation timestamp in milliseconds
-    pub last_recalculation_time_ms: f64,
+    pub last_recalculation_time_ms: Decimal,
 }
 
 impl DailyVolumeProfile {
@@ -559,8 +564,8 @@ impl DailyVolumeProfile {
             candle_count: self.candle_count,
             total_volume: self.total_volume,
             price_levels_count: self.price_levels.levels.len(),
-            min_price: if self.min_price == f64::MAX { 0.0 } else { self.min_price },
-            max_price: if self.max_price == f64::MIN { 0.0 } else { self.max_price },
+            min_price: if self.min_price == Decimal::MAX { dec!(0.0) } else { self.min_price },
+            max_price: if self.max_price == Decimal::MIN { dec!(0.0) } else { self.max_price },
             price_increment: self.price_levels.price_increment,
             last_updated: self.last_updated,
         }
@@ -590,7 +595,7 @@ impl DailyVolumeProfile {
 
     /// Check if profile has any data
     pub fn is_empty(&self) -> bool {
-        self.candle_count == 0 || self.total_volume <= 0.0
+        self.candle_count == 0 || self.total_volume <= dec!(0.0)
     }
 
     /// Get memory usage estimation
@@ -623,10 +628,10 @@ impl DailyVolumeProfile {
 impl Default for ValueArea {
     fn default() -> Self {
         Self {
-            high: 0.0,
-            low: 0.0,
-            volume_percentage: 0.0,
-            volume: 0.0,
+            high: dec!(0.0),
+            low: dec!(0.0),
+            volume_percentage: dec!(0.0),
+            volume: dec!(0.0),
         }
     }
 }
@@ -637,11 +642,11 @@ pub struct VolumeProfileStatistics {
     pub symbol: String,
     pub date: NaiveDate,
     pub candle_count: u32,
-    pub total_volume: f64,
+    pub total_volume: Decimal,
     pub price_levels_count: usize,
-    pub min_price: f64,
-    pub max_price: f64,
-    pub price_increment: f64,
+    pub min_price: Decimal,
+    pub max_price: Decimal,
+    pub price_increment: Decimal,
     pub last_updated: TimestampMS,
 }
 

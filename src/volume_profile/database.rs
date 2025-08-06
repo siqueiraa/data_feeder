@@ -1,6 +1,9 @@
 use chrono::NaiveDate;
 use tokio_postgres::{Client, Error as PostgresError};
 use tracing::{debug, error, info, warn};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use std::convert::TryFrom;
 
 use super::structs::{VolumeProfileData, ValueArea, PriceLevelData};
 use crate::historical::structs::TimestampMS;
@@ -130,23 +133,35 @@ impl VolumeProfileDatabase {
             self.table_name
         );
 
-        // Build parameter list - use f64 directly for PostgreSQL DOUBLE PRECISION compatibility
+        // Build parameter list - convert Decimal to f64 for PostgreSQL DOUBLE PRECISION compatibility
         let candle_count_param = profile_data.candle_count as i32;
         let last_updated_param = profile_data.last_updated;
+        
+        // Convert Decimal values to f64 for PostgreSQL DOUBLE PRECISION columns
+        let total_volume_f64 = profile_data.total_volume.to_f64().unwrap_or(0.0);
+        let vwap_f64 = profile_data.vwap.to_f64().unwrap_or(0.0);
+        let poc_f64 = profile_data.poc.to_f64().unwrap_or(0.0);
+        let value_area_high_f64 = profile_data.value_area.high.to_f64().unwrap_or(0.0);
+        let value_area_low_f64 = profile_data.value_area.low.to_f64().unwrap_or(0.0);
+        let value_area_volume_f64 = profile_data.value_area.volume.to_f64().unwrap_or(0.0);
+        let value_area_percentage_f64 = profile_data.value_area.volume_percentage.to_f64().unwrap_or(0.0);
+        let price_increment_f64 = profile_data.price_increment.to_f64().unwrap_or(0.0);
+        let min_price_f64 = profile_data.min_price.to_f64().unwrap_or(0.0);
+        let max_price_f64 = profile_data.max_price.to_f64().unwrap_or(0.0);
         
         let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
             &symbol,
             &date,
-            &profile_data.total_volume,
-            &profile_data.vwap,
-            &profile_data.poc,
-            &profile_data.value_area.high,
-            &profile_data.value_area.low,
-            &profile_data.value_area.volume,
-            &profile_data.value_area.volume_percentage,
-            &profile_data.price_increment,
-            &profile_data.min_price,
-            &profile_data.max_price,
+            &total_volume_f64,
+            &vwap_f64,
+            &poc_f64,
+            &value_area_high_f64,
+            &value_area_low_f64,
+            &value_area_volume_f64,
+            &value_area_percentage_f64,
+            &price_increment_f64,
+            &min_price_f64,
+            &max_price_f64,
             &candle_count_param,
             &last_updated_param,
         ];
@@ -279,34 +294,45 @@ impl VolumeProfileDatabase {
             ));
         }
 
-        // Build parameter list - use f64 directly for PostgreSQL DECIMAL compatibility
+        // Build parameter list - convert Decimal to f64 for PostgreSQL DOUBLE PRECISION compatibility
         let candle_count_param = profile_data.candle_count as i32;
         let last_updated_param = profile_data.last_updated;
         
-        // Use f64 directly - PostgreSQL can handle f64 to DECIMAL conversion
+        // Convert Decimal values to f64 for PostgreSQL DOUBLE PRECISION columns
+        let total_volume_f64 = profile_data.total_volume.to_f64().unwrap_or(0.0);
+        let vwap_f64 = profile_data.vwap.to_f64().unwrap_or(0.0);
+        let poc_f64 = profile_data.poc.to_f64().unwrap_or(0.0);
+        let value_area_high_f64 = profile_data.value_area.high.to_f64().unwrap_or(0.0);
+        let value_area_low_f64 = profile_data.value_area.low.to_f64().unwrap_or(0.0);
+        let value_area_volume_f64 = profile_data.value_area.volume.to_f64().unwrap_or(0.0);
+        let value_area_percentage_f64 = profile_data.value_area.volume_percentage.to_f64().unwrap_or(0.0);
+        let price_increment_f64 = profile_data.price_increment.to_f64().unwrap_or(0.0);
+        let min_price_f64 = profile_data.min_price.to_f64().unwrap_or(0.0);
+        let max_price_f64 = profile_data.max_price.to_f64().unwrap_or(0.0);
+        
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
             &symbol,
             &date,
-            &profile_data.total_volume,
-            &profile_data.vwap,
-            &profile_data.poc,
-            &profile_data.value_area.high,
-            &profile_data.value_area.low,
-            &profile_data.value_area.volume,
-            &profile_data.value_area.volume_percentage,
-            &profile_data.price_increment,
-            &profile_data.min_price,
-            &profile_data.max_price,
+            &total_volume_f64,
+            &vwap_f64,
+            &poc_f64,
+            &value_area_high_f64,
+            &value_area_low_f64,
+            &value_area_volume_f64,
+            &value_area_percentage_f64,
+            &price_increment_f64,
+            &min_price_f64,
+            &max_price_f64,
             &candle_count_param,
             &last_updated_param,
         ];
 
-        // Add price level parameters - use f64 directly
+        // Add price level parameters - convert Decimal to f64
         let mut price_params = Vec::new();
         let mut volume_params = Vec::new();
         for level in &profile_data.price_levels[..level_count] {
-            price_params.push(level.price);
-            volume_params.push(level.volume);
+            price_params.push(level.price.to_f64().unwrap_or(0.0));
+            volume_params.push(level.volume.to_f64().unwrap_or(0.0));
         }
         
         for i in 0..level_count {
@@ -370,9 +396,9 @@ impl VolumeProfileDatabase {
                         if let (Some(price), Some(volume)) = (price, volume) {
                             if volume > 0.0 { // Only include non-zero volume levels
                                 price_levels.push(PriceLevelData {
-                                    price,
-                                    volume,
-                                    percentage: 0.0, // Calculate if needed
+                                    price: Decimal::try_from(price).unwrap_or(Decimal::ZERO),
+                                    volume: Decimal::try_from(volume).unwrap_or(Decimal::ZERO),
+                                    percentage: Decimal::ZERO, // Calculate if needed
                                     candle_count: 0, // Historical data doesn't have candle count
                                 });
                             }
@@ -387,18 +413,18 @@ impl VolumeProfileDatabase {
                 let profile_data = VolumeProfileData {
                     date: date.format("%Y-%m-%d").to_string(),
                     price_levels,
-                    total_volume,
-                    vwap,
-                    poc,
+                    total_volume: Decimal::try_from(total_volume).unwrap_or(Decimal::ZERO),
+                    vwap: Decimal::try_from(vwap).unwrap_or(Decimal::ZERO),
+                    poc: Decimal::try_from(poc).unwrap_or(Decimal::ZERO),
                     value_area: ValueArea {
-                        high: value_area_high,
-                        low: value_area_low,
-                        volume_percentage: value_area_percentage,
-                        volume: value_area_volume,
+                        high: Decimal::try_from(value_area_high).unwrap_or(Decimal::ZERO),
+                        low: Decimal::try_from(value_area_low).unwrap_or(Decimal::ZERO),
+                        volume_percentage: Decimal::try_from(value_area_percentage).unwrap_or(Decimal::ZERO),
+                        volume: Decimal::try_from(value_area_volume).unwrap_or(Decimal::ZERO),
                     },
-                    price_increment,
-                    min_price,
-                    max_price,
+                    price_increment: Decimal::try_from(price_increment).unwrap_or(Decimal::ZERO),
+                    min_price: Decimal::try_from(min_price).unwrap_or(Decimal::ZERO),
+                    max_price: Decimal::try_from(max_price).unwrap_or(Decimal::ZERO),
                     candle_count: candle_count as u32,
                     last_updated: last_updated as TimestampMS,
                 };
@@ -468,9 +494,9 @@ impl VolumeProfileDatabase {
                     if let (Some(price), Some(volume)) = (price, volume) {
                         if volume > 0.0 { // Only include non-zero volume levels
                             price_levels.push(PriceLevelData {
-                                price,
-                                volume,
-                                percentage: 0.0, // Calculate if needed
+                                price: Decimal::try_from(price).unwrap_or(Decimal::ZERO),
+                                volume: Decimal::try_from(volume).unwrap_or(Decimal::ZERO),
+                                percentage: Decimal::ZERO, // Calculate if needed
                                 candle_count: 0, // Historical data doesn't have candle count
                             });
                         }
@@ -485,18 +511,18 @@ impl VolumeProfileDatabase {
             let profile_data = VolumeProfileData {
                 date: date.format("%Y-%m-%d").to_string(),
                 price_levels,
-                total_volume,
-                vwap,
-                poc,
+                total_volume: Decimal::try_from(total_volume).unwrap_or(Decimal::ZERO),
+                vwap: Decimal::try_from(vwap).unwrap_or(Decimal::ZERO),
+                poc: Decimal::try_from(poc).unwrap_or(Decimal::ZERO),
                 value_area: ValueArea {
-                    high: value_area_high,
-                    low: value_area_low,
-                    volume_percentage: value_area_percentage,
-                    volume: value_area_volume,
+                    high: Decimal::try_from(value_area_high).unwrap_or(Decimal::ZERO),
+                    low: Decimal::try_from(value_area_low).unwrap_or(Decimal::ZERO),
+                    volume_percentage: Decimal::try_from(value_area_percentage).unwrap_or(Decimal::ZERO),
+                    volume: Decimal::try_from(value_area_volume).unwrap_or(Decimal::ZERO),
                 },
-                price_increment,
-                min_price,
-                max_price,
+                price_increment: Decimal::try_from(price_increment).unwrap_or(Decimal::ZERO),
+                min_price: Decimal::try_from(min_price).unwrap_or(Decimal::ZERO),
+                max_price: Decimal::try_from(max_price).unwrap_or(Decimal::ZERO),
                 candle_count: candle_count as u32,
                 last_updated: last_updated as TimestampMS,
             };
