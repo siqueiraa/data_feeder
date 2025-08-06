@@ -52,17 +52,22 @@ impl HistoricalActor {
                 .with_io_context("Failed to create CSV directory")?;
         }
 
-        // Initialize queue system for non-blocking operations
+        // Initialize queue system for non-blocking operations with CPU-aware worker allocation
+        let cpu_count = num_cpus::get();
+        let task_workers = (cpu_count * 2).max(2).min(8); // 2x CPU cores, min 2, max 8
+        let io_workers = cpu_count.max(2).min(4); // 1x CPU cores, min 2, max 4
+        let db_workers = (cpu_count / 2).max(1).min(2); // 0.5x CPU cores, min 1, max 2
+        
         let task_config = QueueConfig {
-            max_workers: 8,
+            max_workers: task_workers,
             ..QueueConfig::default()
         };
         let io_config = QueueConfig {
-            max_workers: 4,
+            max_workers: io_workers,
             ..QueueConfig::default()
         };
         let db_config = QueueConfig {
-            max_workers: 2,
+            max_workers: db_workers,
             ..QueueConfig::default()
         };
         
@@ -82,7 +87,8 @@ impl HistoricalActor {
 
 
         info!("HistoricalActor initialized - LMDB operations will be delegated to LmdbActor");
-        info!("🚀 Queue system initialized: 8 CPU workers, 4 I/O workers, 2 DB workers, 1200 req/min rate limit");
+        info!("🚀 Queue system initialized: {} CPU workers, {} I/O workers, {} DB workers, 1200 req/min rate limit", 
+              task_workers, io_workers, db_workers);
 
         Ok(Self { 
             csv_path: csv_path.to_path_buf(),

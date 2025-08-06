@@ -216,13 +216,14 @@ impl WebSocketActor {
                 .map_err(|e| WebSocketError::Unknown(format!("Failed to create base path: {}", e)))?;
         }
 
-        // Initialize queue system for non-blocking operations
+        // Initialize queue system for non-blocking operations with CPU-aware worker allocation
+        let cpu_count = num_cpus::get();
         let task_config = QueueConfig {
-            max_workers: 4,
+            max_workers: cpu_count.max(2).min(4), // 1x CPU cores, min 2, max 4
             ..QueueConfig::default()
         };
         let db_config = QueueConfig {
-            max_workers: 2,
+            max_workers: (cpu_count / 2).max(1).min(2), // 0.5x CPU cores, min 1, max 2
             batch_size: 10, // Batch candles for better performance
             batch_timeout: Duration::from_millis(100),
             ..QueueConfig::default()
