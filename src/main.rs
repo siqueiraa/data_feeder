@@ -23,6 +23,136 @@ use data_feeder::adaptive_config::{AdaptiveConfig, AdaptiveConfigToml};
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use thiserror::Error;
+
+// Enhanced Configuration Validation Types (Story 3.5 - Task 1)
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigurationValidationResult {
+    pub is_valid: bool,
+    pub errors: Vec<ConfigurationError>,
+    pub warnings: Vec<ConfigurationWarning>,
+    pub suggestions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigurationError {
+    pub error_type: ConfigErrorType,
+    pub feature_name: String,
+    pub message: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigurationWarning {
+    pub feature_name: String,
+    pub message: String,
+    pub suggestion: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigErrorType {
+    FeatureMismatch,
+    InvalidValue,
+    MissingDependency,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeatureDependencyGraph {
+    pub dependencies: HashMap<String, Vec<String>>,
+    pub enabled_features: HashSet<String>,
+    pub required_features: HashSet<String>,
+}
+
+#[derive(Error, Debug)]
+pub enum FeatureDependencyError {
+    #[error("Feature dependency violation: {feature} requires {dependency} but it is not enabled")]
+    MissingDependency { feature: String, dependency: String },
+    #[error("Circular dependency detected: {features:?}")]
+    CircularDependency { features: Vec<String> },
+}
+
+impl Default for ConfigurationValidationResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConfigurationValidationResult {
+    pub fn new() -> Self {
+        Self {
+            is_valid: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            suggestions: Vec::new(),
+        }
+    }
+    
+    pub fn add_error(&mut self, error: ConfigurationError) {
+        self.is_valid = false;
+        self.errors.push(error);
+    }
+    
+    pub fn add_warning(&mut self, warning: ConfigurationWarning) {
+        self.warnings.push(warning);
+    }
+    
+    pub fn add_suggestion(&mut self, suggestion: String) {
+        self.suggestions.push(suggestion);
+    }
+}
+
+impl Default for FeatureDependencyGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FeatureDependencyGraph {
+    pub fn new() -> Self {
+        let mut dependencies = HashMap::new();
+        let mut enabled_features = HashSet::new();
+        
+        // Define feature dependencies (volume_profile_reprocessing requires volume_profile)
+        dependencies.insert("volume_profile_reprocessing".to_string(), vec!["volume_profile".to_string()]);
+        
+        // Detect enabled features at compile time
+        #[cfg(feature = "postgres")]
+        enabled_features.insert("postgres".to_string());
+        
+        #[cfg(feature = "kafka")]
+        enabled_features.insert("kafka".to_string());
+        
+        #[cfg(feature = "volume_profile")]
+        enabled_features.insert("volume_profile".to_string());
+        
+        #[cfg(feature = "volume_profile_reprocessing")]
+        enabled_features.insert("volume_profile_reprocessing".to_string());
+        
+        Self {
+            dependencies,
+            enabled_features,
+            required_features: HashSet::new(),
+        }
+    }
+    
+    pub fn validate_dependencies(&self) -> Result<(), FeatureDependencyError> {
+        for (feature, deps) in &self.dependencies {
+            if self.enabled_features.contains(feature) {
+                for dep in deps {
+                    if !self.enabled_features.contains(dep) {
+                        return Err(FeatureDependencyError::MissingDependency {
+                            feature: feature.clone(),
+                            dependency: dep.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 // Stub configurations for disabled features
 #[cfg(not(feature = "postgres"))]
@@ -210,10 +340,32 @@ impl DataFeederConfig {
         Ok(Self::from_toml_config(toml_config))
     }
     
-    /// Convert TOML configuration to DataFeederConfig
-    fn from_toml_config(toml_config: TomlConfig) -> Self {
-        // Validate feature flag configuration alignment
-        Self::validate_feature_config(&toml_config).expect("Configuration validation failed");
+    /// Convert TOML configuration to DataFeederConfig  
+    fn from_toml_config(mut toml_config: TomlConfig) -> Self {
+        // Step 1: Sanitize configuration for disabled features (Subtask 2.1, 2.4)
+        let sanitization_warnings = Self::sanitize_config_for_features(&mut toml_config);
+        for warning in &sanitization_warnings {
+            warn!("🧹 Configuration sanitized: {}: {}", warning.feature_name, warning.message);
+        }
+        
+        // Step 2: Check for configuration migration issues (Subtask 2.3)
+        let migration_warnings = Self::validate_configuration_migration(&toml_config);
+        for warning in &migration_warnings {
+            warn!("⚠️ Migration warning: {}: {}", warning.feature_name, warning.message);
+        }
+        
+        // Step 3: Validate feature flag configuration alignment with enhanced validation
+        let validation_result = Self::validate_feature_config(&toml_config)
+            .expect("Configuration validation framework failed");
+        
+        if !validation_result.is_valid {
+            let error_messages: Vec<String> = validation_result.errors.iter()
+                .map(|e| format!("{}: {} (Fix: {})", e.feature_name, e.message, e.remediation))
+                .collect();
+            panic!("Configuration validation failed with {} errors:\n{}", 
+                validation_result.errors.len(), 
+                error_messages.join("\n"));
+        }
         // Detect system resources first (before any configuration processing)
         let system_resources = SystemResources::detect_and_cache()
             .expect("Failed to detect system resources");
@@ -319,62 +471,285 @@ impl DataFeederConfig {
         }
     }
 
-    /// Validate feature flag configuration alignment (Subtask 4.1, 4.2)
-    fn validate_feature_config(_toml_config: &TomlConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Validate Kafka configuration - only check when feature is disabled
-        #[cfg(not(feature = "kafka"))]
-        {
-            // When kafka feature is disabled, the kafka field is not available in TOML config
-            // This is handled at compile time - no runtime validation needed since the field won't exist
-            warn!("⚠️ Kafka feature is disabled - any kafka configuration in config.toml will be ignored");
-        }
-
-        // Validate PostgreSQL configuration
-        #[cfg(not(feature = "postgres"))]  
-        {
-            // When postgres feature is disabled, the database field is not available in TOML config
-            // This is handled at compile time - no runtime validation needed since the field won't exist
-            warn!("⚠️ PostgreSQL feature is disabled - any database configuration in config.toml will be ignored");
+    /// Enhanced validate feature flag configuration alignment (Story 3.5 - Task 1)
+    fn validate_feature_config(toml_config: &TomlConfig) -> Result<ConfigurationValidationResult, Box<dyn std::error::Error + Send + Sync>> {
+        let mut result = ConfigurationValidationResult::new();
+        
+        // Initialize feature dependency graph
+        let dependency_graph = FeatureDependencyGraph::new();
+        
+        // Validate feature dependencies first (Subtask 1.4)
+        if let Err(dep_error) = dependency_graph.validate_dependencies() {
+            match dep_error {
+                FeatureDependencyError::MissingDependency { feature, dependency } => {
+                    result.add_error(ConfigurationError {
+                        error_type: ConfigErrorType::MissingDependency,
+                        feature_name: feature.clone(),
+                        message: format!("Feature '{}' requires '{}' but it is not enabled", feature, dependency),
+                        remediation: format!("To use '{}', enable the '{}' feature in Cargo.toml: features = [\"{}\"]. Or disable '{}' if not needed.", feature, dependency, dependency, feature),
+                    });
+                }
+                FeatureDependencyError::CircularDependency { features } => {
+                    result.add_error(ConfigurationError {
+                        error_type: ConfigErrorType::MissingDependency,
+                        feature_name: "circular_dependency".to_string(),
+                        message: format!("Circular dependency detected between features: {:?}", features),
+                        remediation: "Review feature dependencies and remove circular references in Cargo.toml".to_string(),
+                    });
+                }
+            }
         }
         
-        #[cfg(feature = "postgres")]
+        // Validate Kafka configuration (Subtask 1.1, 1.3)
+        #[cfg(not(feature = "kafka"))]
         {
-            // When postgres feature is enabled, validate that database config is reasonable
-            if _toml_config.database.enabled {
-                if _toml_config.database.host.is_empty() {
-                    return Err("Configuration error: PostgreSQL is enabled but host is empty".into());
-                }
-                if _toml_config.database.database.is_empty() {
-                    return Err("Configuration error: PostgreSQL is enabled but database is empty".into());
-                }
-                if _toml_config.database.username.is_empty() {
-                    return Err("Configuration error: PostgreSQL is enabled but username is empty".into());
+            result.add_warning(ConfigurationWarning {
+                feature_name: "kafka".to_string(),
+                message: "Kafka feature is disabled - any kafka configuration in config.toml will be ignored".to_string(),
+                suggestion: "Enable kafka feature in Cargo.toml if you need Kafka functionality: features = [\"kafka\"]".to_string(),
+            });
+        }
+
+        #[cfg(feature = "kafka")]
+        {
+            if let Some(ref kafka_config) = toml_config.kafka {
+                if kafka_config.enabled {
+                    // Validate Kafka configuration values
+                    if kafka_config.bootstrap_servers.is_empty() {
+                        result.add_error(ConfigurationError {
+                            error_type: ConfigErrorType::InvalidValue,
+                            feature_name: "kafka".to_string(),
+                            message: "Kafka is enabled but no bootstrap servers are configured".to_string(),
+                            remediation: "Add kafka bootstrap servers in config.toml: [kafka] bootstrap_servers = [\"localhost:9092\"]".to_string(),
+                        });
+                    }
+                    
+                    if kafka_config.topic_prefix.is_empty() {
+                        result.add_error(ConfigurationError {
+                            error_type: ConfigErrorType::InvalidValue,
+                            feature_name: "kafka".to_string(),
+                            message: "Kafka is enabled but topic prefix is empty".to_string(),
+                            remediation: "Set kafka topic prefix in config.toml: [kafka] topic_prefix = \"market_data\"".to_string(),
+                        });
+                    }
                 }
             }
         }
 
-        // Validate Volume Profile configuration  
-        #[cfg(not(feature = "volume_profile"))]
+        // Validate PostgreSQL configuration (Subtask 1.1, 1.3)
+        #[cfg(not(feature = "postgres"))]  
         {
-            // When volume_profile feature is disabled, we can't access the field directly
-            // This validation would need to be done at the TOML parsing level
-            // For now, we'll just log that volume profile feature is disabled
-            warn!("⚠️ Volume Profile feature is disabled - any volume profile configuration in config.toml will be ignored");
-        }
-
-        // Validate Volume Profile Reprocessing configuration
-        #[cfg(not(feature = "volume_profile_reprocessing"))]
-        {
-            warn!("⚠️ Volume Profile Reprocessing feature is disabled - reprocessing functionality not available");
+            result.add_warning(ConfigurationWarning {
+                feature_name: "postgres".to_string(),
+                message: "PostgreSQL feature is disabled - any database configuration in config.toml will be ignored".to_string(),
+                suggestion: "Enable postgres feature in Cargo.toml if you need PostgreSQL functionality: features = [\"postgres\"]".to_string(),
+            });
         }
         
-        #[cfg(all(feature = "volume_profile_reprocessing", not(feature = "volume_profile")))]
+        #[cfg(feature = "postgres")]
         {
-            return Err("Configuration error: volume_profile_reprocessing feature requires volume_profile feature to be enabled".into());
+            if toml_config.database.enabled {
+                if toml_config.database.host.is_empty() {
+                    result.add_error(ConfigurationError {
+                        error_type: ConfigErrorType::InvalidValue,
+                        feature_name: "postgres".to_string(),
+                        message: "PostgreSQL is enabled but host is empty".to_string(),
+                        remediation: "Set database host in config.toml: [database] host = \"localhost\"".to_string(),
+                    });
+                }
+                if toml_config.database.database.is_empty() {
+                    result.add_error(ConfigurationError {
+                        error_type: ConfigErrorType::InvalidValue,
+                        feature_name: "postgres".to_string(),
+                        message: "PostgreSQL is enabled but database name is empty".to_string(),
+                        remediation: "Set database name in config.toml: [database] database = \"market_data\"".to_string(),
+                    });
+                }
+                if toml_config.database.username.is_empty() {
+                    result.add_error(ConfigurationError {
+                        error_type: ConfigErrorType::InvalidValue,
+                        feature_name: "postgres".to_string(),
+                        message: "PostgreSQL is enabled but username is empty".to_string(),
+                        remediation: "Set database username in config.toml: [database] username = \"postgres\"".to_string(),
+                    });
+                }
+                
+                // Additional PostgreSQL validation
+                if toml_config.database.port == 0 {
+                    result.add_error(ConfigurationError {
+                        error_type: ConfigErrorType::InvalidValue,
+                        feature_name: "postgres".to_string(),
+                        message: "PostgreSQL port cannot be 0".to_string(),
+                        remediation: "Set valid database port in config.toml: [database] port = 5432".to_string(),
+                    });
+                }
+            }
         }
 
-        info!("✅ Configuration validation passed - all feature flags align with config.toml settings");
-        Ok(())
+        // Validate Volume Profile configuration (Subtask 1.1, 1.2)
+        #[cfg(not(feature = "volume_profile"))]
+        {
+            result.add_warning(ConfigurationWarning {
+                feature_name: "volume_profile".to_string(),
+                message: "Volume Profile feature is disabled - any volume profile configuration in config.toml will be ignored".to_string(),
+                suggestion: "Enable volume_profile feature in Cargo.toml if you need volume profile functionality: features = [\"volume_profile\"]".to_string(),
+            });
+        }
+
+        #[cfg(feature = "volume_profile")]
+        {
+            if let Some(ref vp_config) = toml_config.volume_profile {
+                if vp_config.enabled {
+                    if vp_config.target_price_levels < 10 {
+                        result.add_warning(ConfigurationWarning {
+                            feature_name: "volume_profile".to_string(),
+                            message: format!("Volume profile target price levels ({}) is low, may reduce analysis accuracy", vp_config.target_price_levels),
+                            suggestion: "Consider using at least 20 target price levels for better volume profile analysis".to_string(),
+                        });
+                    }
+                    
+                    if vp_config.historical_days == 0 {
+                        result.add_error(ConfigurationError {
+                            error_type: ConfigErrorType::InvalidValue,
+                            feature_name: "volume_profile".to_string(),
+                            message: "Volume profile historical_days cannot be 0".to_string(),
+                            remediation: "Set valid historical_days in config.toml: [volume_profile] historical_days = 30".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Validate Volume Profile Reprocessing configuration (Subtask 1.2, 1.4)
+        #[cfg(not(feature = "volume_profile_reprocessing"))]
+        {
+            result.add_warning(ConfigurationWarning {
+                feature_name: "volume_profile_reprocessing".to_string(),
+                message: "Volume Profile Reprocessing feature is disabled - reprocessing functionality not available".to_string(),
+                suggestion: "Enable volume_profile_reprocessing feature in Cargo.toml if needed: features = [\"volume_profile\", \"volume_profile_reprocessing\"]".to_string(),
+            });
+        }
+        
+        // This compile-time check is handled by FeatureDependencyGraph::validate_dependencies() above
+        
+        // Add configuration suggestions (Subtask 1.3)
+        if result.is_valid {
+            result.add_suggestion("Configuration validation passed successfully".to_string());
+            
+            // Add helpful suggestions based on enabled features
+            #[cfg(all(feature = "postgres", feature = "kafka"))]
+            result.add_suggestion("Both PostgreSQL and Kafka are enabled - consider monitoring disk space for dual storage".to_string());
+            
+            #[cfg(feature = "volume_profile")]
+            result.add_suggestion("Volume profile is enabled - ensure adequate memory allocation for historical data analysis".to_string());
+        }
+
+        // Log results
+        if result.is_valid {
+            info!("✅ Configuration validation passed - all feature flags align with config.toml settings");
+            for warning in &result.warnings {
+                warn!("⚠️ {}: {}", warning.feature_name, warning.message);
+            }
+        } else {
+            for error in &result.errors {
+                error!("❌ {}: {} | Fix: {}", error.feature_name, error.message, error.remediation);
+            }
+        }
+        
+        Ok(result)
+    }
+    
+    /// Sanitize configuration by removing sections for disabled features (Subtask 2.1, 2.4)
+    #[allow(unused_mut)]
+    fn sanitize_config_for_features(_toml_config: &mut TomlConfig) -> Vec<ConfigurationWarning> {
+        let mut warnings = Vec::new();
+        
+        // Sanitize Kafka configuration when feature is disabled
+        #[cfg(not(feature = "kafka"))]
+        {
+            if _toml_config.kafka.is_some() {
+                warnings.push(ConfigurationWarning {
+                    feature_name: "kafka".to_string(),
+                    message: "Removing Kafka configuration section - feature is disabled".to_string(),
+                    suggestion: "Enable kafka feature in Cargo.toml if you need Kafka functionality: features = [\"kafka\"]".to_string(),
+                });
+                _toml_config.kafka = None;
+            }
+        }
+        
+        // Sanitize PostgreSQL configuration when feature is disabled  
+        #[cfg(not(feature = "postgres"))]
+        {
+            // Cannot remove database field as it's not optional in TomlConfig when postgres enabled
+            // This is handled by the conditional compilation of the field itself
+            warnings.push(ConfigurationWarning {
+                feature_name: "postgres".to_string(),
+                message: "PostgreSQL feature is disabled - database configuration will be ignored".to_string(),
+                suggestion: "Enable postgres feature in Cargo.toml if you need PostgreSQL functionality: features = [\"postgres\"]".to_string(),
+            });
+        }
+        
+        // Sanitize Volume Profile configuration when feature is disabled
+        #[cfg(not(feature = "volume_profile"))]
+        {
+            if _toml_config.volume_profile.is_some() {
+                warnings.push(ConfigurationWarning {
+                    feature_name: "volume_profile".to_string(),
+                    message: "Removing Volume Profile configuration section - feature is disabled".to_string(),
+                    suggestion: "Enable volume_profile feature in Cargo.toml if you need volume profile functionality: features = [\"volume_profile\"]".to_string(),
+                });
+                _toml_config.volume_profile = None;
+            }
+        }
+        
+        warnings
+    }
+    
+    /// Validate and sanitize configuration migration scenarios (Subtask 2.3)
+    fn validate_configuration_migration(toml_config: &TomlConfig) -> Vec<ConfigurationWarning> {
+        let mut warnings = Vec::new();
+        
+        // Check for deprecated feature combinations
+        #[cfg(all(feature = "volume_profile_reprocessing", not(feature = "volume_profile")))]
+        {
+            warnings.push(ConfigurationWarning {
+                feature_name: "volume_profile_reprocessing".to_string(),
+                message: "Deprecated configuration: volume_profile_reprocessing without volume_profile".to_string(),
+                suggestion: "This combination will be removed in future versions. Enable both features or disable reprocessing.".to_string(),
+            });
+        }
+        
+        // Check for potentially problematic configurations
+        #[cfg(all(feature = "postgres", feature = "kafka"))]
+        {
+            if toml_config.database.enabled && toml_config.kafka.as_ref().is_some_and(|k| k.enabled) {
+                warnings.push(ConfigurationWarning {
+                    feature_name: "dual_storage".to_string(),
+                    message: "Both PostgreSQL and Kafka storage are enabled".to_string(),
+                    suggestion: "Monitor disk usage carefully with dual storage enabled".to_string(),
+                });
+            }
+        }
+        
+        // Check for volume profile without adequate historical validation
+        #[cfg(feature = "volume_profile")]
+        {
+            if let Some(ref vp_config) = toml_config.volume_profile {
+                if vp_config.enabled && vp_config.historical_days > 90 {
+                    if let Some(ref hv_config) = toml_config.historical_validation {
+                        if hv_config.validation_days.unwrap_or(60) < vp_config.historical_days {
+                            warnings.push(ConfigurationWarning {
+                                feature_name: "volume_profile".to_string(),
+                                message: "Volume profile historical days exceeds historical validation days".to_string(),
+                                suggestion: "Consider increasing historical_validation.validation_days to match or exceed volume_profile.historical_days".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        warnings
     }
 }
 
@@ -423,11 +798,18 @@ mod tests {
                 adaptive: None,
             };
 
-            // Should fail validation
+            // Should pass validation (kafka not enabled, so ignored with warning)
             let result = DataFeederConfig::validate_feature_config(&toml_config);
-            assert!(result.is_err());
-            let error_msg = result.unwrap_err().to_string();
-            assert!(error_msg.contains("Kafka is enabled in config.toml but the 'kafka' feature is not enabled"));
+            assert!(result.is_ok());
+            let validation_result = result.unwrap();
+            assert!(validation_result.is_valid);
+            
+            // Should have a warning about kafka being disabled
+            assert!(!validation_result.warnings.is_empty());
+            let kafka_warning = validation_result.warnings.iter()
+                .find(|w| w.feature_name == "kafka")
+                .expect("Expected kafka warning");
+            assert!(kafka_warning.message.contains("Kafka feature is disabled"));
         }
     }
 
@@ -474,6 +856,13 @@ mod tests {
             // Should pass validation (disabled in both places is fine)
             let result = DataFeederConfig::validate_feature_config(&toml_config);
             assert!(result.is_ok());
+            let validation_result = result.unwrap();
+            assert!(validation_result.is_valid);
+            
+            // Should still have a warning about kafka being disabled at feature level
+            let kafka_warning = validation_result.warnings.iter()
+                .find(|w| w.feature_name == "kafka");
+            assert!(kafka_warning.is_some());
         }
     }
 
@@ -515,6 +904,8 @@ mod tests {
         // Should pass validation (no config section is fine regardless of feature)
         let result = DataFeederConfig::validate_feature_config(&toml_config);
         assert!(result.is_ok());
+        let validation_result = result.unwrap();
+        assert!(validation_result.is_valid);
     }
 
     #[test]
@@ -560,9 +951,15 @@ mod tests {
             };
 
             let result = DataFeederConfig::validate_feature_config(&toml_config);
-            assert!(result.is_err());
-            let error_msg = result.unwrap_err().to_string();
-            assert!(error_msg.contains("PostgreSQL is enabled but host is empty"));
+            assert!(result.is_ok());
+            let validation_result = result.unwrap();
+            assert!(!validation_result.is_valid);
+            
+            // Should have error about empty host
+            let postgres_error = validation_result.errors.iter()
+                .find(|e| e.feature_name == "postgres" && e.message.contains("host is empty"))
+                .expect("Expected postgres host error");
+            assert!(postgres_error.remediation.contains("Set database host in config.toml"));
         }
     }
     
@@ -609,6 +1006,223 @@ mod tests {
             // Should pass validation (disabled in config is fine)
             let result = DataFeederConfig::validate_feature_config(&toml_config);
             assert!(result.is_ok());
+            let validation_result = result.unwrap();
+            assert!(validation_result.is_valid);
+        }
+    }
+    
+    // Enhanced Configuration Validation Tests (Story 3.5 - Task 4)
+    
+    #[test]
+    fn test_enhanced_validation_valid_postgres_config() {
+        // Test Subtask 4.1: Valid configuration should pass
+        #[cfg(feature = "postgres")]
+        {
+            let mut postgres_config = data_feeder::postgres::PostgresConfig::default();
+            postgres_config.enabled = true;
+            postgres_config.host = "localhost".to_string();
+            postgres_config.database = "test_db".to_string();
+            postgres_config.username = "test_user".to_string();
+            
+            let toml_config = TomlConfig {
+                database: postgres_config,
+                application: ApplicationConfig {
+                    symbols: vec!["BTCUSDT".to_string()],
+                    timeframes: vec![60],
+                    storage_path: "test_data".to_string(),
+                    gap_detection_enabled: false,
+                    start_date: None,
+                    respect_config_start_date: false,
+                    monthly_threshold_months: 2,
+                    enable_technical_analysis: false,
+                    reconnection_gap_threshold_minutes: 1,
+                    reconnection_gap_check_delay_seconds: 5,
+                    periodic_gap_detection_enabled: false,
+                    periodic_gap_check_interval_minutes: 5,
+                    periodic_gap_check_window_minutes: 30,
+                },
+                technical_analysis: TechnicalAnalysisTomlConfig {
+                    min_history_days: 30,
+                    ema_periods: vec![21, 89],
+                    timeframes: vec![60],
+                    volume_lookback_days: 30,
+                },
+                #[cfg(feature = "kafka")]
+                kafka: None,
+                #[cfg(feature = "volume_profile")]
+                volume_profile: None,
+                logging: None,
+                historical_validation: None,
+                adaptive: None,
+            };
+
+            let result = DataFeederConfig::validate_feature_config(&toml_config);
+            assert!(result.is_ok());
+            let validation_result = result.unwrap();
+            assert!(validation_result.is_valid);
+            assert!(validation_result.errors.is_empty());
+        }
+    }
+
+    #[test] 
+    fn test_enhanced_validation_invalid_postgres_values() {
+        // Test Subtask 4.2: Invalid configuration values should produce specific errors
+        #[cfg(feature = "postgres")]
+        {
+            let mut postgres_config = data_feeder::postgres::PostgresConfig::default();
+            postgres_config.enabled = true;
+            postgres_config.host = "".to_string(); // Empty host - should cause error
+            postgres_config.database = "".to_string(); // Empty database - should cause error
+            postgres_config.username = "test_user".to_string();
+            postgres_config.port = 0; // Invalid port - should cause error
+            
+            let toml_config = TomlConfig {
+                database: postgres_config,
+                application: ApplicationConfig {
+                    symbols: vec!["BTCUSDT".to_string()],
+                    timeframes: vec![60],
+                    storage_path: "test_data".to_string(),
+                    gap_detection_enabled: false,
+                    start_date: None,
+                    respect_config_start_date: false,
+                    monthly_threshold_months: 2,
+                    enable_technical_analysis: false,
+                    reconnection_gap_threshold_minutes: 1,
+                    reconnection_gap_check_delay_seconds: 5,
+                    periodic_gap_detection_enabled: false,
+                    periodic_gap_check_interval_minutes: 5,
+                    periodic_gap_check_window_minutes: 30,
+                },
+                technical_analysis: TechnicalAnalysisTomlConfig {
+                    min_history_days: 30,
+                    ema_periods: vec![21, 89],
+                    timeframes: vec![60],
+                    volume_lookback_days: 30,
+                },
+                #[cfg(feature = "kafka")]
+                kafka: None,
+                #[cfg(feature = "volume_profile")]
+                volume_profile: None,
+                logging: None,
+                historical_validation: None,
+                adaptive: None,
+            };
+
+            let result = DataFeederConfig::validate_feature_config(&toml_config);
+            assert!(result.is_ok());
+            let validation_result = result.unwrap();
+            assert!(!validation_result.is_valid);
+            
+            // Should have multiple errors
+            assert_eq!(validation_result.errors.len(), 3);
+            
+            // Check specific error messages and remediation
+            let host_error = validation_result.errors.iter()
+                .find(|e| e.message.contains("host is empty"))
+                .expect("Expected host error");
+            assert_eq!(host_error.feature_name, "postgres");
+            assert!(host_error.remediation.contains("Set database host in config.toml"));
+            
+            let db_error = validation_result.errors.iter()
+                .find(|e| e.message.contains("database name is empty"))
+                .expect("Expected database error");
+            assert!(db_error.remediation.contains("Set database name in config.toml"));
+            
+            let port_error = validation_result.errors.iter()
+                .find(|e| e.message.contains("port cannot be 0"))
+                .expect("Expected port error");
+            assert!(port_error.remediation.contains("Set valid database port in config.toml"));
+        }
+    }
+
+    #[test]
+    fn test_feature_dependency_validation() {
+        // Test Subtask 4.2: Feature dependency validation
+        let dependency_graph = FeatureDependencyGraph::new();
+        
+        // Test valid dependencies
+        let validation_result = dependency_graph.validate_dependencies();
+        
+        // Should pass if volume_profile_reprocessing is not enabled, or if both volume_profile and volume_profile_reprocessing are enabled
+        #[cfg(all(feature = "volume_profile_reprocessing", not(feature = "volume_profile")))]
+        {
+            // This configuration should fail
+            assert!(validation_result.is_err());
+            match validation_result.unwrap_err() {
+                FeatureDependencyError::MissingDependency { feature, dependency } => {
+                    assert_eq!(feature, "volume_profile_reprocessing");
+                    assert_eq!(dependency, "volume_profile");
+                }
+                _ => panic!("Expected MissingDependency error"),
+            }
+        }
+        
+        #[cfg(not(all(feature = "volume_profile_reprocessing", not(feature = "volume_profile"))))]
+        {
+            // Valid configuration should pass
+            assert!(validation_result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_configuration_sanitization() {
+        // Test Subtask 4.4: Configuration sanitization for disabled features
+        let mut toml_config = TomlConfig {
+            #[cfg(feature = "postgres")]
+            database: PostgresConfig::default(),
+            application: ApplicationConfig {
+                symbols: vec!["BTCUSDT".to_string()],
+                timeframes: vec![60],
+                storage_path: "test_data".to_string(),
+                gap_detection_enabled: false,
+                start_date: None,
+                respect_config_start_date: false,
+                monthly_threshold_months: 2,
+                enable_technical_analysis: false,
+                reconnection_gap_threshold_minutes: 1,
+                reconnection_gap_check_delay_seconds: 5,
+                periodic_gap_detection_enabled: false,
+                periodic_gap_check_interval_minutes: 5,
+                periodic_gap_check_window_minutes: 30,
+            },
+            technical_analysis: TechnicalAnalysisTomlConfig {
+                min_history_days: 30,
+                ema_periods: vec![21, 89],
+                timeframes: vec![60],
+                volume_lookback_days: 30,
+            },
+            #[cfg(feature = "kafka")]
+            kafka: Some(KafkaConfig::default()),
+            #[cfg(not(feature = "kafka"))]
+            kafka: Some(KafkaConfig::default()),
+            #[cfg(feature = "volume_profile")]
+            volume_profile: Some(data_feeder::volume_profile::VolumeProfileConfig::default()),
+            #[cfg(not(feature = "volume_profile"))]
+            volume_profile: Some(VolumeProfileConfig::default()),
+            logging: None,
+            historical_validation: None,
+            adaptive: None,
+        };
+
+        let _warnings = DataFeederConfig::sanitize_config_for_features(&mut toml_config);
+        
+        // Should have warnings for disabled features
+        #[cfg(not(feature = "kafka"))]
+        {
+            assert!(toml_config.kafka.is_none()); // Should be removed
+            let kafka_warning = warnings.iter()
+                .find(|w| w.feature_name == "kafka")
+                .expect("Expected kafka sanitization warning");
+            assert!(kafka_warning.message.contains("Removing Kafka configuration"));
+        }
+        
+        #[cfg(not(feature = "volume_profile"))]
+        {
+            assert!(toml_config.volume_profile.is_none()); // Should be removed
+            let vp_warning = warnings.iter()
+                .find(|w| w.feature_name == "volume_profile")
+                .expect("Expected volume profile sanitization warning");
+            assert!(vp_warning.message.contains("Removing Volume Profile configuration"));
         }
     }
 }

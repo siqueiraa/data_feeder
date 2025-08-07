@@ -2,6 +2,7 @@
 mod tests {
     use crate::historical::actor::*;
     use crate::historical::errors::*;
+    use crate::adaptive_config::AdaptiveConfig;
     use tempfile::TempDir;
     use std::path::Path;
 
@@ -12,12 +13,14 @@ mod tests {
         
         let symbols = vec!["BTCUSDT".to_string()];
         let timeframes = vec![60u64];
+        let adaptive_config = AdaptiveConfig::default_static_config();
         
         let result = HistoricalActor::new(
             &symbols,
             &timeframes,
             temp_dir.path(),
-            csv_temp_dir.path()
+            csv_temp_dir.path(),
+            &adaptive_config
         );
         
         assert!(result.is_ok(), "HistoricalActor creation should succeed");
@@ -33,12 +36,14 @@ mod tests {
         
         let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
         let timeframes = vec![60u64, 300u64];
+        let adaptive_config = AdaptiveConfig::default_static_config();
         
         let result = HistoricalActor::new(
             &symbols,
             &timeframes,
             temp_dir.path(),
-            csv_temp_dir.path()
+            csv_temp_dir.path(),
+            &adaptive_config
         );
         
         assert!(result.is_ok(), "HistoricalActor creation with multiple symbols should succeed");
@@ -54,12 +59,14 @@ mod tests {
         
         let symbols = vec!["BTCUSDT".to_string()];
         let timeframes = vec![60u64];
+        let adaptive_config = AdaptiveConfig::default_static_config();
         
         let result = HistoricalActor::new(
             &symbols,
             &timeframes,
             temp_dir.path(), // Pass a valid base_path
-            invalid_path // Pass the invalid path to csv_path
+            invalid_path, // Pass the invalid path to csv_path
+            &adaptive_config
         );
         
         assert!(result.is_err(), "HistoricalActor creation should fail with invalid path");
@@ -135,7 +142,8 @@ mod tests {
         let symbols = vec!["BTCUSDT".to_string()];
         let timeframes = vec![60u64];
         
-        let result = HistoricalActor::new(&symbols, &timeframes, temp_dir.path(), invalid_path);
+        let adaptive_config = AdaptiveConfig::default_static_config();
+        let result = HistoricalActor::new(&symbols, &timeframes, temp_dir.path(), invalid_path, &adaptive_config);
         
         assert!(result.is_err(), "HistoricalActor creation with invalid path should return an error");
     }

@@ -2,6 +2,7 @@ use super::actor::{HistoricalActor, HistoricalAsk, HistoricalReply};
 use chrono::{TimeZone, Utc};
 use kameo::actor::ActorRef;
 use tempfile::tempdir;
+use crate::adaptive_config::AdaptiveConfig;
 
 #[tokio::test]
 async fn test_fetch_candles() {
@@ -12,7 +13,8 @@ async fn test_fetch_candles() {
     let csv_tmp_dir = tempdir().unwrap();
     let csv_path = csv_tmp_dir.path();
 
-    let actor = HistoricalActor::new(&symbols, &timeframes, base_path, csv_path)
+    let adaptive_config = AdaptiveConfig::default_static_config();
+    let actor = HistoricalActor::new(&symbols, &timeframes, base_path, csv_path, &adaptive_config)
         .expect("Failed to create HistoricalActor");
     let actor_ref: ActorRef<HistoricalActor> = kameo::spawn(actor);
 

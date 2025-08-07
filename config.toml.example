@@ -1,19 +1,63 @@
 # Data Feeder Configuration File
+# 
+# FEATURE FLAGS AND CONFIGURATION ALIGNMENT (Story 3.5)
+# =====================================================
+# This configuration file demonstrates all valid feature flag combinations.
+# Features are enabled in Cargo.toml and configured here in config.toml.
+#
+# Available Features:
+# - postgres: PostgreSQL storage backend  
+# - kafka: Kafka message publishing
+# - volume_profile: Volume profile technical analysis
+# - volume_profile_reprocessing: Historical volume profile reprocessing (requires volume_profile)
+#
+# Feature Dependency Matrix:
+# ┌──────────────────────────────┬─────────────────────────────────────────────────────┐
+# │ Feature                      │ Dependencies                                        │
+# ├──────────────────────────────┼─────────────────────────────────────────────────────┤
+# │ postgres                     │ None                                                │
+# │ kafka                        │ None                                                │
+# │ volume_profile               │ None                                                │
+# │ volume_profile_reprocessing  │ volume_profile (required)                          │
+# └──────────────────────────────┴─────────────────────────────────────────────────────┘
+#
+# Valid Feature Combinations:
+# - [] (no features): Minimal LMDB-only storage
+# - [postgres]: PostgreSQL storage only
+# - [kafka]: Kafka publishing only
+# - [volume_profile]: Volume profile analysis only
+# - [postgres, kafka]: Dual storage with publishing
+# - [postgres, volume_profile]: PostgreSQL with volume analysis
+# - [kafka, volume_profile]: Kafka publishing with volume analysis
+# - [postgres, kafka, volume_profile]: Full feature set
+# - [volume_profile, volume_profile_reprocessing]: Volume profile with reprocessing
+# - [postgres, kafka, volume_profile, volume_profile_reprocessing]: Full feature set with reprocessing
+#
+# INVALID Combinations (will cause validation errors):
+# - [volume_profile_reprocessing]: Missing required volume_profile dependency
+#
+# Configuration Sections:
+# - Sections for disabled features will be ignored with warnings
+# - Invalid values in enabled features will cause validation errors
+# - Missing required configuration for enabled features will cause errors
 
 [database]
-# PostgreSQL connection settings
-host = "localhost"
-port = 5432
-database = "crypto_data"
-username = "postgres"
-password = "your_password"
-max_connections = 10
+# PostgreSQL connection settings (requires 'postgres' feature)
+# NOTE: This section is ignored if the 'postgres' feature is not enabled in Cargo.toml
+# To enable: Add 'postgres' to the features list in Cargo.toml
+host = "localhost"          # Required: PostgreSQL server hostname
+port = 5432                 # Required: PostgreSQL server port (must be > 0)
+database = "crypto_data"    # Required: Database name (cannot be empty)
+username = "postgres"       # Required: Database username (cannot be empty)
+password = "your_password"  # Database password
+max_connections = 10        # Connection pool size
 connection_timeout_seconds = 30
 
 # Storage settings
-batch_size = 1000
-batch_timeout_seconds = 5
-enabled = false  # Set to true to enable PostgreSQL storage
+batch_size = 1000           # Number of records per batch
+batch_timeout_seconds = 5   # Maximum time to wait before committing batch
+enabled = false             # Set to true to enable PostgreSQL storage
+                           # Validation: If enabled=true, host, database, username must not be empty
 
 [application]
 # Application settings
@@ -46,12 +90,14 @@ timeframes = [60, 300, 900, 3600, 14400]  # 1m, 5m, 15m, 1h, 4h
 volume_lookback_days = 60
 
 [kafka]
-# Kafka producer settings for technical analysis indicators
-enabled = false  # Set to true to enable Kafka publishing
-bootstrap_servers = ["localhost:9092"]  # Replace with your Kafka broker address
-topic_prefix = "ta_"  # Results in "ta_data" topic
-client_id = "data_feeder_rust"
-acks = "all"  # Ensure message durability
+# Kafka producer settings for technical analysis indicators (requires 'kafka' feature)
+# NOTE: This section is ignored if the 'kafka' feature is not enabled in Cargo.toml
+# To enable: Add 'kafka' to the features list in Cargo.toml
+enabled = false                         # Set to true to enable Kafka publishing
+bootstrap_servers = ["localhost:9092"] # Required: Kafka broker addresses (cannot be empty list)
+topic_prefix = "ta_"                   # Required: Topic prefix (cannot be empty string)
+client_id = "data_feeder_rust"         # Kafka client identifier
+acks = "all"                           # Message durability setting
 retries = 3
 max_in_flight_requests_per_connection = 1
 compression_type = "snappy"
@@ -60,8 +106,14 @@ linger_ms = 10
 request_timeout_ms = 30000
 delivery_timeout_ms = 120000
 
+# Validation Rules:
+# - If enabled=true, bootstrap_servers must not be empty
+# - If enabled=true, topic_prefix must not be empty
+
 [volume_profile]
-# Volume Profile settings - Asset-aware configuration
+# Volume Profile settings - Asset-aware configuration (requires 'volume_profile' feature)
+# NOTE: This section is ignored if the 'volume_profile' feature is not enabled in Cargo.toml
+# To enable: Add 'volume_profile' to the features list in Cargo.toml
 enabled = true
 price_increment_mode = "Adaptive"    # "Fixed" or "Adaptive" - Adaptive recommended for multi-asset
 target_price_levels = 500           # Target number of price levels per range (adaptive mode)
@@ -95,11 +147,18 @@ value_area_percentage = 70.0        # Percentage of volume to include in value a
 "PEPEUSDT" = { price_increment_mode = "Adaptive", min_price_increment = 0.00000001, max_price_increment = 0.000001, calculation_mode = "TPO" }
 "SHIBUSDT" = { price_increment_mode = "Adaptive", min_price_increment = 0.00000001, max_price_increment = 0.00001, calculation_mode = "TPO" }
 
-# Volume Profile Reprocessing settings (requires volume_profile_reprocessing feature)
+# Volume Profile Reprocessing settings (requires 'volume_profile_reprocessing' feature)
+# NOTE: Requires BOTH 'volume_profile' AND 'volume_profile_reprocessing' features
+# To enable: Add both 'volume_profile' and 'volume_profile_reprocessing' to Cargo.toml features
 [volume_profile.reprocessing]
 enabled = false  # Set to true to enable reprocessing functionality
 mode = "missing_days_only"  # "reprocess_whole_history", "missing_days_only", "today_only"
 batch_size = 10  # Number of days to process in each batch
+
+# Validation Rules:
+# - target_price_levels: Warning if < 10 (may reduce analysis accuracy)
+# - historical_days: Error if = 0 (must be > 0)
+# - reprocessing: Only available if volume_profile_reprocessing feature enabled
 
 [adaptive]
 # Adaptive resource configuration system
@@ -134,3 +193,47 @@ enabled = true  # Enable adaptive configuration based on system resources
 
 # Disable adaptive configuration entirely (use static defaults)
 # disable_adaptive = false
+
+# ================================================================
+# EXAMPLE CONFIGURATIONS FOR DIFFERENT FEATURE COMBINATIONS
+# ================================================================
+
+# Example 1: Minimal Configuration (no features enabled)
+# Cargo.toml: features = []
+# - Only LMDB storage
+# - No PostgreSQL, Kafka, or Volume Profile
+# - [database], [kafka], [volume_profile] sections will be ignored with warnings
+
+# Example 2: PostgreSQL Only
+# Cargo.toml: features = ["postgres"]
+# - Enable [database] section with enabled = true
+# - [kafka], [volume_profile] sections ignored with warnings
+
+# Example 3: Full Feature Set
+# Cargo.toml: features = ["postgres", "kafka", "volume_profile", "volume_profile_reprocessing"]
+# - All sections active and validated
+# - Configuration migration warnings for potentially resource-intensive setup
+
+# Example 4: Volume Profile with Reprocessing
+# Cargo.toml: features = ["volume_profile", "volume_profile_reprocessing"] 
+# - [volume_profile] section active with reprocessing enabled
+# - [database], [kafka] sections ignored with warnings
+
+# TROUBLESHOOTING QUICK REFERENCE
+# ================================
+# Common Configuration Errors:
+#
+# Error: "PostgreSQL is enabled but host is empty"
+# Fix: Set database.host = "localhost" (or your PostgreSQL server address)
+#
+# Error: "Kafka is enabled but no bootstrap servers are configured" 
+# Fix: Set kafka.bootstrap_servers = ["localhost:9092"] (or your Kafka brokers)
+#
+# Error: "Feature 'volume_profile_reprocessing' requires 'volume_profile'"
+# Fix: Add "volume_profile" to Cargo.toml features list
+#
+# Error: "Volume profile historical_days cannot be 0"
+# Fix: Set volume_profile.historical_days to a value > 0 (e.g., 30)
+#
+# Warning: "Volume profile target price levels (5) is low"
+# Suggestion: Increase volume_profile.target_price_levels to at least 10-20

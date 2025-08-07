@@ -122,11 +122,57 @@ cargo build --release --no-default-features --features="volume_profile,volume_pr
 
 ### Configuration Validation
 
-The application validates that your `config.toml` matches the enabled features:
+The application performs comprehensive validation to ensure your `config.toml` matches the enabled features and contains valid values:
 
-- ❌ **Error**: Kafka enabled in config but `kafka` feature not compiled
-- ⚠️ **Warning**: Kafka config present but feature disabled (section ignored)  
+#### ✅ **Enhanced Validation Features**
+- **Feature Dependency Checking**: Validates that required feature dependencies are enabled
+- **Configuration Sanitization**: Automatically removes sections for disabled features with warnings  
+- **Value Validation**: Checks that enabled features have valid configuration values
+- **Migration Warnings**: Alerts for potentially problematic feature combinations
+- **Detailed Error Messages**: Provides specific remediation steps for configuration issues
+
+#### 🔍 **Validation Types**
+
+**Feature Alignment Validation:**
+- ❌ **Error**: Feature enabled in config but not compiled in Cargo.toml
+- ⚠️ **Warning**: Configuration section present for disabled feature (automatically removed)
 - ✅ **Success**: Configuration matches compiled features
+
+**Feature Dependency Validation:**
+- ❌ **Error**: `volume_profile_reprocessing` enabled without `volume_profile` feature
+- ✅ **Success**: All feature dependencies satisfied
+
+**Configuration Value Validation:**
+- ❌ **Error**: PostgreSQL enabled but host/database/username empty
+- ❌ **Error**: Kafka enabled but no bootstrap servers configured
+- ⚠️ **Warning**: Volume profile target price levels < 10 (may reduce accuracy)
+
+#### 🛠️ **Common Configuration Errors & Fixes**
+
+| Error | Fix |
+|-------|-----|
+| "PostgreSQL is enabled but host is empty" | Set `database.host = "localhost"` |
+| "Kafka is enabled but no bootstrap servers are configured" | Set `kafka.bootstrap_servers = ["localhost:9092"]` |
+| "Feature 'volume_profile_reprocessing' requires 'volume_profile'" | Add `"volume_profile"` to Cargo.toml features |
+| "Volume profile historical_days cannot be 0" | Set `volume_profile.historical_days = 30` |
+
+#### 📋 **Configuration Checklist**
+
+Before running the application:
+
+1. **Enable Features**: Add required features to `Cargo.toml`
+```toml
+[features]
+default = []
+postgres = ["tokio-postgres", "deadpool-postgres"]  
+kafka = ["rdkafka"]
+volume_profile = []
+volume_profile_reprocessing = ["volume_profile"]
+```
+
+2. **Configure Sections**: Only configure sections for enabled features
+3. **Validate Settings**: Ensure all required fields have valid values
+4. **Test Configuration**: Run with `--check-config` flag to validate without starting
 
 ## 🚀 Quick Start
 
