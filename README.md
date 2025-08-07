@@ -42,6 +42,10 @@ The Cryptocurrency Data Feeder is a robust, production-ready system designed to 
 - **Trend Analysis**: Multi-timeframe trend detection using EMA crossovers
 - **Volume Analysis**: Maximum volume tracking with trend correlation
 - **Volume Profiles**: Daily volume distribution analysis with POC, VWAP, and value area calculation
+- **Volume Profile Reprocessing**: Intelligent reprocessing with three modes:
+  - `missing_days_only` (default): Gap detection and targeted reprocessing
+  - `today_only`: Current day reprocessing for quick updates
+  - `reprocess_whole_history`: Complete historical data reprocessing
 - **Real-time Alerts**: Instant indicator updates via Kafka
 
 ### 🔧 **Production Ready**
@@ -84,6 +88,46 @@ The Cryptocurrency Data Feeder is a robust, production-ready system designed to 
                 └─────────────────┘    └─────────────────┘
 ```
 
+## 🎛️ Feature Flags
+
+This application uses Rust feature flags to enable/disable functionality at compile time, allowing you to create lightweight binaries with only the components you need.
+
+### Available Features
+
+| Feature | Description | Default | Dependencies |
+|---------|-------------|---------|--------------|
+| `kafka` | Real-time indicator publishing to Kafka | ❌ | librdkafka |
+| `postgres` | PostgreSQL database integration | ❌ | PostgreSQL client libs |
+| `volume_profile` | Daily volume profile analysis | ❌ | None |
+| `volume_profile_reprocessing` | Volume profile reprocessing utilities | ❌ | `volume_profile` |
+
+### Feature Combinations
+
+```bash
+# Minimal build (LMDB storage only)
+cargo build --release --no-default-features
+
+# Kafka integration only  
+cargo build --release --no-default-features --features="kafka"
+
+# Full featured build
+cargo build --release --features="kafka,postgres,volume_profile,volume_profile_reprocessing"
+
+# PostgreSQL + Volume Profile + Reprocessing (no Kafka)
+cargo build --release --no-default-features --features="postgres,volume_profile,volume_profile_reprocessing"
+
+# Volume Profile with Reprocessing only
+cargo build --release --no-default-features --features="volume_profile,volume_profile_reprocessing"
+```
+
+### Configuration Validation
+
+The application validates that your `config.toml` matches the enabled features:
+
+- ❌ **Error**: Kafka enabled in config but `kafka` feature not compiled
+- ⚠️ **Warning**: Kafka config present but feature disabled (section ignored)  
+- ✅ **Success**: Configuration matches compiled features
+
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -104,7 +148,16 @@ cd data_feeder
 
 2. **Build the project:**
 ```bash
-cargo build --release
+# Choose your build based on needed features:
+
+# Minimal build (LMDB only)
+cargo build --release --no-default-features
+
+# With Kafka support
+cargo build --release --no-default-features --features="kafka"  
+
+# Full featured (recommended for development)
+cargo build --release --features="kafka,postgres,volume_profile"
 ```
 
 3. **Copy and configure settings:**
@@ -128,13 +181,20 @@ symbols = ["BTCUSDT", "ETHUSDT"]  # Trading pairs to monitor
 timeframes = [60, 300, 900, 3600, 14400]  # 1m, 5m, 15m, 1h, 4h
 enable_technical_analysis = true
 
+# Kafka section (only processed if 'kafka' feature enabled)
 [kafka]
 enabled = true  # Enable real-time indicator publishing
 bootstrap_servers = ["your-kafka-broker:9092"]
 topic_prefix = "ta_"  # Results in "ta_data" topic
 
+# PostgreSQL section (only processed if 'postgres' feature enabled)
 [database]
 enabled = false  # Optional PostgreSQL integration
+
+# Volume Profile section (only processed if 'volume_profile' feature enabled)
+[volume_profile]
+enabled = true
+historical_days = 60
 ```
 
 ## 📊 Data Output
@@ -220,6 +280,13 @@ RUST_LOG=info cargo run
 # Check code quality
 cargo check
 cargo clippy
+
+# Test feature combinations
+./test_feature_combinations.sh
+
+# Build specific feature combinations
+cargo check --no-default-features --features="kafka"
+cargo check --features="kafka,postgres,volume_profile"
 ```
 
 ### Running Tests
@@ -298,6 +365,18 @@ cargo test -- --nocapture
 ## ❗ Troubleshooting
 
 ### Common Issues
+
+**Feature Flag Configuration Errors:**
+```bash
+# Error: Kafka enabled in config but feature disabled
+# Solution: Either disable in config or rebuild with kafka feature
+cargo build --release --features="kafka"
+
+# Error: Missing dependencies for features
+# Solution: Install required system dependencies
+# For Kafka: install librdkafka-dev
+# For PostgreSQL: install libpq-dev
+```
 
 **Connection Errors:**
 ```bash

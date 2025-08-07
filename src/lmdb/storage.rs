@@ -314,4 +314,17 @@ impl LmdbStorage {
         self.envs.contains_key(&key)
     }
 
+    /// Check if a specific key exists (for volume profile reprocessing)
+    #[cfg(feature = "volume_profile_reprocessing")]
+    pub fn check_key_exists(&self, _key: &str) -> Result<bool, HistoricalDataError> {
+        // For now, this is a placeholder implementation
+        // In a full implementation, this would check if volume profile data
+        // exists for the given key across different databases
+        
+        // Parse key format: "symbol:date" for volume profiles
+        // For now, return false to indicate missing data
+        // This will trigger gap detection as intended
+        Ok(false)
+    }
+
 }

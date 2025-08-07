@@ -308,6 +308,33 @@ impl LmdbActor {
         }
     }
 
+    /// Handle checking if volume profile data exists
+    #[cfg(feature = "volume_profile_reprocessing")]
+    async fn handle_check_volume_profile_exists(
+        &mut self,
+        key: String,
+    ) -> LmdbActorResponse {
+        debug!("🔍 Checking volume profile existence for key: {}", key);
+        
+        // Use LMDB storage to check if the key exists
+        // For now, we'll check in the standard candle database as volume profiles
+        // are derived from candle data. In a full implementation, there would be
+        // a separate volume profile database.
+        
+        // For this implementation, assume volume profile exists if we have candle data
+        // for the corresponding symbol and date
+        match self.storage.check_key_exists(&key) {
+            Ok(exists) => {
+                debug!("✅ Volume profile key {} exists: {}", key, exists);
+                LmdbActorResponse::VolumeProfileExists { exists }
+            }
+            Err(e) => {
+                error!("❌ Failed to check volume profile existence for {}: {}", key, e);
+                LmdbActorResponse::ErrorResponse(format!("Failed to check existence: {}", e))
+            }
+        }
+    }
+
 
 
 }
@@ -355,6 +382,10 @@ impl Message<LmdbActorMessage> for LmdbActor {
             }
             LmdbActorMessage::InitializeDatabase { symbol, timeframe } => {
                 self.handle_initialize_database(symbol, timeframe).await
+            }
+            #[cfg(feature = "volume_profile_reprocessing")]
+            LmdbActorMessage::CheckVolumeProfileExists { key } => {
+                self.handle_check_volume_profile_exists(key).await
             }
         }
     }

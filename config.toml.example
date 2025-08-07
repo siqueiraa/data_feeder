@@ -95,6 +95,12 @@ value_area_percentage = 70.0        # Percentage of volume to include in value a
 "PEPEUSDT" = { price_increment_mode = "Adaptive", min_price_increment = 0.00000001, max_price_increment = 0.000001, calculation_mode = "TPO" }
 "SHIBUSDT" = { price_increment_mode = "Adaptive", min_price_increment = 0.00000001, max_price_increment = 0.00001, calculation_mode = "TPO" }
 
+# Volume Profile Reprocessing settings (requires volume_profile_reprocessing feature)
+[volume_profile.reprocessing]
+enabled = false  # Set to true to enable reprocessing functionality
+mode = "missing_days_only"  # "reprocess_whole_history", "missing_days_only", "today_only"
+batch_size = 10  # Number of days to process in each batch
+
 [adaptive]
 # Adaptive resource configuration system
 enabled = true  # Enable adaptive configuration based on system resources

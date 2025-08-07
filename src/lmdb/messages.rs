@@ -41,6 +41,11 @@ pub enum LmdbActorMessage {
         symbol: String,
         timeframe: u64,
     },
+    /// Check if volume profile data exists for a key
+    #[cfg(feature = "volume_profile_reprocessing")]
+    CheckVolumeProfileExists {
+        key: String,
+    },
 }
 
 /// Fire-and-forget messages for LmdbActor (Tell messages)
@@ -79,6 +84,11 @@ pub enum LmdbActorResponse {
     Success,
     /// Error response
     ErrorResponse(String),
+    /// Volume profile existence check result
+    #[cfg(feature = "volume_profile_reprocessing")]
+    VolumeProfileExists {
+        exists: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

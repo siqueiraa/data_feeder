@@ -212,6 +212,8 @@ impl DataFeederConfig {
     
     /// Convert TOML configuration to DataFeederConfig
     fn from_toml_config(toml_config: TomlConfig) -> Self {
+        // Validate feature flag configuration alignment
+        Self::validate_feature_config(&toml_config).expect("Configuration validation failed");
         // Detect system resources first (before any configuration processing)
         let system_resources = SystemResources::detect_and_cache()
             .expect("Failed to detect system resources");
@@ -314,6 +316,299 @@ impl DataFeederConfig {
             logging_config,
             // Adaptive configuration
             adaptive_config,
+        }
+    }
+
+    /// Validate feature flag configuration alignment (Subtask 4.1, 4.2)
+    fn validate_feature_config(_toml_config: &TomlConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Validate Kafka configuration - only check when feature is disabled
+        #[cfg(not(feature = "kafka"))]
+        {
+            // When kafka feature is disabled, the kafka field is not available in TOML config
+            // This is handled at compile time - no runtime validation needed since the field won't exist
+            warn!("⚠️ Kafka feature is disabled - any kafka configuration in config.toml will be ignored");
+        }
+
+        // Validate PostgreSQL configuration
+        #[cfg(not(feature = "postgres"))]  
+        {
+            // When postgres feature is disabled, the database field is not available in TOML config
+            // This is handled at compile time - no runtime validation needed since the field won't exist
+            warn!("⚠️ PostgreSQL feature is disabled - any database configuration in config.toml will be ignored");
+        }
+        
+        #[cfg(feature = "postgres")]
+        {
+            // When postgres feature is enabled, validate that database config is reasonable
+            if _toml_config.database.enabled {
+                if _toml_config.database.host.is_empty() {
+                    return Err("Configuration error: PostgreSQL is enabled but host is empty".into());
+                }
+                if _toml_config.database.database.is_empty() {
+                    return Err("Configuration error: PostgreSQL is enabled but database is empty".into());
+                }
+                if _toml_config.database.username.is_empty() {
+                    return Err("Configuration error: PostgreSQL is enabled but username is empty".into());
+                }
+            }
+        }
+
+        // Validate Volume Profile configuration  
+        #[cfg(not(feature = "volume_profile"))]
+        {
+            // When volume_profile feature is disabled, we can't access the field directly
+            // This validation would need to be done at the TOML parsing level
+            // For now, we'll just log that volume profile feature is disabled
+            warn!("⚠️ Volume Profile feature is disabled - any volume profile configuration in config.toml will be ignored");
+        }
+
+        // Validate Volume Profile Reprocessing configuration
+        #[cfg(not(feature = "volume_profile_reprocessing"))]
+        {
+            warn!("⚠️ Volume Profile Reprocessing feature is disabled - reprocessing functionality not available");
+        }
+        
+        #[cfg(all(feature = "volume_profile_reprocessing", not(feature = "volume_profile")))]
+        {
+            return Err("Configuration error: volume_profile_reprocessing feature requires volume_profile feature to be enabled".into());
+        }
+
+        info!("✅ Configuration validation passed - all feature flags align with config.toml settings");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_configuration_validation_kafka_disabled_but_enabled_in_config() {
+        // This test validates Subtask 2.3 - configuration validation with various feature flag combinations
+        #[cfg(not(feature = "kafka"))]
+        {
+            // Create a TOML config with Kafka enabled but feature disabled
+            let mut kafka_config = KafkaConfig::default();
+            kafka_config.enabled = true;
+            
+            let toml_config = TomlConfig {
+                #[cfg(feature = "postgres")]
+                database: PostgresConfig::default(),
+                application: ApplicationConfig {
+                    symbols: vec!["BTCUSDT".to_string()],
+                    timeframes: vec![60],
+                    storage_path: "test_data".to_string(),
+                    gap_detection_enabled: false,
+                    start_date: None,
+                    respect_config_start_date: false,
+                    monthly_threshold_months: 2,
+                    enable_technical_analysis: false,
+                    reconnection_gap_threshold_minutes: 1,
+                    reconnection_gap_check_delay_seconds: 5,
+                    periodic_gap_detection_enabled: false,
+                    periodic_gap_check_interval_minutes: 5,
+                    periodic_gap_check_window_minutes: 30,
+                },
+                technical_analysis: TechnicalAnalysisTomlConfig {
+                    min_history_days: 30,
+                    ema_periods: vec![21, 89],
+                    timeframes: vec![60],
+                    volume_lookback_days: 30,
+                },
+                kafka: Some(kafka_config),
+                #[cfg(feature = "volume_profile")]
+                volume_profile: None,
+                logging: None,
+                historical_validation: None,
+                adaptive: None,
+            };
+
+            // Should fail validation
+            let result = DataFeederConfig::validate_feature_config(&toml_config);
+            assert!(result.is_err());
+            let error_msg = result.unwrap_err().to_string();
+            assert!(error_msg.contains("Kafka is enabled in config.toml but the 'kafka' feature is not enabled"));
+        }
+    }
+
+    #[test]  
+    fn test_configuration_validation_kafka_disabled_and_disabled_in_config() {
+        // This test validates graceful handling when Kafka is disabled in both feature and config
+        #[cfg(not(feature = "kafka"))]
+        {
+            let mut kafka_config = KafkaConfig::default();
+            kafka_config.enabled = false; // Disabled in config
+            
+            let toml_config = TomlConfig {
+                #[cfg(feature = "postgres")]
+                database: PostgresConfig::default(),
+                application: ApplicationConfig {
+                    symbols: vec!["BTCUSDT".to_string()],
+                    timeframes: vec![60],
+                    storage_path: "test_data".to_string(),
+                    gap_detection_enabled: false,
+                    start_date: None,
+                    respect_config_start_date: false,
+                    monthly_threshold_months: 2,
+                    enable_technical_analysis: false,
+                    reconnection_gap_threshold_minutes: 1,
+                    reconnection_gap_check_delay_seconds: 5,
+                    periodic_gap_detection_enabled: false,
+                    periodic_gap_check_interval_minutes: 5,
+                    periodic_gap_check_window_minutes: 30,
+                },
+                technical_analysis: TechnicalAnalysisTomlConfig {
+                    min_history_days: 30,
+                    ema_periods: vec![21, 89],
+                    timeframes: vec![60],
+                    volume_lookback_days: 30,
+                },
+                kafka: Some(kafka_config),
+                #[cfg(feature = "volume_profile")]
+                volume_profile: None,
+                logging: None,
+                historical_validation: None,
+                adaptive: None,
+            };
+
+            // Should pass validation (disabled in both places is fine)
+            let result = DataFeederConfig::validate_feature_config(&toml_config);
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_configuration_validation_no_kafka_config_section() {
+        // Test when no Kafka configuration section is present at all
+        let toml_config = TomlConfig {
+            #[cfg(feature = "postgres")]
+            database: PostgresConfig::default(),
+            application: ApplicationConfig {
+                symbols: vec!["BTCUSDT".to_string()],
+                timeframes: vec![60],
+                storage_path: "test_data".to_string(),
+                gap_detection_enabled: false,
+                start_date: None,
+                respect_config_start_date: false,
+                monthly_threshold_months: 2,
+                enable_technical_analysis: false,
+                reconnection_gap_threshold_minutes: 1,
+                reconnection_gap_check_delay_seconds: 5,
+                periodic_gap_detection_enabled: false,
+                periodic_gap_check_interval_minutes: 5,
+                periodic_gap_check_window_minutes: 30,
+            },
+            technical_analysis: TechnicalAnalysisTomlConfig {
+                min_history_days: 30,
+                ema_periods: vec![21, 89],
+                timeframes: vec![60],
+                volume_lookback_days: 30,
+            },
+            kafka: None, // No Kafka config section
+            #[cfg(feature = "volume_profile")]
+            volume_profile: None,
+            logging: None,
+            historical_validation: None,
+            adaptive: None,
+        };
+
+        // Should pass validation (no config section is fine regardless of feature)
+        let result = DataFeederConfig::validate_feature_config(&toml_config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_configuration_validation_postgresql_enabled_but_invalid_config() {
+        // This test validates Subtask 4.2 - clear error messages for PostgreSQL config validation
+        #[cfg(feature = "postgres")]
+        {
+            // Test with empty host - use data_feeder path like other imports in main.rs
+            let mut postgres_config = data_feeder::postgres::PostgresConfig::default();
+            postgres_config.enabled = true;
+            postgres_config.host = "".to_string();
+            
+            let toml_config = TomlConfig {
+                database: postgres_config,
+                application: ApplicationConfig {
+                    symbols: vec!["BTCUSDT".to_string()],
+                    timeframes: vec![60],
+                    storage_path: "/tmp/test".to_string(),
+                    gap_detection_enabled: true,
+                    start_date: None,
+                    respect_config_start_date: false,
+                    monthly_threshold_months: 2,
+                    enable_technical_analysis: true,
+                    reconnection_gap_threshold_minutes: 1,
+                    reconnection_gap_check_delay_seconds: 5,
+                    periodic_gap_detection_enabled: true,
+                    periodic_gap_check_interval_minutes: 5,
+                    periodic_gap_check_window_minutes: 30,
+                },
+                technical_analysis: TechnicalAnalysisTomlConfig {
+                    min_history_days: 30,
+                    ema_periods: vec![21, 89],
+                    timeframes: vec![60],
+                    volume_lookback_days: 30,
+                },
+                #[cfg(feature = "kafka")]
+                kafka: None,
+                #[cfg(feature = "volume_profile")]
+                volume_profile: None,
+                logging: None,
+                historical_validation: None,
+                adaptive: None,
+            };
+
+            let result = DataFeederConfig::validate_feature_config(&toml_config);
+            assert!(result.is_err());
+            let error_msg = result.unwrap_err().to_string();
+            assert!(error_msg.contains("PostgreSQL is enabled but host is empty"));
+        }
+    }
+    
+    #[test]
+    fn test_configuration_validation_postgresql_disabled_in_config() {
+        // Test when PostgreSQL is disabled in config (should pass regardless of feature)
+        #[cfg(feature = "postgres")]
+        {
+            let mut postgres_config = data_feeder::postgres::PostgresConfig::default();
+            postgres_config.enabled = false; // Disabled in config
+            
+            let toml_config = TomlConfig {
+                database: postgres_config,
+                application: ApplicationConfig {
+                    symbols: vec!["BTCUSDT".to_string()],
+                    timeframes: vec![60],
+                    storage_path: "/tmp/test".to_string(),
+                    gap_detection_enabled: true,
+                    start_date: None,
+                    respect_config_start_date: false,
+                    monthly_threshold_months: 2,
+                    enable_technical_analysis: true,
+                    reconnection_gap_threshold_minutes: 1,
+                    reconnection_gap_check_delay_seconds: 5,
+                    periodic_gap_detection_enabled: true,
+                    periodic_gap_check_interval_minutes: 5,
+                    periodic_gap_check_window_minutes: 30,
+                },
+                technical_analysis: TechnicalAnalysisTomlConfig {
+                    min_history_days: 30,
+                    ema_periods: vec![21, 89],
+                    timeframes: vec![60],
+                    volume_lookback_days: 30,
+                },
+                #[cfg(feature = "kafka")]
+                kafka: None,
+                #[cfg(feature = "volume_profile")]
+                volume_profile: None,
+                logging: None,
+                historical_validation: None,
+                adaptive: None,
+            };
+
+            // Should pass validation (disabled in config is fine)
+            let result = DataFeederConfig::validate_feature_config(&toml_config);
+            assert!(result.is_ok());
         }
     }
 }

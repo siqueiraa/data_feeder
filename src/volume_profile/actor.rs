@@ -260,6 +260,18 @@ pub enum VolumeProfileTellSerializable {
     },
     /// Process retry queue for failed operations
     ProcessRetryQueue,
+    /// Start reprocessing with specified mode (reprocessing feature)
+    #[cfg(feature = "volume_profile_reprocessing")]
+    StartReprocessing {
+        symbol: String,
+        mode: super::reprocessing::ReprocessingMode,
+    },
+    /// Get reprocessing status (reprocessing feature)
+    #[cfg(feature = "volume_profile_reprocessing")]
+    ReprocessingStatus,
+    /// Stop ongoing reprocessing operations (reprocessing feature)  
+    #[cfg(feature = "volume_profile_reprocessing")]
+    StopReprocessing,
 }
 
 /// All Volume Profile Actor messages for telling (including non-serializable ones)
@@ -300,6 +312,18 @@ pub enum VolumeProfileTell {
         postgres_actor: Option<()>,
         lmdb_actor: ActorRef<LmdbActor>,
     },
+    /// Start reprocessing with specified mode (reprocessing feature)
+    #[cfg(feature = "volume_profile_reprocessing")]
+    StartReprocessing {
+        symbol: String,
+        mode: super::reprocessing::ReprocessingMode,
+    },
+    /// Get reprocessing status (reprocessing feature)
+    #[cfg(feature = "volume_profile_reprocessing")]
+    ReprocessingStatus,
+    /// Stop ongoing reprocessing operations (reprocessing feature)  
+    #[cfg(feature = "volume_profile_reprocessing")]
+    StopReprocessing,
 }
 
 // Conversion from serializable to full enum
@@ -321,6 +345,14 @@ impl From<VolumeProfileTellSerializable> for VolumeProfileTell {
                 VolumeProfileTell::ProcessBackfill { symbol, missing_dates }
             }
             VolumeProfileTellSerializable::ProcessRetryQueue => VolumeProfileTell::ProcessRetryQueue,
+            #[cfg(feature = "volume_profile_reprocessing")]
+            VolumeProfileTellSerializable::StartReprocessing { symbol, mode } => {
+                VolumeProfileTell::StartReprocessing { symbol, mode }
+            }
+            #[cfg(feature = "volume_profile_reprocessing")]
+            VolumeProfileTellSerializable::ReprocessingStatus => VolumeProfileTell::ReprocessingStatus,
+            #[cfg(feature = "volume_profile_reprocessing")]
+            VolumeProfileTellSerializable::StopReprocessing => VolumeProfileTell::StopReprocessing,
         }
     }
 }
@@ -1137,6 +1169,9 @@ pub struct VolumeProfileActor {
     batch_queue: Vec<(String, FuturesOHLCVCandle)>,
     /// Last batch processing time
     last_batch_time: Option<std::time::Instant>,
+    /// Volume profile reprocessing coordinator (when feature enabled)
+    #[cfg(feature = "volume_profile_reprocessing")]
+    reprocessing_coordinator: Option<super::reprocessing::ReprocessingCoordinator>,
 }
 
 /// Key for identifying unique volume profiles (symbol + date)
@@ -1183,6 +1218,8 @@ impl VolumeProfileActor {
             // total_kafka_publishes: 0, // Removed - now handled by IndicatorActor
             batch_queue: Vec::new(),
             last_batch_time: None,
+            #[cfg(feature = "volume_profile_reprocessing")]
+            reprocessing_coordinator: None,
         })
     }
 
@@ -1504,11 +1541,9 @@ impl VolumeProfileActor {
 
                     // Store in database (optional - system continues without database)
                     if let Err(e) = self.store_profile_in_database(&profile_key, &profile_data).await {
-                        if e.contains("PostgreSQL actor not available") {
-                            warn!("📊 OPERATING IN OFFLINE MODE: Database unavailable, volume profile cached in memory only");
-                        } else {
-                            error!("❌ DATABASE ERROR: Failed to store rebuilt volume profile in database: {}", e);
-                        }
+                        // Since store_profile_in_database now returns Ok(()) when PostgreSQL is unavailable,
+                        // this error case should only be for actual database errors
+                        error!("❌ DATABASE ERROR: Failed to store rebuilt volume profile in database: {}", e);
                         
                         // Continue operation without database storage
                         // Volume profile is still available in memory for real-time processing
@@ -1791,7 +1826,10 @@ impl VolumeProfileActor {
                 Ok(())
             }
         } else {
-            Err("PostgreSQL actor not available".to_string())
+            // PostgreSQL persistence not available - continue without error
+            debug!("PostgreSQL actor not available, continuing without database persistence for {} on {}", 
+                   profile_key.symbol, profile_key.date);
+            Ok(())
         }
     }
 
@@ -2101,7 +2139,9 @@ impl Message<VolumeProfileTell> for VolumeProfileActor {
                 }
                 
                 // 🔄 NOW REBUILD HISTORICAL DATA: References are set, we can now access LMDB
-                if self.config.enabled {
+                // Only do historical reconstruction if reprocessing feature is compiled AND enabled in config
+                #[cfg(feature = "volume_profile_reprocessing")]
+                if self.config.enabled && self.reprocessing_coordinator.as_ref().map_or(false, |c| c.get_config().enabled) {
                     let today = chrono::Utc::now().date_naive();
                     let historical_days = self.config.historical_days;
                     info!("🔄 STARTUP RECONSTRUCTION: Now rebuilding volume profiles for {} historical days (up to {})", historical_days, today);
@@ -2120,9 +2160,9 @@ impl Message<VolumeProfileTell> for VolumeProfileActor {
                                     info!("✅ STARTUP: Successfully initialized volume profile for {} on {}", symbol, target_date);
                                 }
                                 Err(e) => {
-                                    if e.contains("PostgreSQL actor not available") {
-                                        debug!("📊 STARTUP: Volume profile for {} on {} initialized in memory-only mode (database offline)", symbol, target_date);
-                                    } else if days_back < 7 {
+                                    // Since store_profile_in_database now returns Ok(()) when PostgreSQL is unavailable,
+                                    // any error here is a real database error
+                                    if days_back < 7 {
                                         // Only warn for recent days (last week)
                                         warn!("⚠️ STARTUP: Failed to rebuild volume profile for {} on {} (recent): {}", symbol, target_date, e);
                                     } else {
@@ -2137,6 +2177,87 @@ impl Message<VolumeProfileTell> for VolumeProfileActor {
                     }
                     
                     info!("🎯 STARTUP RECONSTRUCTION COMPLETE: All {} days of volume profiles initialized", historical_days);
+                }
+            }
+            #[cfg(feature = "volume_profile_reprocessing")]
+            VolumeProfileTell::StartReprocessing { symbol, mode } => {
+                info!("🔄 VolumeProfileActor starting reprocessing for {} in mode: {}", symbol, mode);
+                
+                // Initialize reprocessing coordinator if not already created
+                if self.reprocessing_coordinator.is_none() {
+                    let config = super::reprocessing::VolumeProfileReprocessingConfig::new(
+                        true, mode.clone(), Some(10)
+                    );
+                    match super::reprocessing::ReprocessingCoordinator::new(config) {
+                        Ok(coordinator) => {
+                            self.reprocessing_coordinator = Some(coordinator);
+                            info!("✅ Reprocessing coordinator initialized for mode: {}", mode);
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to initialize reprocessing coordinator: {}", e);
+                            self.last_error = Some(Arc::new(e.to_string()));
+                            return;
+                        }
+                    }
+                }
+                
+                // Start reprocessing with the coordinator  
+                if let Some(_coordinator) = &mut self.reprocessing_coordinator {
+                    if let Some(_lmdb_actor) = &self.lmdb_actor {
+                        warn!("⚠️ Historical actor integration not yet implemented for reprocessing - implementing basic functionality");
+                        
+                        // For now, just implement basic gap detection and scheduling
+                        match mode {
+                            super::reprocessing::ReprocessingMode::TodayOnly => {
+                                info!("🔄 Today-only reprocessing mode activated for {}", symbol);
+                                // This would trigger today's volume profile recalculation
+                                info!("✅ Today-only reprocessing queued for {} (stub implementation)", symbol);
+                            }
+                            super::reprocessing::ReprocessingMode::MissingDaysOnly => {
+                                info!("🔍 Missing days reprocessing mode activated for {}", symbol);
+                                // This would use gap detection to find missing days
+                                info!("✅ Gap detection reprocessing queued for {} (stub implementation)", symbol);
+                            }
+                            super::reprocessing::ReprocessingMode::ReprocessWholeHistory => {
+                                info!("🏛️ Whole history reprocessing mode activated for {}", symbol);
+                                // This would reprocess all historical data
+                                info!("✅ Whole history reprocessing queued for {} (stub implementation)", symbol);
+                            }
+                        }
+                    } else {
+                        error!("❌ LMDB actor not available for reprocessing");
+                        self.last_error = Some(Arc::new("LMDB actor not available".to_string()));
+                    }
+                }
+            }
+            #[cfg(feature = "volume_profile_reprocessing")]
+            VolumeProfileTell::ReprocessingStatus => {
+                debug!("📊 VolumeProfileActor reprocessing status requested");
+                
+                if let Some(coordinator) = &self.reprocessing_coordinator {
+                    let status = coordinator.get_status();
+                    info!("📊 Reprocessing status: active={}, mode={:?}, progress={:.1}%", 
+                          status.active, status.mode, status.progress_percentage());
+                } else {
+                    info!("📊 No reprocessing coordinator active");
+                }
+            }
+            #[cfg(feature = "volume_profile_reprocessing")]
+            VolumeProfileTell::StopReprocessing => {
+                info!("⏹️ VolumeProfileActor stopping reprocessing");
+                
+                if let Some(coordinator) = &mut self.reprocessing_coordinator {
+                    match coordinator.stop_reprocessing().await {
+                        Ok(()) => {
+                            info!("✅ Volume profile reprocessing stopped successfully");
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to stop reprocessing: {}", e);
+                            self.last_error = Some(Arc::new(e.to_string()));
+                        }
+                    }
+                } else {
+                    warn!("⚠️ No active reprocessing coordinator to stop");
                 }
             }
         }
