@@ -92,6 +92,12 @@ impl BufferPoolStats {
     }
 }
 
+impl Default for BufferPoolStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Message type for WebSocket processing thread pool
 #[derive(Debug, Clone)]
 pub enum WebSocketTask {
@@ -478,21 +484,153 @@ impl WebSocketActor {
     }
     
     /// Process WebSocket message in worker thread (static method for thread pool)
-    fn process_message_in_thread(message: &str, timestamp: i64) -> Result<(), WebSocketError> {
-        // TODO: Implement actual message parsing and processing
-        // This is a placeholder for the thread pool processing logic
-        // The actual implementation will integrate with sonic-rs for zero-copy parsing
+    pub fn process_message_in_thread(message: &str, _timestamp: i64) -> Result<(), WebSocketError> {
+        use crate::record_operation_duration;
+        let start_time = std::time::Instant::now();
         
-        debug!("Processing WebSocket message in thread: {} chars, timestamp: {}", message.len(), timestamp);
-        
-        // Simulate processing time
+        // Validate message is not empty
         if message.is_empty() {
-            return Err(WebSocketError::Connection("Empty message".to_string()));
+            return Err(WebSocketError::Connection("Empty message received".to_string()));
+        }
+
+        // Pre-validate message format to avoid unnecessary parsing overhead
+        if !message.starts_with('{') || !message.ends_with('}') {
+            return Err(WebSocketError::Parse("Invalid JSON format".to_string()));
+        }
+
+        // Use optimized parser for zero-copy parsing with enhanced error context
+        let kline_event = match parse_any_kline_message_optimized(message) {
+            Ok(event) => event,
+            Err(e) => {
+                error!("Failed to parse WebSocket message ({}B): {}", message.len(), e);
+                return Err(e);
+            }
+        };
+
+        // Validate parsed data integrity
+        Self::validate_kline_event(&kline_event)?;
+
+        // Use string interning for the symbol to reduce allocations
+        let interned_symbol = intern_symbol(&kline_event.symbol);
+        
+        // Convert BinanceKlineEvent to FuturesOHLCVCandle
+        let candle = Self::convert_kline_to_candle(&kline_event)?;
+        
+        // Create shared candle for zero-copy operations
+        let _shared_candle = shared_candle(candle.clone());
+        
+        // Process only closed candles for historical storage
+        if candle.closed {
+            debug!("🕯️ Processed closed candle for {} at {}: O:{} H:{} L:{} C:{} V:{}", 
+                   interned_symbol, candle.open_time, candle.open, candle.high, 
+                   candle.low, candle.close, candle.volume);
+                   
+            // Record performance metrics
+            record_operation_duration!("websocket", "message_processing", start_time.elapsed().as_secs_f64());
+        } else {
+            // For real-time updates, we could send to a different channel here
+            debug!("📊 Processed real-time candle update for {} at {}", 
+                   interned_symbol, candle.open_time);
         }
         
-        // Placeholder: In real implementation, this would parse JSON and extract candle data
-        // using sonic-rs for zero-copy parsing
+        // Validate processing time meets performance target (<30ms)
+        let processing_time = start_time.elapsed();
+        if processing_time > std::time::Duration::from_millis(30) {
+            warn!("⚠️ Slow WebSocket processing took {:?} (target: <30ms)", processing_time);
+        } else {
+            debug!("✅ Fast WebSocket processing completed in {:?}", processing_time);
+        }
+
         Ok(())
+    }
+
+    /// Validate BinanceKlineEvent data integrity
+    pub fn validate_kline_event(event: &crate::websocket::binance::kline::BinanceKlineEvent) -> Result<(), WebSocketError> {
+        // Validate event type
+        if event.event_type != "kline" {
+            return Err(WebSocketError::Parse(format!(
+                "Invalid event type: expected 'kline', got '{}'", event.event_type
+            )));
+        }
+
+        // Validate symbol is not empty
+        if event.symbol.is_empty() {
+            return Err(WebSocketError::Parse("Symbol cannot be empty".to_string()));
+        }
+
+        // Validate timestamp ranges
+        if event.event_time <= 0 {
+            return Err(WebSocketError::Parse("Invalid event time".to_string()));
+        }
+
+        // Validate kline data
+        if event.kline.start_time <= 0 || event.kline.close_time <= 0 {
+            return Err(WebSocketError::Parse("Invalid kline timestamps".to_string()));
+        }
+
+        if event.kline.start_time >= event.kline.close_time {
+            return Err(WebSocketError::Parse("Start time must be less than close time".to_string()));
+        }
+
+        // Validate price data (strings should be parseable as f64)
+        Self::validate_price_string(&event.kline.open, "open")?;
+        Self::validate_price_string(&event.kline.high, "high")?;
+        Self::validate_price_string(&event.kline.low, "low")?;
+        Self::validate_price_string(&event.kline.close, "close")?;
+        Self::validate_price_string(&event.kline.volume, "volume")?;
+        Self::validate_price_string(&event.kline.taker_buy_base_asset_volume, "taker_buy_base_asset_volume")?;
+
+        Ok(())
+    }
+
+    /// Validate price string can be parsed as f64
+    pub fn validate_price_string(price_str: &str, field_name: &str) -> Result<(), WebSocketError> {
+        price_str.parse::<f64>()
+            .map_err(|_| WebSocketError::Parse(format!(
+                "Invalid {} price: cannot parse '{}' as float", field_name, price_str
+            )))?;
+        Ok(())
+    }
+
+    /// Convert BinanceKlineEvent to FuturesOHLCVCandle
+    pub fn convert_kline_to_candle(event: &crate::websocket::binance::kline::BinanceKlineEvent) -> Result<FuturesOHLCVCandle, WebSocketError> {
+        // Parse string prices to f64
+        let open = event.kline.open.parse::<f64>()
+            .map_err(|e| WebSocketError::Parse(format!("Failed to parse open price: {}", e)))?;
+        let high = event.kline.high.parse::<f64>()
+            .map_err(|e| WebSocketError::Parse(format!("Failed to parse high price: {}", e)))?;
+        let low = event.kline.low.parse::<f64>()
+            .map_err(|e| WebSocketError::Parse(format!("Failed to parse low price: {}", e)))?;
+        let close = event.kline.close.parse::<f64>()
+            .map_err(|e| WebSocketError::Parse(format!("Failed to parse close price: {}", e)))?;
+        let volume = event.kline.volume.parse::<f64>()
+            .map_err(|e| WebSocketError::Parse(format!("Failed to parse volume: {}", e)))?;
+        let taker_buy_base_asset_volume = event.kline.taker_buy_base_asset_volume.parse::<f64>()
+            .map_err(|e| WebSocketError::Parse(format!("Failed to parse taker buy base asset volume: {}", e)))?;
+
+        // Validate price relationships
+        if high < low {
+            return Err(WebSocketError::Parse("High price cannot be less than low price".to_string()));
+        }
+        if high < open || high < close {
+            return Err(WebSocketError::Parse("High price must be >= open and close prices".to_string()));
+        }
+        if low > open || low > close {
+            return Err(WebSocketError::Parse("Low price must be <= open and close prices".to_string()));
+        }
+
+        Ok(FuturesOHLCVCandle::new_from_values(
+            event.kline.start_time,
+            event.kline.close_time,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            event.kline.number_of_trades as u64,
+            taker_buy_base_asset_volume,
+            event.kline.is_kline_closed,
+        ))
     }
     
     /// Send message to thread pool for processing

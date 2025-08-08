@@ -6,6 +6,7 @@ use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
 
 use crate::historical::structs::{FuturesOHLCVCandle, TimestampMS};
+use crate::common::shared_data::new_symbol_hashmap;
 use super::structs::{
     VolumeProfileConfig, VolumeProfileData, ValueArea, 
     PriceLevelMap, PriceIncrementMode, PriceKey, ResolvedAssetConfig,
@@ -670,16 +671,16 @@ mod tests {
             enabled: true,
             price_increment_mode: PriceIncrementMode::Fixed,
             target_price_levels: 200,
-            fixed_price_increment: 0.01,
-            min_price_increment: 0.001,
-            max_price_increment: 1.0,
+            fixed_price_increment: dec!(0.01),
+            min_price_increment: dec!(0.001),
+            max_price_increment: dec!(1.0),
             update_frequency: super::super::structs::UpdateFrequency::EveryCandle,
             batch_size: 1,
-            value_area_percentage: 70.0,
+            value_area_percentage: dec!(70.0),
             volume_distribution_mode: VolumeDistributionMode::ClosingPrice,
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
             calculation_mode: VolumeProfileCalculationMode::Volume,
-            asset_overrides: std::collections::HashMap::new(),
+            asset_overrides: new_symbol_hashmap(),
             historical_days: 60,
         }
     }
@@ -708,7 +709,7 @@ mod tests {
         assert_eq!(profile.symbol, "BTCUSDT");
         assert_eq!(profile.date, date);
         assert_eq!(profile.candle_count, 0);
-        assert_eq!(profile.total_volume, 0.0);
+        assert_eq!(profile.total_volume, dec!(0.0));
         assert!(profile.is_empty());
     }
 
@@ -725,12 +726,12 @@ mod tests {
         profile.add_candle(&candle);
 
         assert_eq!(profile.candle_count, 1);
-        assert_eq!(profile.total_volume, 1000.0);
+        assert_eq!(profile.total_volume, dec!(1000.0));
         assert!(!profile.is_empty());
         
         let stats = profile.get_statistics();
         assert_eq!(stats.candle_count, 1);
-        assert_eq!(stats.total_volume, 1000.0);
+        assert_eq!(stats.total_volume, dec!(1000.0));
         assert!(stats.price_levels_count > 0);
     }
 
@@ -748,18 +749,18 @@ mod tests {
         
         // With time-based distribution (close price only), should have 1 price level
         assert_eq!(profile_data.price_levels.len(), 1);
-        assert_eq!(profile_data.price_levels[0].price, 101.0);
-        assert_eq!(profile_data.price_levels[0].volume, 1000.0);
+        assert_eq!(profile_data.price_levels[0].price, dec!(101.0));
+        assert_eq!(profile_data.price_levels[0].volume, dec!(1000.0));
         
         // Total volume should equal candle volume
-        let total_distributed_volume: f64 = profile_data.price_levels.iter().map(|p| p.volume).sum();
-        assert!((total_distributed_volume - 1000.0).abs() < 0.01);
+        let total_distributed_volume: Decimal = profile_data.price_levels.iter().map(|p| p.volume).sum();
+        assert!((total_distributed_volume - dec!(1000.0)).abs() < dec!(0.01));
         
         // VWAP should equal close price for single candle
-        assert!((profile_data.vwap - 101.0).abs() < 0.01);
+        assert!((profile_data.vwap - dec!(101.0)).abs() < dec!(0.01));
         
         // POC should equal close price
-        assert!((profile_data.poc - 101.0).abs() < 0.01);
+        assert!((profile_data.poc - dec!(101.0)).abs() < dec!(0.01));
     }
 
     #[test]
@@ -781,7 +782,7 @@ mod tests {
         }
 
         assert_eq!(profile.candle_count, 3);
-        assert_eq!(profile.total_volume, 3300.0);
+        assert_eq!(profile.total_volume, dec!(3300.0));
 
         let profile_data = profile.get_profile_data();
         
@@ -790,7 +791,7 @@ mod tests {
         
         // With 3 discrete price levels, value area should include highest volume levels
         // to achieve as close to 70% as possible with available levels
-        assert!(profile_data.value_area.volume_percentage >= 60.0, 
+        assert!(profile_data.value_area.volume_percentage >= dec!(60.0), 
                 "Value area should capture majority of volume, got {:.2}%", 
                 profile_data.value_area.volume_percentage);
         
@@ -816,11 +817,11 @@ mod tests {
         profile.rebuild_from_candles(&candles);
 
         assert_eq!(profile.candle_count, 2);
-        assert_eq!(profile.total_volume, 2500.0);
+        assert_eq!(profile.total_volume, dec!(2500.0));
         
         let profile_data = profile.get_profile_data();
         assert!(!profile_data.price_levels.is_empty());
-        assert!(profile_data.vwap > 0.0);
+        assert!(profile_data.vwap > dec!(0.0));
     }
 
     #[test]
@@ -837,7 +838,7 @@ mod tests {
 
         // Should not add candle from wrong date
         assert_eq!(profile.candle_count, 0);
-        assert_eq!(profile.total_volume, 0.0);
+        assert_eq!(profile.total_volume, dec!(0.0));
         assert!(profile.is_empty());
     }
 
@@ -845,19 +846,19 @@ mod tests {
     fn test_adaptive_price_increment() {
         let mut config = create_test_config();
         config.price_increment_mode = PriceIncrementMode::Adaptive;
-        config.min_price_increment = 0.001;
-        config.max_price_increment = 1.0;
+        config.min_price_increment = dec!(0.001);
+        config.max_price_increment = dec!(1.0);
 
         // Resolve config for testing
         let resolved_config = config.resolve_for_asset("TESTUSDT");
         
         // Test with small price range
-        let small_range_increment = DailyVolumeProfile::calculate_price_increment(&resolved_config, Some(1.0));
+        let small_range_increment = DailyVolumeProfile::calculate_price_increment(&resolved_config, Some(dec!(1.0)));
         assert!(small_range_increment >= resolved_config.min_price_increment);
         assert!(small_range_increment <= resolved_config.max_price_increment);
 
         // Test with large price range
-        let large_range_increment = DailyVolumeProfile::calculate_price_increment(&resolved_config, Some(1000.0));
+        let large_range_increment = DailyVolumeProfile::calculate_price_increment(&resolved_config, Some(dec!(1000.0)));
         assert!(large_range_increment >= resolved_config.min_price_increment);
         assert!(large_range_increment <= resolved_config.max_price_increment);
         assert!(large_range_increment > small_range_increment);
@@ -915,23 +916,27 @@ mod tests {
         let uniform_data = uniform_profile.get_profile_data();
         
         // Both should have same total volume
-        assert_eq!(closing_data.total_volume, 1000.0);
-        assert_eq!(uniform_data.total_volume, 1000.0);
+        assert_eq!(closing_data.total_volume, dec!(1000.0));
+        assert_eq!(uniform_data.total_volume, dec!(1000.0));
         
         // Closing price should have 1 price level (all at close)
         assert_eq!(closing_data.price_levels.len(), 1);
-        assert_eq!(closing_data.price_levels[0].price, 102.0);
-        assert_eq!(closing_data.price_levels[0].volume, 1000.0);
+        assert_eq!(closing_data.price_levels[0].price, dec!(102.0));
+        assert_eq!(closing_data.price_levels[0].volume, dec!(1000.0));
         
         // Uniform should have multiple price levels across the range
         assert!(uniform_data.price_levels.len() > 1);
         
         // Check that uniform distribution spreads across expected range
-        let min_price = uniform_data.price_levels.iter().map(|p| p.price).fold(f64::INFINITY, f64::min);
-        let max_price = uniform_data.price_levels.iter().map(|p| p.price).fold(f64::NEG_INFINITY, f64::max);
+        let min_price = uniform_data.price_levels.iter()
+            .map(|p| p.price)
+            .fold(Decimal::MAX, |acc, price| if price < acc { price } else { acc });
+        let max_price = uniform_data.price_levels.iter()
+            .map(|p| p.price)
+            .fold(Decimal::MIN, |acc, price| if price > acc { price } else { acc });
         
-        assert!(min_price >= 96.0);
-        assert!(max_price <= 104.0);
+        assert!(min_price >= dec!(96.0));
+        assert!(max_price <= dec!(104.0));
     }
 
     #[test]
@@ -974,14 +979,14 @@ mod tests {
         // Value areas should both target 70% but may differ in range
         // Traditional method expands contiguously from POC, may include less volume
         // Greedy method selects highest volume levels regardless of contiguity
-        assert!(traditional_data.value_area.volume_percentage >= 0.0);
-        assert!(traditional_data.value_area.volume_percentage <= 100.0);
-        assert!(greedy_data.value_area.volume_percentage >= 0.0);
-        assert!(greedy_data.value_area.volume_percentage <= 100.0);
+        assert!(traditional_data.value_area.volume_percentage >= dec!(0.0));
+        assert!(traditional_data.value_area.volume_percentage <= dec!(100.0));
+        assert!(greedy_data.value_area.volume_percentage >= dec!(0.0));
+        assert!(greedy_data.value_area.volume_percentage <= dec!(100.0));
         
         // Both should include high-volume areas but may select differently
-        assert!(traditional_data.value_area.volume > 0.0);
-        assert!(greedy_data.value_area.volume > 0.0);
+        assert!(traditional_data.value_area.volume > dec!(0.0));
+        assert!(greedy_data.value_area.volume > dec!(0.0));
     }
 
     #[test]
@@ -1061,27 +1066,27 @@ mod tests {
         let tpo_data = tpo_profile.get_profile_data();
         
         // Both should have same total volume and candle count
-        assert_eq!(volume_data.total_volume, 1850.0, "Total volume should be 1850");
-        assert_eq!(tpo_data.total_volume, 1850.0, "Total volume should be same for both methods");
+        assert_eq!(volume_data.total_volume, dec!(1850.0), "Total volume should be 1850");
+        assert_eq!(tpo_data.total_volume, dec!(1850.0), "Total volume should be same for both methods");
         assert_eq!(volume_data.candle_count, 8, "Should have 8 candles");
         assert_eq!(tpo_data.candle_count, 8, "Should have same candle count");
         
         // Volume method POC should be at price 100 (1000 volume)
-        assert_eq!(volume_data.poc, 100.0, "Volume POC should be at price 100");
+        assert_eq!(volume_data.poc, dec!(100.0), "Volume POC should be at price 100");
         
         // TPO method POC should be at price 101 (5 candles)
-        assert_eq!(tpo_data.poc, 101.0, "TPO POC should be at price 101");
+        assert_eq!(tpo_data.poc, dec!(101.0), "TPO POC should be at price 101");
         
         // Both should have valid value areas
         assert!(volume_data.value_area.high >= volume_data.value_area.low, "Volume VA should have valid range");
         assert!(tpo_data.value_area.high >= tpo_data.value_area.low, "TPO VA should have valid range");
         
         // Volume method should include price 100 in value area
-        assert!(volume_data.value_area.low <= 100.0 && volume_data.value_area.high >= 100.0, 
+        assert!(volume_data.value_area.low <= dec!(100.0) && volume_data.value_area.high >= dec!(100.0), 
                 "Volume method should include price 100 in value area");
         
         // TPO method should include price 101 in value area
-        assert!(tpo_data.value_area.low <= 101.0 && tpo_data.value_area.high >= 101.0, 
+        assert!(tpo_data.value_area.low <= dec!(101.0) && tpo_data.value_area.high >= dec!(101.0), 
                 "TPO method should include price 101 in value area");
     }
 
@@ -1107,9 +1112,9 @@ mod tests {
         let profile_data = profile.get_profile_data();
         
         // Should handle equal volumes gracefully
-        assert!(profile_data.poc >= 100.0 && profile_data.poc <= 102.0, 
+        assert!(profile_data.poc >= dec!(100.0) && profile_data.poc <= dec!(102.0), 
                 "POC should be within price range for equal volumes");
-        assert!(profile_data.value_area.volume_percentage > 0.0, 
+        assert!(profile_data.value_area.volume_percentage > dec!(0.0), 
                 "Should calculate reasonable value area percentage");
         assert!(profile_data.value_area.high >= profile_data.value_area.low, 
                 "Should maintain valid value area range");
@@ -1137,7 +1142,7 @@ mod tests {
         }
         
         let volume_data = profile.get_profile_data();
-        assert_eq!(volume_data.poc, 100.0, "Volume method should identify POC at 100.0");
+        assert_eq!(volume_data.poc, dec!(100.0), "Volume method should identify POC at 100.0");
         
         // Switch to TPO method (simulating runtime configuration change)
         config.calculation_mode = VolumeProfileCalculationMode::TPO;
@@ -1148,7 +1153,7 @@ mod tests {
         }
         
         let tpo_data = tpo_profile.get_profile_data();
-        assert_eq!(tpo_data.poc, 101.0, "TPO method should identify POC at 101.0");
+        assert_eq!(tpo_data.poc, dec!(101.0), "TPO method should identify POC at 101.0");
         
         // Both should maintain data integrity
         assert_eq!(volume_data.total_volume, tpo_data.total_volume, "Total volume should be consistent");
@@ -1184,7 +1189,7 @@ mod tests {
         assert!(profile_data.poc >= profile_data.value_area.low && profile_data.poc <= profile_data.value_area.high, 
                 "POC should be within value area: POC={:.2}, VAL={:.2}, VAH={:.2}", 
                 profile_data.poc, profile_data.value_area.low, profile_data.value_area.high);
-        assert!(profile_data.value_area.volume_percentage >= 50.0 && profile_data.value_area.volume_percentage <= 100.0, 
+        assert!(profile_data.value_area.volume_percentage >= dec!(50.0) && profile_data.value_area.volume_percentage <= dec!(100.0), 
                 "Value area percentage should be reasonable: {:.2}%", profile_data.value_area.volume_percentage);
     }
 
@@ -1275,7 +1280,7 @@ mod tests {
         let metrics = profile.get_cache_metrics();
         assert_eq!(metrics.hits, 1);
         assert_eq!(metrics.misses, 1);
-        assert_eq!(metrics.hit_rate, 0.5);
+        assert_eq!(metrics.hit_rate, dec!(0.5));
     }
     
     #[test]
@@ -1286,12 +1291,12 @@ mod tests {
         let initial_metrics = coordinator.get_cache_metrics();
         assert_eq!(initial_metrics.hits, 0);
         assert_eq!(initial_metrics.misses, 0);
-        assert_eq!(initial_metrics.hit_rate, 0.0);
+        assert_eq!(initial_metrics.hit_rate, dec!(0.0));
         
         // Test cache operations with timing
         std::thread::sleep(std::time::Duration::from_millis(1));
         coordinator.invalidate_before_update();
-        assert!(coordinator.last_invalidation_time_ms > 0.0);
+        assert!(coordinator.last_invalidation_time_ms > dec!(0.0));
         
         std::thread::sleep(std::time::Duration::from_millis(1));
         coordinator.reset_after_recalculation();
@@ -1305,7 +1310,7 @@ mod tests {
         let final_metrics = coordinator.get_cache_metrics();
         assert_eq!(final_metrics.hits, 2);
         assert_eq!(final_metrics.misses, 1);
-        assert!((final_metrics.hit_rate - (2.0/3.0)).abs() < 0.01);
+        assert!((final_metrics.hit_rate - (dec!(2.0)/dec!(3.0))).abs() < dec!(0.01));
     }
     
     #[test]
@@ -1325,15 +1330,15 @@ mod tests {
         let _data = profile.get_profile_data();
         
         let metrics = profile.get_cache_metrics();
-        assert!(metrics.last_invalidation_time_ms > 0.0, "Should have invalidation timing");
-        assert!(metrics.last_recalculation_time_ms > 0.0, "Should have recalculation timing");
+        assert!(metrics.last_invalidation_time_ms > dec!(0.0), "Should have invalidation timing");
+        assert!(metrics.last_recalculation_time_ms > dec!(0.0), "Should have recalculation timing");
         assert_eq!(metrics.misses, 1, "Should record cache miss");
         
         // Second access should be a hit
         let _data2 = profile.get_profile_data();
         let metrics2 = profile.get_cache_metrics();
         assert_eq!(metrics2.hits, 1, "Should record cache hit");
-        assert_eq!(metrics2.hit_rate, 0.5, "Hit rate should be 50%");
+        assert_eq!(metrics2.hit_rate, dec!(0.5), "Hit rate should be 50%");
     }
     
     #[test]
@@ -1361,14 +1366,14 @@ mod tests {
         assert_eq!(debug.algorithm_version, "1.4.0", "Should have correct algorithm version");
         
         // Verify precision metrics
-        assert!(debug.precision_metrics.price_range_span > 0.0, "Should have price range span");
-        assert_eq!(debug.precision_metrics.price_increment_used, 0.01, "Should track price increment");
+        assert!(debug.precision_metrics.price_range_span > dec!(0.0), "Should have price range span");
+        assert_eq!(debug.precision_metrics.price_increment_used, dec!(0.01), "Should track price increment");
         assert!(debug.precision_metrics.total_price_keys > 0, "Should count price keys");
-        assert!((debug.precision_metrics.volume_conservation_check - 1.0).abs() < 0.01, 
+        assert!((debug.precision_metrics.volume_conservation_check - dec!(1.0)).abs() < dec!(0.01), 
                 "Volume conservation should be close to 1.0");
         
         // Verify performance metrics
-        assert!(debug.performance_metrics.value_area_calculation_time_ms >= 0.0, "Should have timing data");
+        assert!(debug.performance_metrics.value_area_calculation_time_ms >= dec!(0.0), "Should have timing data");
         assert_eq!(debug.performance_metrics.cache_operations_count, 3, "Should count cache operations");
         assert_eq!(debug.performance_metrics.candles_processed_count, 1, "Should count processed candles");
         assert!(debug.performance_metrics.memory_usage_bytes > 0, "Should estimate memory usage");
@@ -1590,7 +1595,7 @@ mod tests {
         
         profile.add_candle(&valid_candle);
         assert_eq!(profile.candle_count, 1);
-        assert_eq!(profile.total_volume, 1000.0);
+        assert_eq!(profile.total_volume, dec!(1000.0));
 
         // Test that rejected candles are logged but not processed (use clearly invalid timestamp)
         let wrong_timestamp = 1737072000000 + 10 * 60 * 60 * 1000; // 2025-01-17 10:00:00 UTC (next day, well outside boundary)
@@ -1598,6 +1603,6 @@ mod tests {
         
         profile.add_candle(&wrong_candle);
         assert_eq!(profile.candle_count, 1); // Should not increase
-        assert_eq!(profile.total_volume, 1000.0); // Should not change
+        assert_eq!(profile.total_volume, dec!(1000.0)); // Should not change
     }
 }

@@ -23,7 +23,8 @@ use data_feeder::adaptive_config::{AdaptiveConfig, AdaptiveConfigToml};
 use kameo::actor::ActorRef;
 use kameo::request::MessageSend;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use rustc_hash::FxHashMap;
 use thiserror::Error;
 
 // Enhanced Configuration Validation Types (Story 3.5 - Task 1)
@@ -60,7 +61,7 @@ pub enum ConfigErrorType {
 
 #[derive(Debug, Clone)]
 pub struct FeatureDependencyGraph {
-    pub dependencies: HashMap<String, Vec<String>>,
+    pub dependencies: FxHashMap<String, Vec<String>>,
     pub enabled_features: HashSet<String>,
     pub required_features: HashSet<String>,
 }
@@ -111,7 +112,7 @@ impl Default for FeatureDependencyGraph {
 
 impl FeatureDependencyGraph {
     pub fn new() -> Self {
-        let mut dependencies = HashMap::new();
+        let mut dependencies = FxHashMap::default();
         let mut enabled_features = HashSet::new();
         
         // Define feature dependencies (volume_profile_reprocessing requires volume_profile)

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::time::Duration;
 
 use chrono;
@@ -69,20 +69,20 @@ pub enum TimeFrameReply {
 #[derive(Debug)]
 struct SymbolTimeFrameState {
     /// Ring buffers for each timeframe
-    ring_buffers: HashMap<u64, CandleRingBuffer>,
+    ring_buffers: FxHashMap<u64, CandleRingBuffer>,
     /// Whether this symbol is initialized
     is_initialized: bool,
     /// Last processed candle timestamp
     last_candle_time: Option<TimestampMS>,
     /// Track processed candle timestamps for deduplication (close_time -> processed_at)
-    processed_candles: HashMap<TimestampMS, std::time::Instant>,
-    /// MEMORY POOL: Reusable HashMap for completed candles (eliminates HashMap allocations)
-    completed_candles_buffer: HashMap<u64, FuturesOHLCVCandle>,
+    processed_candles: FxHashMap<TimestampMS, std::time::Instant>,
+    /// MEMORY POOL: Reusable FxHashMap for completed candles (eliminates HashMap allocations)
+    completed_candles_buffer: FxHashMap<u64, FuturesOHLCVCandle>,
 }
 
 impl SymbolTimeFrameState {
     fn new(timeframes: &[u64]) -> Self {
-        let mut ring_buffers = HashMap::new();
+        let mut ring_buffers = FxHashMap::default();
         
         // Create ring buffers for each timeframe (except 1-minute)
         for &timeframe in timeframes {
@@ -104,15 +104,15 @@ impl SymbolTimeFrameState {
             ring_buffers,
             is_initialized: false,
             last_candle_time: None,
-            processed_candles: HashMap::new(),
+            processed_candles: FxHashMap::default(),
             // MEMORY POOL: Pre-allocate HashMap for completed candles (typically 4-5 timeframes max)
-            completed_candles_buffer: HashMap::with_capacity(8),
+            completed_candles_buffer: FxHashMap::with_capacity_and_hasher(8, Default::default()),
         }
     }
 
     /// Process a new 1-minute candle and return completed higher timeframe candles
-    fn process_candle(&mut self, candle: &FuturesOHLCVCandle) -> HashMap<u64, FuturesOHLCVCandle> {
-        // MEMORY POOL: Reuse pre-allocated HashMap instead of creating new one each time
+    fn process_candle(&mut self, candle: &FuturesOHLCVCandle) -> FxHashMap<u64, FuturesOHLCVCandle> {
+        // MEMORY POOL: Reuse pre-allocated FxHashMap instead of creating new one each time
         self.completed_candles_buffer.clear();
 
         // DEDUPLICATION: Check if we've already processed this exact candle
@@ -165,7 +165,7 @@ impl SymbolTimeFrameState {
         }
 
         // OPTIMIZATION 2: Direct ring buffer population (skip all real-time overhead)
-        let mut completed_counts = std::collections::HashMap::new();
+        let mut completed_counts = FxHashMap::default();
         for candle in historical_candles {
             // Skip all deduplication, timing, and memory management overhead
             // Use bulk methods that avoid debug logging and real-time checks
@@ -235,7 +235,7 @@ pub struct TimeFrameActor {
     /// Configuration
     config: TechnicalAnalysisConfig,
     /// Symbol-specific state
-    symbol_states: HashMap<String, SymbolTimeFrameState>,
+    symbol_states: FxHashMap<String, SymbolTimeFrameState>,
     /// Reference to indicator actor
     indicator_actor: Option<ActorRef<IndicatorActor>>,
     /// Reference to API actor for gap filling
@@ -247,13 +247,13 @@ pub struct TimeFrameActor {
     /// Reference timestamp for synchronized loading
     reference_timestamp: Option<i64>,
     /// Symbols pending indicator initialization (waiting for gap filling)
-    symbols_pending_indicator_init: HashMap<String, Vec<FuturesOHLCVCandle>>,
+    symbols_pending_indicator_init: FxHashMap<String, Vec<FuturesOHLCVCandle>>,
 }
 
 impl TimeFrameActor {
     /// Create a new TimeFrame actor
     pub fn new(config: TechnicalAnalysisConfig) -> Self {
-        let mut symbol_states = HashMap::new();
+        let mut symbol_states = FxHashMap::default();
         
         // Initialize state for each symbol
         for symbol in &config.symbols {
@@ -269,7 +269,7 @@ impl TimeFrameActor {
             lmdb_actor: None,
             is_ready: false,
             reference_timestamp: None,
-            symbols_pending_indicator_init: HashMap::new(),
+            symbols_pending_indicator_init: FxHashMap::default(),
         }
     }
 
@@ -440,8 +440,8 @@ impl TimeFrameActor {
     }
 
     /// Group candles by day for efficient gap detection
-    fn group_candles_by_day<'a>(&self, candles: &'a [FuturesOHLCVCandle]) -> HashMap<String, Vec<&'a FuturesOHLCVCandle>> {
-        let mut daily_groups = HashMap::new();
+    fn group_candles_by_day<'a>(&self, candles: &'a [FuturesOHLCVCandle]) -> FxHashMap<String, Vec<&'a FuturesOHLCVCandle>> {
+        let mut daily_groups = FxHashMap::default();
         
         for candle in candles {
             let day_key = chrono::DateTime::from_timestamp_millis(candle.close_time)
@@ -455,7 +455,7 @@ impl TimeFrameActor {
     }
 
     /// Fast daily completeness validation - only check incomplete days in detail
-    fn validate_daily_completeness(&self, daily_groups: &HashMap<String, Vec<&'_ FuturesOHLCVCandle>>) -> Vec<String> {
+    fn validate_daily_completeness(&self, daily_groups: &FxHashMap<String, Vec<&'_ FuturesOHLCVCandle>>) -> Vec<String> {
         let mut incomplete_days = Vec::new();
         
         for (day, candles) in daily_groups {
@@ -474,7 +474,7 @@ impl TimeFrameActor {
     fn analyze_gaps_for_incomplete_days(
         &self,
         incomplete_days: &[String], 
-        daily_groups: &HashMap<String, Vec<&'_ FuturesOHLCVCandle>>
+        daily_groups: &FxHashMap<String, Vec<&'_ FuturesOHLCVCandle>>
     ) -> Vec<(i64, i64, i64)> {
         let mut large_gaps = Vec::new();
         
@@ -810,7 +810,7 @@ impl TimeFrameActor {
                 
                 // Collect timeframe updates - ONLY CLOSED CANDLES for EMA calculations
                 let batch_prep_start = std::time::Instant::now();
-                let mut candles_batch = HashMap::new();
+                let mut candles_batch = FxHashMap::default();
                 
                 // 1. CRITICAL FIX: Only include 1-minute candle if it's CLOSED
                 if is_closed {

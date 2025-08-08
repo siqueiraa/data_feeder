@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant}; // PHASE 3: Memory pressure detection
@@ -110,7 +111,7 @@ pub enum IndicatorTell {
     /// Initialize with historical aggregated candles
     InitializeWithHistory {
         symbol: String,
-        aggregated_candles: HashMap<u64, Vec<FuturesOHLCVCandle>>,
+        aggregated_candles: FxHashMap<u64, Vec<FuturesOHLCVCandle>>,
     },
     /// Process a new candle for a specific timeframe
     ProcessCandle {
@@ -121,7 +122,7 @@ pub enum IndicatorTell {
     /// Process multiple timeframe updates in a single batch (prevents duplicate outputs)
     ProcessMultiTimeFrameUpdate {
         symbol: String,
-        candles: HashMap<u64, FuturesOHLCVCandle>, // timeframe_seconds -> candle
+        candles: FxHashMap<u64, FuturesOHLCVCandle>, // timeframe_seconds -> candle
     },
     /// Set Kafka actor reference for publishing indicators
     #[cfg(feature = "kafka")]
@@ -347,7 +348,7 @@ impl SymbolIndicatorState {
     async fn initialize_with_history(
         &mut self,
         symbol: &str,
-        aggregated_candles: HashMap<u64, Vec<FuturesOHLCVCandle>>,
+        aggregated_candles: FxHashMap<u64, Vec<FuturesOHLCVCandle>>,
     ) {
         info!("Initializing indicator state for {} with {} timeframes", 
               symbol, aggregated_candles.len());
@@ -963,7 +964,7 @@ pub struct IndicatorActor {
     config: TechnicalAnalysisConfig,
     
     /// Symbol-specific indicator state
-    symbol_states: HashMap<String, SymbolIndicatorState>,
+    symbol_states: FxHashMap<String, SymbolIndicatorState>,
     
     /// Overall initialization status
     is_ready: bool,
@@ -1009,7 +1010,7 @@ impl IndicatorActor {
 
     /// Create a new Indicator actor
     pub fn new(config: TechnicalAnalysisConfig) -> Self {
-        let mut symbol_states = HashMap::new();
+        let mut symbol_states = FxHashMap::default();
         
         // Initialize state for each symbol
         for symbol in &config.symbols {
@@ -1644,7 +1645,7 @@ mod tests {
     fn test_kafka_graceful_degradation() {
         // Test that indicator processing works without Kafka actor reference
         let config = TechnicalAnalysisConfig::default();
-        let mut actor = IndicatorActor::new(config);
+        let actor = IndicatorActor::new(config);
         
         // Verify processing works without Kafka actor
         assert!(actor.kafka_actor.is_none());
@@ -1660,7 +1661,7 @@ mod tests {
     fn test_kafka_set_actor_method_compilation() {
         // This test ensures the set_kafka_actor method compiles when Kafka is enabled
         let config = TechnicalAnalysisConfig::default();
-        let mut actor = IndicatorActor::new(config);
+        let actor = IndicatorActor::new(config);
         
         // The set_kafka_actor method should be available when feature is enabled
         // In real scenario, we would create an actual KafkaActor ref

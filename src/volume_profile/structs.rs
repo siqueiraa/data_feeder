@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use crate::common::shared_data::{SymbolHashMap, new_symbol_hashmap};
 use tracing::info;
 use rust_decimal::{prelude::*, Decimal};
 use rust_decimal_macros::dec;
@@ -54,7 +55,7 @@ pub struct VolumeProfileConfig {
     #[serde(default)]
     pub calculation_mode: VolumeProfileCalculationMode,
     #[serde(default)]
-    pub asset_overrides: HashMap<String, AssetConfig>,
+    pub asset_overrides: SymbolHashMap<AssetConfig>,
     /// Number of historical days to process during startup (default: 60)
     #[serde(default = "default_historical_days")]
     pub historical_days: u32,
@@ -76,7 +77,7 @@ impl Default for VolumeProfileConfig {
             volume_distribution_mode: VolumeDistributionMode::WeightedOHLC,
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
             calculation_mode: VolumeProfileCalculationMode::default(),
-            asset_overrides: HashMap::new(),
+            asset_overrides: new_symbol_hashmap(),
             historical_days: default_historical_days(),
         }
     }
@@ -1605,8 +1606,8 @@ mod tests {
 
     #[test]
     fn test_price_key_conversion() {
-        let price_increment = 0.01;
-        let price = 50000.25;
+        let price_increment = dec!(0.01);
+        let price = dec!(50000.25);
         
         let key = PriceKey::from_price(price, price_increment);
         let converted_price = key.to_price(price_increment);
@@ -1620,108 +1621,108 @@ mod tests {
 
     #[test]
     fn test_price_level_map_basic_operations() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
         // Add volume at different price levels
-        map.add_volume(50000.25, 100.0);
-        map.add_volume(50000.26, 150.0);
-        map.add_volume(50000.25, 50.0); // Add more volume to same level
+        map.add_volume(dec!(50000.25), dec!(100.0));
+        map.add_volume(dec!(50000.26), dec!(150.0));
+        map.add_volume(dec!(50000.25), dec!(50.0)); // Add more volume to same level
         
         // Total volume should be sum of all additions
-        assert_eq!(map.total_volume(), 300.0);
+        assert_eq!(map.total_volume(), dec!(300.0));
         
         // Both prices now have 150.0 volume, so POC could be either
         let poc = map.get_poc().unwrap();
         // The max_by implementation returns 50000.26 (the last equal max value)
-        assert!((poc - 50000.26).abs() < 0.001);
+        assert!((poc - dec!(50000.26)).abs() < dec!(0.001));
     }
 
     #[test]
     fn test_vwap_calculation() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
-        map.add_volume(100.0, 10.0); // 100 * 10 = 1000
-        map.add_volume(200.0, 20.0); // 200 * 20 = 4000
-        map.add_volume(300.0, 30.0); // 300 * 30 = 9000
+        map.add_volume(dec!(100.0), dec!(10.0)); // 100 * 10 = 1000
+        map.add_volume(dec!(200.0), dec!(20.0)); // 200 * 20 = 4000
+        map.add_volume(dec!(300.0), dec!(30.0)); // 300 * 30 = 9000
         
         let vwap = map.calculate_vwap();
-        let expected_vwap = (1000.0 + 4000.0 + 9000.0) / (10.0 + 20.0 + 30.0);
+        let expected_vwap = (dec!(1000.0) + dec!(4000.0) + dec!(9000.0)) / (dec!(10.0) + dec!(20.0) + dec!(30.0));
         
-        assert!((vwap - expected_vwap).abs() < 0.001);
+        assert!((vwap - expected_vwap).abs() < dec!(0.001));
     }
 
     #[test]
     fn test_value_area_calculation() {
-        let mut map = PriceLevelMap::new(1.0);  // Use 1.0 increment to match the price spacing
+        let mut map = PriceLevelMap::new(dec!(1.0));  // Use 1.0 increment to match the price spacing
         
         // Create distribution with clear POC
-        map.add_volume(100.0, 10.0);  // 10% of volume
-        map.add_volume(101.0, 50.0);  // 50% of volume (POC)
-        map.add_volume(102.0, 30.0);  // 30% of volume
-        map.add_volume(103.0, 10.0);  // 10% of volume
+        map.add_volume(dec!(100.0), dec!(10.0));  // 10% of volume
+        map.add_volume(dec!(101.0), dec!(50.0));  // 50% of volume (POC)
+        map.add_volume(dec!(102.0), dec!(30.0));  // 30% of volume
+        map.add_volume(dec!(103.0), dec!(10.0));  // 10% of volume
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // With greedy selection, should get exactly 70% volume
         // We select 101.0 (50%) + 102.0 (30%) = 80% 
         // Then the contiguous range 101-102 contains 80% volume
-        assert!(value_area.volume_percentage >= 70.0, "Expected >= 70%, got {}", value_area.volume_percentage);
-        assert!(value_area.volume_percentage <= 80.0, "Should not exceed 80% for this test, got {}", value_area.volume_percentage);
-        assert!(value_area.volume > 0.0);
-        assert!(value_area.low <= 101.0);
-        assert!(value_area.high >= 102.0);
+        assert!(value_area.volume_percentage >= dec!(70.0), "Expected >= 70%, got {}", value_area.volume_percentage);
+        assert!(value_area.volume_percentage <= dec!(80.0), "Should not exceed 80% for this test, got {}", value_area.volume_percentage);
+        assert!(value_area.volume > dec!(0.0));
+        assert!(value_area.low <= dec!(101.0));
+        assert!(value_area.high >= dec!(102.0));
         assert!(value_area.high > value_area.low, "Value area should span a range: high={} low={}", 
                 value_area.high, value_area.low);
     }
 
     #[test]
     fn test_value_area_concentrated_volume() {
-        let mut map = PriceLevelMap::new(0.01);  // Fine-grained increment like real data
+        let mut map = PriceLevelMap::new(dec!(0.01));  // Fine-grained increment like real data
         
         // Simulate the real-world scenario: volume concentrated at one price
-        map.add_volume(114367.6, 4461.0);  // POC volume
-        map.add_volume(114367.59, 100.0);   // Small adjacent volume
-        map.add_volume(114367.61, 150.0);   // Small adjacent volume
+        map.add_volume(dec!(114367.6), dec!(4461.0));  // POC volume
+        map.add_volume(dec!(114367.59), dec!(100.0));   // Small adjacent volume
+        map.add_volume(dec!(114367.61), dec!(150.0));   // Small adjacent volume
         
         let total_volume = map.total_volume();
-        assert!(total_volume > 0.0);
+        assert!(total_volume > dec!(0.0));
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Value area should capture approximately 70% volume (or as close as possible with discrete levels)
         // With concentrated volume, it may include more to reach a contiguous range
-        assert!(value_area.volume_percentage >= 70.0 && value_area.volume_percentage <= 100.0, 
+        assert!(value_area.volume_percentage >= dec!(70.0) && value_area.volume_percentage <= dec!(100.0), 
                 "Value area should capture 70-100% volume: {}%", value_area.volume_percentage);
         
         // Value area should include the POC (highest volume level)
-        assert!(value_area.low <= 114367.6 && value_area.high >= 114367.6,
+        assert!(value_area.low <= dec!(114367.6) && value_area.high >= dec!(114367.6),
                 "Value area should include POC at 114367.6");
         
         // Should have reasonable volume
-        assert!(value_area.volume > 0.0);
+        assert!(value_area.volume > dec!(0.0));
     }
 
     #[test]
     fn test_value_area_single_price_level() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
         // Edge case: all volume at exactly one price
-        map.add_volume(114367.6, 1000.0);
+        map.add_volume(dec!(114367.6), dec!(1000.0));
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Should still provide meaningful range
         assert!(value_area.high >= value_area.low);
-        assert!(value_area.volume_percentage >= 50.0, 
+        assert!(value_area.volume_percentage >= dec!(50.0), 
                 "Should capture all volume when only one level exists");
     }
 
     #[test]
     fn test_price_level_data_conversion() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
-        map.add_volume(50000.25, 100.0);
-        map.add_volume(50000.26, 200.0);
+        map.add_volume(dec!(50000.25), dec!(100.0));
+        map.add_volume(dec!(50000.26), dec!(200.0));
         
         let price_levels = map.to_price_levels();
         
@@ -1731,70 +1732,70 @@ mod tests {
         assert!(price_levels[0].price < price_levels[1].price);
         
         // Percentages should sum to 100%
-        let total_percentage: f64 = price_levels.iter().map(|p| p.percentage).sum();
-        assert!((total_percentage - 100.0).abs() < 0.001);
+        let total_percentage: Decimal = price_levels.iter().map(|p| p.percentage).sum();
+        assert!((total_percentage - dec!(100.0)).abs() < dec!(0.001));
     }
 
     #[test]
     fn test_empty_price_level_map() {
-        let map = PriceLevelMap::new(0.01);
+        let map = PriceLevelMap::new(dec!(0.01));
         
-        assert_eq!(map.total_volume(), 0.0);
+        assert_eq!(map.total_volume(), dec!(0.0));
         assert!(map.get_poc().is_none());
-        assert_eq!(map.calculate_vwap(), 0.0);
+        assert_eq!(map.calculate_vwap(), dec!(0.0));
         assert!(map.to_price_levels().is_empty());
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
-        assert_eq!(value_area.volume, 0.0);
-        assert_eq!(value_area.volume_percentage, 0.0);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        assert_eq!(value_area.volume, dec!(0.0));
+        assert_eq!(value_area.volume_percentage, dec!(0.0));
     }
 
     #[test]
     fn test_volume_distribution_modes() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
         // Test ClosingPrice distribution
-        map.distribute_candle_volume(100.0, 102.0, 98.0, 101.0, 1000.0, &VolumeDistributionMode::ClosingPrice);
-        assert_eq!(map.total_volume(), 1000.0);
+        map.distribute_candle_volume(dec!(100.0), dec!(102.0), dec!(98.0), dec!(101.0), dec!(1000.0), &VolumeDistributionMode::ClosingPrice);
+        assert_eq!(map.total_volume(), dec!(1000.0));
         let levels = map.to_price_levels();
         assert_eq!(levels.len(), 1);
-        assert_eq!(levels[0].price, 101.0);
-        assert_eq!(levels[0].volume, 1000.0);
+        assert_eq!(levels[0].price, dec!(101.0));
+        assert_eq!(levels[0].volume, dec!(1000.0));
 
         // Reset and test WeightedOHLC distribution
-        map = PriceLevelMap::new(0.01);
-        map.distribute_candle_volume(100.0, 102.0, 98.0, 101.0, 1000.0, &VolumeDistributionMode::WeightedOHLC);
-        assert_eq!(map.total_volume(), 1000.0);
+        map = PriceLevelMap::new(dec!(0.01));
+        map.distribute_candle_volume(dec!(100.0), dec!(102.0), dec!(98.0), dec!(101.0), dec!(1000.0), &VolumeDistributionMode::WeightedOHLC);
+        assert_eq!(map.total_volume(), dec!(1000.0));
         
         // Should have volume at close (50%), high (25%), and low (25%)
-        let close_volume = map.get_volume_at_key(&PriceKey::from_price(101.0, 0.01));
-        let high_volume = map.get_volume_at_key(&PriceKey::from_price(102.0, 0.01));
-        let low_volume = map.get_volume_at_key(&PriceKey::from_price(98.0, 0.01));
+        let close_volume = map.get_volume_at_key(&PriceKey::from_price(dec!(101.0), dec!(0.01)));
+        let high_volume = map.get_volume_at_key(&PriceKey::from_price(dec!(102.0), dec!(0.01)));
+        let low_volume = map.get_volume_at_key(&PriceKey::from_price(dec!(98.0), dec!(0.01)));
         
-        assert_eq!(close_volume, 500.0);
-        assert_eq!(high_volume, 250.0);
-        assert_eq!(low_volume, 250.0);
+        assert_eq!(close_volume, dec!(500.0));
+        assert_eq!(high_volume, dec!(250.0));
+        assert_eq!(low_volume, dec!(250.0));
 
         // Reset and test HighLowWeighted distribution
-        map = PriceLevelMap::new(0.01);
-        map.distribute_candle_volume(100.0, 102.0, 98.0, 101.0, 1000.0, &VolumeDistributionMode::HighLowWeighted);
-        assert_eq!(map.total_volume(), 1000.0);
+        map = PriceLevelMap::new(dec!(0.01));
+        map.distribute_candle_volume(dec!(100.0), dec!(102.0), dec!(98.0), dec!(101.0), dec!(1000.0), &VolumeDistributionMode::HighLowWeighted);
+        assert_eq!(map.total_volume(), dec!(1000.0));
         
-        let high_volume = map.get_volume_at_key(&PriceKey::from_price(102.0, 0.01));
-        let low_volume = map.get_volume_at_key(&PriceKey::from_price(98.0, 0.01));
+        let high_volume = map.get_volume_at_key(&PriceKey::from_price(dec!(102.0), dec!(0.01)));
+        let low_volume = map.get_volume_at_key(&PriceKey::from_price(dec!(98.0), dec!(0.01)));
         
-        assert_eq!(high_volume, 500.0);
-        assert_eq!(low_volume, 500.0);
+        assert_eq!(high_volume, dec!(500.0));
+        assert_eq!(low_volume, dec!(500.0));
     }
 
     #[test]
     fn test_uniform_volume_distribution() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Test uniform distribution across a 4-unit range (100 to 104)
-        map.distribute_candle_volume(100.0, 104.0, 100.0, 102.0, 1000.0, &VolumeDistributionMode::UniformOHLC);
+        map.distribute_candle_volume(dec!(100.0), dec!(104.0), dec!(100.0), dec!(102.0), dec!(1000.0), &VolumeDistributionMode::UniformOHLC);
         
-        assert_eq!(map.total_volume(), 1000.0);
+        assert_eq!(map.total_volume(), dec!(1000.0));
         let levels = map.to_price_levels();
         
         // Should have distributed across levels in the range (100 to 104)
@@ -1802,61 +1803,61 @@ mod tests {
         assert_eq!(levels.len(), 4);
         
         // Each level should have approximately equal volume
-        let expected_volume_per_level = 1000.0 / 4.0;
+        let expected_volume_per_level = dec!(1000.0) / dec!(4.0);
         for level in &levels {
-            assert!((level.volume - expected_volume_per_level).abs() < 1.0);
+            assert!((level.volume - expected_volume_per_level).abs() < dec!(1.0));
         }
     }
 
     #[test]
     fn test_traditional_vs_greedy_value_area() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create a distribution where traditional and greedy methods should differ
-        map.add_volume(100.0, 10.0);  // 10%
-        map.add_volume(101.0, 50.0);  // 50% (POC)
-        map.add_volume(102.0, 20.0);  // 20%
-        map.add_volume(103.0, 15.0);  // 15%
-        map.add_volume(105.0, 5.0);   // 5% (isolated level)
+        map.add_volume(dec!(100.0), dec!(10.0));  // 10%
+        map.add_volume(dec!(101.0), dec!(50.0));  // 50% (POC)
+        map.add_volume(dec!(102.0), dec!(20.0));  // 20%
+        map.add_volume(dec!(103.0), dec!(15.0));  // 15%
+        map.add_volume(dec!(105.0), dec!(5.0));   // 5% (isolated level)
         
-        let traditional_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
-        let greedy_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Greedy, &VolumeProfileCalculationMode::Volume);
+        let traditional_va = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let greedy_va = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Greedy, &VolumeProfileCalculationMode::Volume);
         
         // Both should include POC
-        assert!(traditional_va.low <= 101.0 && traditional_va.high >= 101.0);
-        assert!(greedy_va.low <= 101.0 && greedy_va.high >= 101.0);
+        assert!(traditional_va.low <= dec!(101.0) && traditional_va.high >= dec!(101.0));
+        assert!(greedy_va.low <= dec!(101.0) && greedy_va.high >= dec!(101.0));
         
         // Both should aim for ~70% volume
-        assert!(traditional_va.volume_percentage >= 65.0 && traditional_va.volume_percentage <= 85.0);
-        assert!(greedy_va.volume_percentage >= 65.0 && greedy_va.volume_percentage <= 85.0);
+        assert!(traditional_va.volume_percentage >= dec!(65.0) && traditional_va.volume_percentage <= dec!(85.0));
+        assert!(greedy_va.volume_percentage >= dec!(65.0) && greedy_va.volume_percentage <= dec!(85.0));
         
         // Traditional method should create a more contiguous range from POC
         // Greedy method might include the isolated high-volume level at 105.0
-        assert!(traditional_va.high <= 103.0, "Traditional should stay contiguous from POC");
+        assert!(traditional_va.high <= dec!(103.0), "Traditional should stay contiguous from POC");
     }
 
     #[test]
     fn test_value_area_edge_cases() {
         // Test with single price level - AC1: high must be greater than low (no degenerate single-price areas)
-        let mut map = PriceLevelMap::new(0.01);
-        map.add_volume(100.0, 1000.0);
+        let mut map = PriceLevelMap::new(dec!(0.01));
+        map.add_volume(dec!(100.0), dec!(1000.0));
         
-        let va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
-        assert_eq!(va.low, 100.0);
-        assert_eq!(va.high, 100.01);  // Should be expanded by price_increment per AC1
-        assert!(va.volume > 0.0);      // Volume should be positive
-        assert!(va.volume_percentage > 0.0);  // Percentage should be positive
+        let va = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        assert_eq!(va.low, dec!(100.0));
+        assert_eq!(va.high, dec!(100.01));  // Should be expanded by price_increment per AC1
+        assert!(va.volume > dec!(0.0));      // Volume should be positive
+        assert!(va.volume_percentage > dec!(0.0));  // Percentage should be positive
         
         // Test with two equal volume levels
-        map = PriceLevelMap::new(1.0);
-        map.add_volume(100.0, 500.0);
-        map.add_volume(101.0, 500.0);
+        map = PriceLevelMap::new(dec!(1.0));
+        map.add_volume(dec!(100.0), dec!(500.0));
+        map.add_volume(dec!(101.0), dec!(500.0));
         
-        let va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
-        assert!(va.low <= 100.0);
-        assert!(va.high >= 101.0);
-        assert_eq!(va.volume, 1000.0);
-        assert_eq!(va.volume_percentage, 100.0);
+        let va = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        assert!(va.low <= dec!(100.0));
+        assert!(va.high >= dec!(101.0));
+        assert_eq!(va.volume, dec!(1000.0));
+        assert_eq!(va.volume_percentage, dec!(100.0));
     }
 
     #[test]
@@ -1864,16 +1865,16 @@ mod tests {
         let mut config = VolumeProfileConfig::default();
         
         // Add asset overrides
-        let mut overrides = HashMap::new();
+        let mut overrides = new_symbol_hashmap();
         let btc_config = AssetConfig {
             price_increment_mode: Some(PriceIncrementMode::Fixed),
-            fixed_price_increment: Some(10.0),
+            fixed_price_increment: Some(dec!(10.0)),
             target_price_levels: Some(100),
             min_price_increment: None,
             max_price_increment: None,
             volume_distribution_mode: Some(VolumeDistributionMode::ClosingPrice),
             value_area_calculation_mode: Some(ValueAreaCalculationMode::Greedy),
-            value_area_percentage: Some(68.0),
+            value_area_percentage: Some(dec!(68.0)),
             calculation_mode: Some(VolumeProfileCalculationMode::TPO),
         };
         overrides.insert("BTCUSDT".to_string(), btc_config);
@@ -1882,11 +1883,11 @@ mod tests {
         // Test BTC-specific config resolution
         let btc_resolved = config.resolve_for_asset("BTCUSDT");
         assert!(matches!(btc_resolved.price_increment_mode, PriceIncrementMode::Fixed));
-        assert_eq!(btc_resolved.fixed_price_increment, 10.0);
+        assert_eq!(btc_resolved.fixed_price_increment, dec!(10.0));
         assert_eq!(btc_resolved.target_price_levels, 100);
         assert!(matches!(btc_resolved.volume_distribution_mode, VolumeDistributionMode::ClosingPrice));
         assert!(matches!(btc_resolved.value_area_calculation_mode, ValueAreaCalculationMode::Greedy));
-        assert_eq!(btc_resolved.value_area_percentage, 68.0);
+        assert_eq!(btc_resolved.value_area_percentage, dec!(68.0));
         
         // Test fallback to global config for non-overridden asset
         let eth_resolved = config.resolve_for_asset("ETHUSDT");
@@ -1912,33 +1913,33 @@ mod tests {
         config.target_price_levels = 200; // Reset to valid
         
         // Test invalid price increments
-        config.fixed_price_increment = -1.0; // Negative
+        config.fixed_price_increment = dec!(-1.0); // Negative
         assert!(config.validate().is_err());
         
-        config.fixed_price_increment = 0.01; // Reset to valid
-        config.min_price_increment = -0.001; // Negative
+        config.fixed_price_increment = dec!(0.01); // Reset to valid
+        config.min_price_increment = dec!(-0.001); // Negative
         assert!(config.validate().is_err());
         
-        config.min_price_increment = 0.001; // Reset to valid
-        config.max_price_increment = 0.0005; // Less than min
+        config.min_price_increment = dec!(0.001); // Reset to valid
+        config.max_price_increment = dec!(0.0005); // Less than min
         assert!(config.validate().is_err());
         
-        config.max_price_increment = 1.0; // Reset to valid
+        config.max_price_increment = dec!(1.0); // Reset to valid
         
         // Test invalid value area percentage
-        config.value_area_percentage = 40.0; // Too small
+        config.value_area_percentage = dec!(40.0); // Too small
         assert!(config.validate().is_err());
         
-        config.value_area_percentage = 99.0; // Too large
+        config.value_area_percentage = dec!(99.0); // Too large
         assert!(config.validate().is_err());
         
-        config.value_area_percentage = 70.0; // Reset to valid
+        config.value_area_percentage = dec!(70.0); // Reset to valid
         
         // Test invalid asset override
-        let mut overrides = HashMap::new();
+        let mut overrides = new_symbol_hashmap();
         let invalid_asset = AssetConfig {
             price_increment_mode: None,
-            fixed_price_increment: Some(-10.0), // Negative
+            fixed_price_increment: Some(dec!(-10.0)), // Negative
             target_price_levels: None,
             min_price_increment: None,
             max_price_increment: None,
@@ -1964,50 +1965,50 @@ mod tests {
         // Test that different target levels produce different increments
         let mut config = VolumeProfileConfig {
             price_increment_mode: PriceIncrementMode::Adaptive,
-            min_price_increment: 0.00000001,
-            max_price_increment: 100.0,
+            min_price_increment: dec!(0.00000001),
+            max_price_increment: dec!(100.0),
             ..Default::default()
         };
         
         // High target levels (fine granularity)
         config.target_price_levels = 1000;
         let high_target_resolved = config.resolve_for_asset("TESTUSDT");
-        let fine_increment = DailyVolumeProfile::calculate_price_increment(&high_target_resolved, Some(100.0)); // $100 range
+        let fine_increment = DailyVolumeProfile::calculate_price_increment(&high_target_resolved, Some(dec!(100.0))); // $100 range
         
         // Low target levels (coarse granularity)
         config.target_price_levels = 50;
         let low_target_resolved = config.resolve_for_asset("TESTUSDT");
-        let coarse_increment = DailyVolumeProfile::calculate_price_increment(&low_target_resolved, Some(100.0)); // $100 range
+        let coarse_increment = DailyVolumeProfile::calculate_price_increment(&low_target_resolved, Some(dec!(100.0))); // $100 range
         
         // Coarse increment should be larger (fewer levels)
         assert!(coarse_increment > fine_increment);
         
         // Verify reasonable values
-        assert_eq!(fine_increment, 100.0 / 1000.0); // $0.10 increment for 1000 levels in $100
-        assert_eq!(coarse_increment, 100.0 / 50.0);  // $2.00 increment for 50 levels in $100
+        assert_eq!(fine_increment, dec!(100.0) / dec!(1000.0)); // $0.10 increment for 1000 levels in $100
+        assert_eq!(coarse_increment, dec!(100.0) / dec!(50.0));  // $2.00 increment for 50 levels in $100
     }
 
     #[test]
     fn test_balanced_volume_profile_with_weighted_ohlc() {
-        let mut map = PriceLevelMap::new(0.5); // Use 0.5 increment for better granularity
+        let mut map = PriceLevelMap::new(dec!(0.5)); // Use 0.5 increment for better granularity
         
         // Create a more realistic trading scenario with bell-curve like distribution
         // Simulate accumulation around 101-102 range with some outliers
         let candles = vec![
             // Low volume outliers
-            (99.0, 100.0, 99.0, 99.5, 500.0),   // Low outlier
-            (104.0, 105.0, 104.0, 104.5, 500.0), // High outlier
+            (dec!(99.0), dec!(100.0), dec!(99.0), dec!(99.5), dec!(500.0)),   // Low outlier
+            (dec!(104.0), dec!(105.0), dec!(104.0), dec!(104.5), dec!(500.0)), // High outlier
             
             // Main accumulation zone - should create centered POC
-            (100.5, 101.5, 100.0, 101.0, 3000.0), // Volume at 101 area
-            (101.0, 102.0, 100.8, 101.5, 4000.0), // Peak volume
-            (101.5, 102.5, 101.0, 102.0, 3500.0), // Volume at 102 area
-            (101.8, 102.2, 101.3, 101.8, 3000.0), // More volume around 101-102
-            (101.2, 102.8, 101.0, 102.2, 2500.0), // Balanced distribution
+            (dec!(100.5), dec!(101.5), dec!(100.0), dec!(101.0), dec!(3000.0)), // Volume at 101 area
+            (dec!(101.0), dec!(102.0), dec!(100.8), dec!(101.5), dec!(4000.0)), // Peak volume
+            (dec!(101.5), dec!(102.5), dec!(101.0), dec!(102.0), dec!(3500.0)), // Volume at 102 area
+            (dec!(101.8), dec!(102.2), dec!(101.3), dec!(101.8), dec!(3000.0)), // More volume around 101-102
+            (dec!(101.2), dec!(102.8), dec!(101.0), dec!(102.2), dec!(2500.0)), // Balanced distribution
             
             // Some mid-range activity
-            (102.0, 103.0, 101.8, 102.5, 1500.0), // Moderate volume
-            (100.8, 102.0, 100.5, 101.2, 1000.0), // Lower moderate volume
+            (dec!(102.0), dec!(103.0), dec!(101.8), dec!(102.5), dec!(1500.0)), // Moderate volume
+            (dec!(100.8), dec!(102.0), dec!(100.5), dec!(101.2), dec!(1000.0)), // Lower moderate volume
         ];
         
         // Use WeightedOHLC distribution (new default)
@@ -2016,13 +2017,13 @@ mod tests {
         }
         
         // Calculate value area using traditional method
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         let poc = map.get_poc().unwrap();
         
         // Basic validations that should always pass with WeightedOHLC
         
         // Value area should contain significant volume (close to target)
-        assert!(value_area.volume_percentage >= 65.0, 
+        assert!(value_area.volume_percentage >= dec!(65.0), 
                 "Value area should contain at least 65% of volume, got {:.1}%", value_area.volume_percentage);
         
         // POC should be within the value area (fundamental requirement)
@@ -2031,7 +2032,7 @@ mod tests {
         
         // Value area should have reasonable range (not degenerate)
         let va_range = value_area.high - value_area.low;
-        assert!(va_range >= 0.0, "Value area range should be non-negative: {:.1}", va_range);
+        assert!(va_range >= dec!(0.0), "Value area range should be non-negative: {:.1}", va_range);
         
         // With WeightedOHLC, we should have multiple price levels (not just one)
         let price_levels = map.to_price_levels();
@@ -2040,8 +2041,8 @@ mod tests {
         
         // The POC should be a high-volume level
         let poc_level = price_levels.iter().find(|level| level.price == poc).unwrap();
-        let max_volume = price_levels.iter().map(|l| l.volume).fold(0.0, f64::max);
-        assert!((poc_level.volume - max_volume).abs() < 0.01,
+        let max_volume = price_levels.iter().map(|l| l.volume).fold(dec!(0.0), |acc, vol| if vol > acc { vol } else { acc });
+        assert!((poc_level.volume - max_volume).abs() < dec!(0.01),
                 "POC should be at the highest volume level");
     }
 
@@ -2062,48 +2063,48 @@ mod tests {
 
     #[test]
     fn test_value_area_validator_valid_case() {
-        let result = ValueAreaValidator::validate_value_area(102.5, 100.5, 72.0);
+        let result = ValueAreaValidator::validate_value_area(dec!(102.5), dec!(100.5), dec!(72.0));
         assert_eq!(result, ValidationResult::Valid);
     }
 
     #[test]
     fn test_value_area_validator_invalid_range() {
         // High < Low should be invalid
-        let result = ValueAreaValidator::validate_value_area(100.5, 102.5, 72.0);
-        assert_eq!(result, ValidationResult::InvalidRange { high: 100.5, low: 102.5 });
+        let result = ValueAreaValidator::validate_value_area(dec!(100.5), dec!(102.5), dec!(72.0));
+        assert_eq!(result, ValidationResult::InvalidRange { high: dec!(100.5), low: dec!(102.5) });
     }
 
     #[test]
     fn test_value_area_validator_invalid_volume_percentage() {
         // Volume percentage too low
-        let result = ValueAreaValidator::validate_value_area(102.5, 100.5, 60.0);
-        assert_eq!(result, ValidationResult::InvalidVolumePercentage { percentage: 60.0 });
+        let result = ValueAreaValidator::validate_value_area(dec!(102.5), dec!(100.5), dec!(60.0));
+        assert_eq!(result, ValidationResult::InvalidVolumePercentage { percentage: dec!(60.0) });
         
         // Volume percentage too high
-        let result = ValueAreaValidator::validate_value_area(102.5, 100.5, 80.0);
-        assert_eq!(result, ValidationResult::InvalidVolumePercentage { percentage: 80.0 });
+        let result = ValueAreaValidator::validate_value_area(dec!(102.5), dec!(100.5), dec!(80.0));
+        assert_eq!(result, ValidationResult::InvalidVolumePercentage { percentage: dec!(80.0) });
     }
 
     #[test]
     fn test_poc_validation() {
         // POC within range should be valid
-        let result = ValueAreaValidator::validate_poc_in_range(101.5, 102.0, 101.0);
+        let result = ValueAreaValidator::validate_poc_in_range(dec!(101.5), dec!(102.0), dec!(101.0));
         assert_eq!(result, ValidationResult::Valid);
         
         // POC below range should be invalid
-        let result = ValueAreaValidator::validate_poc_in_range(100.5, 102.0, 101.0);
-        assert_eq!(result, ValidationResult::PocNotInRange { poc: 100.5, high: 102.0, low: 101.0 });
+        let result = ValueAreaValidator::validate_poc_in_range(dec!(100.5), dec!(102.0), dec!(101.0));
+        assert_eq!(result, ValidationResult::PocNotInRange { poc: dec!(100.5), high: dec!(102.0), low: dec!(101.0) });
         
         // POC above range should be invalid
-        let result = ValueAreaValidator::validate_poc_in_range(103.0, 102.0, 101.0);
-        assert_eq!(result, ValidationResult::PocNotInRange { poc: 103.0, high: 102.0, low: 101.0 });
+        let result = ValueAreaValidator::validate_poc_in_range(dec!(103.0), dec!(102.0), dec!(101.0));
+        assert_eq!(result, ValidationResult::PocNotInRange { poc: dec!(103.0), high: dec!(102.0), low: dec!(101.0) });
     }
 
     #[test]
     fn test_degenerate_case_detection() {
         // Single price level is degenerate
         let single_level = vec![
-            PriceLevelData { price: 100.0, volume: 1000.0, percentage: 100.0, candle_count: 10 }
+            PriceLevelData { price: dec!(100.0), volume: dec!(1000.0), percentage: dec!(100.0), candle_count: 10 }
         ];
         assert!(ValueAreaValidator::detect_degenerate_case(&single_level));
         
@@ -2113,34 +2114,34 @@ mod tests {
         
         // Extreme volume concentration (>90% at extremes) is degenerate
         let extreme_levels = vec![
-            PriceLevelData { price: 100.0, volume: 500.0, percentage: 50.0, candle_count: 5 },  // First extreme
-            PriceLevelData { price: 101.0, volume: 50.0, percentage: 5.0, candle_count: 1 },    // Middle
-            PriceLevelData { price: 102.0, volume: 450.0, percentage: 45.0, candle_count: 5 },  // Last extreme
+            PriceLevelData { price: dec!(100.0), volume: dec!(500.0), percentage: dec!(50.0), candle_count: 5 },  // First extreme
+            PriceLevelData { price: dec!(101.0), volume: dec!(50.0), percentage: dec!(5.0), candle_count: 1 },    // Middle
+            PriceLevelData { price: dec!(102.0), volume: dec!(450.0), percentage: dec!(45.0), candle_count: 5 },  // Last extreme
         ];
         assert!(ValueAreaValidator::detect_degenerate_case(&extreme_levels)); // 95% at extremes
         
         // Balanced distribution is not degenerate
         let balanced_levels = vec![
-            PriceLevelData { price: 100.0, volume: 200.0, percentage: 20.0, candle_count: 2 },
-            PriceLevelData { price: 101.0, volume: 600.0, percentage: 60.0, candle_count: 6 },  // POC in middle
-            PriceLevelData { price: 102.0, volume: 200.0, percentage: 20.0, candle_count: 2 },
+            PriceLevelData { price: dec!(100.0), volume: dec!(200.0), percentage: dec!(20.0), candle_count: 2 },
+            PriceLevelData { price: dec!(101.0), volume: dec!(600.0), percentage: dec!(60.0), candle_count: 6 },  // POC in middle
+            PriceLevelData { price: dec!(102.0), volume: dec!(200.0), percentage: dec!(20.0), candle_count: 2 },
         ];
         assert!(!ValueAreaValidator::detect_degenerate_case(&balanced_levels)); // Only 40% at extremes
     }
 
     #[test]
     fn test_value_area_calculation_with_validation() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
         // Create a scenario that would produce an invalid value area initially
-        map.add_volume(114367.6, 4000.0);  // Concentrated volume at one price
-        map.add_volume(114367.61, 100.0);  // Small adjacent volume
+        map.add_volume(dec!(114367.6), dec!(4000.0));  // Concentrated volume at one price
+        map.add_volume(dec!(114367.61), dec!(100.0));  // Small adjacent volume
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // After validation and adjustment, should have valid properties
         assert!(value_area.high >= value_area.low, "Value area should have valid range after validation");
-        assert!(value_area.volume > 0.0, "Value area should have positive volume");
+        assert!(value_area.volume > dec!(0.0), "Value area should have positive volume");
         
         // POC should be within the value area
         if let Some(poc) = map.get_poc() {
@@ -2151,74 +2152,74 @@ mod tests {
 
     #[test]
     fn test_contiguous_range_logic() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create distribution with gaps to test contiguous range logic
-        map.add_volume(100.0, 100.0);  // 10%
-        map.add_volume(101.0, 500.0);  // 50% (POC)
-        map.add_volume(102.0, 200.0);  // 20%
-        map.add_volume(105.0, 200.0);  // 20% (gap at 103-104)
+        map.add_volume(dec!(100.0), dec!(100.0));  // 10%
+        map.add_volume(dec!(101.0), dec!(500.0));  // 50% (POC)
+        map.add_volume(dec!(102.0), dec!(200.0));  // 20%
+        map.add_volume(dec!(105.0), dec!(200.0));  // 20% (gap at 103-104)
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Traditional method should create contiguous range around POC
         // Should include 101 (POC) + adjacent levels to reach ~70%
-        assert!(value_area.low <= 101.0, "Value area should include POC");
-        assert!(value_area.high >= 101.0, "Value area should include POC");
+        assert!(value_area.low <= dec!(101.0), "Value area should include POC");
+        assert!(value_area.high >= dec!(101.0), "Value area should include POC");
         
         // Should not include the isolated level at 105.0 due to gap
-        assert!(value_area.high <= 103.0, "Traditional method should maintain contiguous range");
+        assert!(value_area.high <= dec!(103.0), "Traditional method should maintain contiguous range");
     }
 
     #[test]
     fn test_edge_case_handling_extreme_concentration() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
         // Extreme case: 99% volume at highest price
-        map.add_volume(100.0, 10.0);    // 1%
-        map.add_volume(200.0, 990.0);   // 99% at price extreme
+        map.add_volume(dec!(100.0), dec!(10.0));    // 1%
+        map.add_volume(dec!(200.0), dec!(990.0));   // 99% at price extreme
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Should handle extreme concentration gracefully
         assert!(value_area.high >= value_area.low, "Should handle extreme concentration");
-        assert!(value_area.volume > 0.0, "Should have positive volume");
+        assert!(value_area.volume > dec!(0.0), "Should have positive volume");
         
         // POC (at 200.0) should be included in value area
-        assert!(value_area.low <= 200.0 && value_area.high >= 200.0,
+        assert!(value_area.low <= dec!(200.0) && value_area.high >= dec!(200.0),
                 "POC should be included even in extreme concentration");
     }
 
     #[test]
     fn test_volume_percentage_accuracy() {
-        let mut map = PriceLevelMap::new(0.5);
+        let mut map = PriceLevelMap::new(dec!(0.5));
         
         // Create distribution where we can control volume percentages precisely
-        map.add_volume(100.0, 100.0);   // 10%
-        map.add_volume(100.5, 300.0);   // 30%
-        map.add_volume(101.0, 400.0);   // 40% (POC)
-        map.add_volume(101.5, 150.0);   // 15%
-        map.add_volume(102.0, 50.0);    // 5%
+        map.add_volume(dec!(100.0), dec!(100.0));   // 10%
+        map.add_volume(dec!(100.5), dec!(300.0));   // 30%
+        map.add_volume(dec!(101.0), dec!(400.0));   // 40% (POC)
+        map.add_volume(dec!(101.5), dec!(150.0));   // 15%
+        map.add_volume(dec!(102.0), dec!(50.0));    // 5%
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Should target 70% volume but may be flexible within 65-75% range
-        assert!(value_area.volume_percentage >= 65.0 && value_area.volume_percentage <= 85.0,
+        assert!(value_area.volume_percentage >= dec!(65.0) && value_area.volume_percentage <= dec!(85.0),
                 "Volume percentage should be reasonable: {}%", value_area.volume_percentage);
         
         // Should include POC
-        assert!(value_area.low <= 101.0 && value_area.high >= 101.0,
+        assert!(value_area.low <= dec!(101.0) && value_area.high >= dec!(101.0),
                 "Should include POC in value area");
     }
 
     #[test]
     fn test_validation_range_correction() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
         // Create minimal volume profile
-        map.add_volume(100.0, 1000.0);
+        map.add_volume(dec!(100.0), dec!(1000.0));
         
-        let value_area = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
         
         // Single price level should be expanded to meaningful range
         assert!(value_area.high > value_area.low, 
@@ -2232,239 +2233,239 @@ mod tests {
 
     #[test]
     fn test_dual_method_poc_identification() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Add data with different volume and time period distributions
         // Price 100: 2 candles, 300 volume
-        map.add_volume_at_price(100.0, 150.0); // First candle
-        map.add_volume_at_price(100.0, 150.0); // Second candle 
+        map.add_volume_at_price(dec!(100.0), dec!(150.0)); // First candle
+        map.add_volume_at_price(dec!(100.0), dec!(150.0)); // Second candle 
         
         // Price 101: 5 candles, 200 volume  
-        map.add_volume_at_price(101.0, 40.0); // First candle
-        map.add_volume_at_price(101.0, 40.0); // Second candle
-        map.add_volume_at_price(101.0, 40.0); // Third candle
-        map.add_volume_at_price(101.0, 40.0); // Fourth candle
-        map.add_volume_at_price(101.0, 40.0); // Fifth candle
+        map.add_volume_at_price(dec!(101.0), dec!(40.0)); // First candle
+        map.add_volume_at_price(dec!(101.0), dec!(40.0)); // Second candle
+        map.add_volume_at_price(dec!(101.0), dec!(40.0)); // Third candle
+        map.add_volume_at_price(dec!(101.0), dec!(40.0)); // Fourth candle
+        map.add_volume_at_price(dec!(101.0), dec!(40.0)); // Fifth candle
         
         // Price 102: 1 candle, 100 volume
-        map.add_volume_at_price(102.0, 100.0);
+        map.add_volume_at_price(dec!(102.0), dec!(100.0));
         
         // Volume POC should be 100.0 (300 volume)
         let volume_poc = map.identify_poc_volume().unwrap();
-        assert_eq!(volume_poc, 100.0, "Volume POC should be at price with highest volume");
+        assert_eq!(volume_poc, dec!(100.0), "Volume POC should be at price with highest volume");
         
         // TPO POC should be 101.0 (5 candles)
         let tpo_poc = map.identify_poc_tpo().unwrap();
-        assert_eq!(tpo_poc, 101.0, "TPO POC should be at price with most candles");
+        assert_eq!(tpo_poc, dec!(101.0), "TPO POC should be at price with most candles");
         
         // Unified method should return correct POC based on mode
         let volume_unified_poc = map.identify_poc(&VolumeProfileCalculationMode::Volume).unwrap();
-        assert_eq!(volume_unified_poc, 100.0, "Unified Volume POC should match volume method");
+        assert_eq!(volume_unified_poc, dec!(100.0), "Unified Volume POC should match volume method");
         
         let tpo_unified_poc = map.identify_poc(&VolumeProfileCalculationMode::TPO).unwrap();
-        assert_eq!(tpo_unified_poc, 101.0, "Unified TPO POC should match TPO method");
+        assert_eq!(tpo_unified_poc, dec!(101.0), "Unified TPO POC should match TPO method");
     }
 
     #[test]
     fn test_dual_method_value_area_calculation() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create distribution where Volume and TPO methods will differ
         // Price 100: 1 candle, 1000 volume (high volume, low time)
-        map.add_volume_at_price(100.0, 1000.0);
+        map.add_volume_at_price(dec!(100.0), dec!(1000.0));
         
         // Price 101: 10 candles, 100 volume (low volume, high time)
         for _ in 0..10 {
-            map.add_volume_at_price(101.0, 10.0);
+            map.add_volume_at_price(dec!(101.0), dec!(10.0));
         }
         
         // Price 102: 5 candles, 500 volume (medium volume, medium time)
         for _ in 0..5 {
-            map.add_volume_at_price(102.0, 100.0);
+            map.add_volume_at_price(dec!(102.0), dec!(100.0));
         }
         
         // Calculate value areas using both methods
-        let volume_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
-        let tpo_va = map.calculate_value_area(70.0, &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::TPO);
+        let volume_va = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
+        let tpo_va = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::TPO);
         
         // Both should have valid ranges
         assert!(volume_va.high >= volume_va.low, "Volume value area should have valid range");
         assert!(tpo_va.high >= tpo_va.low, "TPO value area should have valid range");
         
         // Volume method should capture significant volume percentage
-        assert!(volume_va.volume_percentage >= 50.0, "Volume VA should capture significant volume");
+        assert!(volume_va.volume_percentage >= dec!(50.0), "Volume VA should capture significant volume");
         
         // TPO method may have different volume percentage since it's based on time periods
         // but should still be reasonable (the volume percentage is always calculated for display)
-        assert!(tpo_va.volume_percentage >= 0.0, "TPO VA should have valid volume percentage");
+        assert!(tpo_va.volume_percentage >= dec!(0.0), "TPO VA should have valid volume percentage");
         
         // Volume method should include price 100 (highest volume POC)
-        assert!(volume_va.low <= 100.0 && volume_va.high >= 100.0, 
+        assert!(volume_va.low <= dec!(100.0) && volume_va.high >= dec!(100.0), 
                 "Volume method should include highest volume price level");
         
         // TPO method should include price 101 (highest candle count POC)
-        assert!(tpo_va.low <= 101.0 && tpo_va.high >= 101.0, 
+        assert!(tpo_va.low <= dec!(101.0) && tpo_va.high >= dec!(101.0), 
                 "TPO method should include highest candle count price level");
     }
 
     #[test]
     fn test_candle_count_tracking() {
-        let mut map = PriceLevelMap::new(0.01);
+        let mut map = PriceLevelMap::new(dec!(0.01));
         
         // Add volume multiple times at same price to test candle counting
-        map.add_volume_at_price(100.0, 50.0);
-        map.add_volume_at_price(100.0, 75.0);
-        map.add_volume_at_price(100.0, 25.0);
+        map.add_volume_at_price(dec!(100.0), dec!(50.0));
+        map.add_volume_at_price(dec!(100.0), dec!(75.0));
+        map.add_volume_at_price(dec!(100.0), dec!(25.0));
         
         // Should have 3 candles and 150 total volume at price 100.0
         assert_eq!(map.get_total_candle_count(), 3, "Should have 3 total candles");
-        assert_eq!(map.total_volume(), 150.0, "Should have 150 total volume");
+        assert_eq!(map.total_volume(), dec!(150.0), "Should have 150 total volume");
         
         // Convert to price levels and verify candle count is included
         let price_levels = map.to_price_levels();
         assert_eq!(price_levels.len(), 1, "Should have 1 price level");
         assert_eq!(price_levels[0].candle_count, 3, "Price level should have 3 candles");
-        assert_eq!(price_levels[0].volume, 150.0, "Price level should have 150 volume");
-        assert_eq!(price_levels[0].price, 100.0, "Price level should be at 100.0");
+        assert_eq!(price_levels[0].volume, dec!(150.0), "Price level should have 150 volume");
+        assert_eq!(price_levels[0].price, dec!(100.0), "Price level should be at 100.0");
     }
 
     #[test]
     fn test_expand_value_area_tpo() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create TPO distribution with different candle counts
         // Price 100: 2 candles, 300 volume
-        map.add_volume_at_price(100.0, 150.0);
-        map.add_volume_at_price(100.0, 150.0);
+        map.add_volume_at_price(dec!(100.0), dec!(150.0));
+        map.add_volume_at_price(dec!(100.0), dec!(150.0));
         
         // Price 101: 8 candles, 400 volume (TPO POC)
         for _ in 0..8 {
-            map.add_volume_at_price(101.0, 50.0);
+            map.add_volume_at_price(dec!(101.0), dec!(50.0));
         }
         
         // Price 102: 6 candles, 600 volume
         for _ in 0..6 {
-            map.add_volume_at_price(102.0, 100.0);
+            map.add_volume_at_price(dec!(102.0), dec!(100.0));
         }
         
         // Price 103: 4 candles, 200 volume
         for _ in 0..4 {
-            map.add_volume_at_price(103.0, 50.0);
+            map.add_volume_at_price(dec!(103.0), dec!(50.0));
         }
         
         // Total: 20 candles, 70% = 14 candles
-        let va = map.expand_value_area_tpo(70.0);
+        let va = map.expand_value_area_tpo(dec!(70.0));
         
         // Should include POC at 101.0 (8 candles)
-        assert!(va.low <= 101.0 && va.high >= 101.0, 
+        assert!(va.low <= dec!(101.0) && va.high >= dec!(101.0), 
                 "TPO value area should include POC at 101.0");
         
         // Should have valid range
         assert!(va.high >= va.low, "Value area should have valid range");
         
         // Should have reasonable volume percentage
-        assert!(va.volume_percentage > 0.0, "Value area should have positive volume percentage");
+        assert!(va.volume_percentage > dec!(0.0), "Value area should have positive volume percentage");
     }
 
     #[test]
     fn test_expand_value_area_volume() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create volume distribution with different volumes
         // Price 100: 2 candles, 800 volume (Volume POC)
-        map.add_volume_at_price(100.0, 400.0);
-        map.add_volume_at_price(100.0, 400.0);
+        map.add_volume_at_price(dec!(100.0), dec!(400.0));
+        map.add_volume_at_price(dec!(100.0), dec!(400.0));
         
         // Price 101: 8 candles, 400 volume
         for _ in 0..8 {
-            map.add_volume_at_price(101.0, 50.0);
+            map.add_volume_at_price(dec!(101.0), dec!(50.0));
         }
         
         // Price 102: 6 candles, 300 volume
         for _ in 0..6 {
-            map.add_volume_at_price(102.0, 50.0);
+            map.add_volume_at_price(dec!(102.0), dec!(50.0));
         }
         
         // Price 103: 4 candles, 100 volume
         for _ in 0..4 {
-            map.add_volume_at_price(103.0, 25.0);
+            map.add_volume_at_price(dec!(103.0), dec!(25.0));
         }
         
         // Total: 1600 volume, 70% = 1120 volume
-        let va = map.expand_value_area_volume(70.0);
+        let va = map.expand_value_area_volume(dec!(70.0));
         
         // Should include POC at 100.0 (800 volume)
-        assert!(va.low <= 100.0 && va.high >= 100.0, 
+        assert!(va.low <= dec!(100.0) && va.high >= dec!(100.0), 
                 "Volume value area should include POC at 100.0");
         
         // Should have valid range
         assert!(va.high >= va.low, "Value area should have valid range");
         
         // Should achieve close to target percentage
-        assert!(va.volume_percentage >= 65.0, 
+        assert!(va.volume_percentage >= dec!(65.0), 
                 "Volume value area should achieve close to target percentage: got {:.2}%", 
                 va.volume_percentage);
     }
 
     #[test]
     fn test_unified_expand_value_area() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create mixed distribution
-        map.add_volume_at_price(100.0, 500.0); // High volume, 1 candle
+        map.add_volume_at_price(dec!(100.0), dec!(500.0)); // High volume, 1 candle
         for _ in 0..10 { // Low volume per candle, 10 candles
-            map.add_volume_at_price(101.0, 10.0);
+            map.add_volume_at_price(dec!(101.0), dec!(10.0));
         }
-        map.add_volume_at_price(102.0, 300.0); // Medium volume, 1 candle
+        map.add_volume_at_price(dec!(102.0), dec!(300.0)); // Medium volume, 1 candle
         
         // Test both methods
-        let volume_va = map.expand_value_area(70.0, &VolumeProfileCalculationMode::Volume);
-        let tpo_va = map.expand_value_area(70.0, &VolumeProfileCalculationMode::TPO);
+        let volume_va = map.expand_value_area(dec!(70.0), &VolumeProfileCalculationMode::Volume);
+        let tpo_va = map.expand_value_area(dec!(70.0), &VolumeProfileCalculationMode::TPO);
         
         // Both should produce valid results
         assert!(volume_va.high >= volume_va.low, "Volume VA should have valid range");
         assert!(tpo_va.high >= tpo_va.low, "TPO VA should have valid range");
         
         // Volume method should include price 100 (highest volume)
-        assert!(volume_va.low <= 100.0 && volume_va.high >= 100.0, 
+        assert!(volume_va.low <= dec!(100.0) && volume_va.high >= dec!(100.0), 
                 "Volume method should include highest volume price");
         
         // TPO method should include price 101 (most candles)
-        assert!(tpo_va.low <= 101.0 && tpo_va.high >= 101.0, 
+        assert!(tpo_va.low <= dec!(101.0) && tpo_va.high >= dec!(101.0), 
                 "TPO method should include highest candle count price");
     }
 
     #[test]
     fn test_validate_value_area_rules_valid() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create valid distribution with proper POC centering
-        map.add_volume_at_price(100.0, 200.0); // 1 candle, 200 volume
-        map.add_volume_at_price(101.0, 400.0); // 1 candle, 400 volume (POC)
-        map.add_volume_at_price(102.0, 300.0); // 1 candle, 300 volume
-        map.add_volume_at_price(103.0, 100.0); // 1 candle, 100 volume
+        map.add_volume_at_price(dec!(100.0), dec!(200.0)); // 1 candle, 200 volume
+        map.add_volume_at_price(dec!(101.0), dec!(400.0)); // 1 candle, 400 volume (POC)
+        map.add_volume_at_price(dec!(102.0), dec!(300.0)); // 1 candle, 300 volume
+        map.add_volume_at_price(dec!(103.0), dec!(100.0)); // 1 candle, 100 volume
         // Total: 1000 volume, 70% = 700 volume
         
-        let value_area = map.expand_value_area_volume(70.0);
-        let validation = map.validate_value_area_rules(&value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.expand_value_area_volume(dec!(70.0));
+        let validation = map.validate_value_area_rules(&value_area, dec!(70.0), &VolumeProfileCalculationMode::Volume);
         
         assert!(validation.is_valid, "Valid value area should pass validation");
         assert!(validation.errors.is_empty(), "Valid value area should have no errors");
-        assert_eq!(validation.metrics.poc_price, 101.0, "POC should be correctly identified");
-        assert!(validation.metrics.actual_volume_percentage >= 65.0, "Should achieve reasonable volume percentage");
+        assert_eq!(validation.metrics.poc_price, dec!(101.0), "POC should be correctly identified");
+        assert!(validation.metrics.actual_volume_percentage >= dec!(65.0), "Should achieve reasonable volume percentage");
     }
 
     #[test]
     fn test_validate_value_area_rules_poc_at_boundary() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create distribution where POC might end up at boundary
-        map.add_volume_at_price(100.0, 1000.0); // Highest volume at edge
-        map.add_volume_at_price(101.0, 100.0);
-        map.add_volume_at_price(102.0, 50.0);
+        map.add_volume_at_price(dec!(100.0), dec!(1000.0)); // Highest volume at edge
+        map.add_volume_at_price(dec!(101.0), dec!(100.0));
+        map.add_volume_at_price(dec!(102.0), dec!(50.0));
         
-        let value_area = map.expand_value_area_volume(70.0);
-        let validation = map.validate_value_area_rules(&value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.expand_value_area_volume(dec!(70.0));
+        let validation = map.validate_value_area_rules(&value_area, dec!(70.0), &VolumeProfileCalculationMode::Volume);
         
         // This should detect validation issues - either boundary problems or percentage issues
         // Both are valid business rule violations when POC is at extreme positions
@@ -2483,21 +2484,21 @@ mod tests {
 
     #[test]
     fn test_validate_value_area_rules_percentage_out_of_range() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create simple distribution
-        map.add_volume_at_price(100.0, 100.0);
-        map.add_volume_at_price(101.0, 100.0);
+        map.add_volume_at_price(dec!(100.0), dec!(100.0));
+        map.add_volume_at_price(dec!(101.0), dec!(100.0));
         
         // Create a value area with incorrect percentage
         let bad_value_area = ValueArea {
-            high: 101.0,
-            low: 100.0,
-            volume_percentage: 50.0, // Too low for 70% target
-            volume: 100.0,
+            high: dec!(101.0),
+            low: dec!(100.0),
+            volume_percentage: dec!(50.0), // Too low for 70% target
+            volume: dec!(100.0),
         };
         
-        let validation = map.validate_value_area_rules(&bad_value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        let validation = map.validate_value_area_rules(&bad_value_area, dec!(70.0), &VolumeProfileCalculationMode::Volume);
         
         assert!(!validation.is_valid, "Out-of-range percentage should fail validation");
         let percentage_error_found = validation.errors.iter()
@@ -2507,22 +2508,22 @@ mod tests {
 
     #[test]
     fn test_validate_value_area_rules_ordering_violation() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create distribution
-        map.add_volume_at_price(100.0, 100.0);
-        map.add_volume_at_price(101.0, 200.0); // POC
-        map.add_volume_at_price(102.0, 100.0);
+        map.add_volume_at_price(dec!(100.0), dec!(100.0));
+        map.add_volume_at_price(dec!(101.0), dec!(200.0)); // POC
+        map.add_volume_at_price(dec!(102.0), dec!(100.0));
         
         // Create invalid value area with wrong ordering
         let bad_value_area = ValueArea {
-            high: 100.0, // VAH < POC (invalid)
-            low: 102.0,  // VAL > POC (invalid)
-            volume_percentage: 70.0,
-            volume: 300.0,
+            high: dec!(100.0), // VAH < POC (invalid)
+            low: dec!(102.0),  // VAL > POC (invalid)
+            volume_percentage: dec!(70.0),
+            volume: dec!(300.0),
         };
         
-        let validation = map.validate_value_area_rules(&bad_value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        let validation = map.validate_value_area_rules(&bad_value_area, dec!(70.0), &VolumeProfileCalculationMode::Volume);
         
         assert!(!validation.is_valid, "Ordering violation should fail validation");
         let ordering_error_found = validation.errors.iter()
@@ -2532,71 +2533,71 @@ mod tests {
 
     #[test]
     fn test_validate_value_area_rules_metrics() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Create test distribution
-        map.add_volume_at_price(100.0, 100.0);
-        map.add_volume_at_price(101.0, 300.0); // POC
-        map.add_volume_at_price(102.0, 100.0);
+        map.add_volume_at_price(dec!(100.0), dec!(100.0));
+        map.add_volume_at_price(dec!(101.0), dec!(300.0)); // POC
+        map.add_volume_at_price(dec!(102.0), dec!(100.0));
         
-        let value_area = map.expand_value_area_volume(70.0);
-        let validation = map.validate_value_area_rules(&value_area, 70.0, &VolumeProfileCalculationMode::Volume);
+        let value_area = map.expand_value_area_volume(dec!(70.0));
+        let validation = map.validate_value_area_rules(&value_area, dec!(70.0), &VolumeProfileCalculationMode::Volume);
         
         // Check metrics are populated correctly
-        assert_eq!(validation.metrics.poc_price, 101.0, "POC price should be 101.0");
-        assert_eq!(validation.metrics.target_volume_percentage, 70.0, "Target percentage should be 70.0");
+        assert_eq!(validation.metrics.poc_price, dec!(101.0), "POC price should be 101.0");
+        assert_eq!(validation.metrics.target_volume_percentage, dec!(70.0), "Target percentage should be 70.0");
         assert!(validation.metrics.price_levels_count > 0, "Should count price levels in value area");
-        assert!(validation.metrics.poc_to_vah_distance >= 0.0, "Distance metrics should be non-negative");
-        assert!(validation.metrics.poc_to_val_distance >= 0.0, "Distance metrics should be non-negative");
+        assert!(validation.metrics.poc_to_vah_distance >= dec!(0.0), "Distance metrics should be non-negative");
+        assert!(validation.metrics.poc_to_val_distance >= dec!(0.0), "Distance metrics should be non-negative");
     }
 
     #[test]
     fn test_enhanced_price_level_management() {
-        let mut map = PriceLevelMap::new(1.0);
+        let mut map = PriceLevelMap::new(dec!(1.0));
         
         // Add data with different volume and candle combinations
-        map.add_volume_at_price(100.0, 200.0); // 1 candle, 200 volume
-        map.add_volume_at_price(100.0, 100.0); // 2nd candle, total 300 volume
+        map.add_volume_at_price(dec!(100.0), dec!(200.0)); // 1 candle, 200 volume
+        map.add_volume_at_price(dec!(100.0), dec!(100.0)); // 2nd candle, total 300 volume
         
-        map.add_volume_at_price(101.0, 500.0); // 1 candle, 500 volume (highest volume)
+        map.add_volume_at_price(dec!(101.0), dec!(500.0)); // 1 candle, 500 volume (highest volume)
         
         for _ in 0..5 { // 5 candles, 250 volume total (highest candle count)
-            map.add_volume_at_price(102.0, 50.0);
+            map.add_volume_at_price(dec!(102.0), dec!(50.0));
         }
         
         // Test percentage calculations
-        let volume_pct = map.calculate_volume_percentage(300.0); // Price 100.0
-        let expected_volume_pct = (300.0 / (300.0 + 500.0 + 250.0)) * 100.0;
-        assert!((volume_pct - expected_volume_pct).abs() < 0.01, 
+        let volume_pct = map.calculate_volume_percentage(dec!(300.0)); // Price 100.0
+        let expected_volume_pct = (dec!(300.0) / (dec!(300.0) + dec!(500.0) + dec!(250.0))) * dec!(100.0);
+        assert!((volume_pct - expected_volume_pct).abs() < dec!(0.01), 
                 "Volume percentage should be calculated correctly: got {:.2}%, expected {:.2}%", 
                 volume_pct, expected_volume_pct);
         
         let candle_pct = map.calculate_candle_percentage(5); // Price 102.0
-        let expected_candle_pct = (5.0 / (2.0 + 1.0 + 5.0)) * 100.0;
-        assert!((candle_pct - expected_candle_pct).abs() < 0.01, 
+        let expected_candle_pct = (dec!(5.0) / (dec!(2.0) + dec!(1.0) + dec!(5.0))) * dec!(100.0);
+        assert!((candle_pct - expected_candle_pct).abs() < dec!(0.01), 
                 "Candle percentage should be calculated correctly: got {:.2}%, expected {:.2}%", 
                 candle_pct, expected_candle_pct);
         
         // Test highest level identification
         let (highest_vol_price, highest_vol) = map.get_highest_volume_level().unwrap();
-        assert_eq!(highest_vol_price, 101.0, "Highest volume level should be at 101.0");
-        assert_eq!(highest_vol, 500.0, "Highest volume should be 500.0");
+        assert_eq!(highest_vol_price, dec!(101.0), "Highest volume level should be at 101.0");
+        assert_eq!(highest_vol, dec!(500.0), "Highest volume should be 500.0");
         
         let (highest_candle_price, highest_candle_count) = map.get_highest_candle_count_level().unwrap();
-        assert_eq!(highest_candle_price, 102.0, "Highest candle count level should be at 102.0");
+        assert_eq!(highest_candle_price, dec!(102.0), "Highest candle count level should be at 102.0");
         assert_eq!(highest_candle_count, 5, "Highest candle count should be 5");
         
         // Test price level metrics
-        let (volume, candle_count) = map.get_price_level_metrics(100.0).unwrap();
-        assert_eq!(volume, 300.0, "Price 100.0 should have 300 volume");
+        let (volume, candle_count) = map.get_price_level_metrics(dec!(100.0)).unwrap();
+        assert_eq!(volume, dec!(300.0), "Price 100.0 should have 300 volume");
         assert_eq!(candle_count, 2, "Price 100.0 should have 2 candles");
         
-        let (volume, candle_count) = map.get_price_level_metrics(102.0).unwrap();
-        assert_eq!(volume, 250.0, "Price 102.0 should have 250 volume");
+        let (volume, candle_count) = map.get_price_level_metrics(dec!(102.0)).unwrap();
+        assert_eq!(volume, dec!(250.0), "Price 102.0 should have 250 volume");
         assert_eq!(candle_count, 5, "Price 102.0 should have 5 candles");
         
         // Test non-existent price level
-        assert!(map.get_price_level_metrics(999.0).is_none(), "Non-existent price should return None");
+        assert!(map.get_price_level_metrics(dec!(999.0)).is_none(), "Non-existent price should return None");
     }
 }
 

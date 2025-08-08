@@ -758,36 +758,37 @@ pub struct VolumeProfileDatabaseStats {
 mod tests {
     use super::*;
     use crate::volume_profile::structs::{PriceLevelData, ValueArea};
+    use rust_decimal_macros::dec;
 
     fn create_test_profile_data() -> VolumeProfileData {
         VolumeProfileData {
             date: "2025-01-15".to_string(),
             price_levels: vec![
                 PriceLevelData {
-                    price: 50000.0,
-                    volume: 1000.0,
-                    percentage: 60.0,
+                    price: dec!(50000.0),
+                    volume: dec!(1000.0),
+                    percentage: dec!(60.0),
                     candle_count: 6,
                 },
                 PriceLevelData {
-                    price: 50001.0,
-                    volume: 666.67,
-                    percentage: 40.0,
+                    price: dec!(50001.0),
+                    volume: dec!(666.67),
+                    percentage: dec!(40.0),
                     candle_count: 4,
                 },
             ],
-            total_volume: 1666.67,
-            vwap: 50000.4,
-            poc: 50000.0,
+            total_volume: dec!(1666.67),
+            vwap: dec!(50000.4),
+            poc: dec!(50000.0),
             value_area: ValueArea {
-                high: 50001.0,
-                low: 50000.0,
-                volume_percentage: 70.0,
-                volume: 1166.67,
+                high: dec!(50001.0),
+                low: dec!(50000.0),
+                volume_percentage: dec!(70.0),
+                volume: dec!(1166.67),
             },
-            price_increment: 0.01,
-            min_price: 50000.0,
-            max_price: 50001.0,
+            price_increment: dec!(0.01),
+            min_price: dec!(50000.0),
+            max_price: dec!(50001.0),
             candle_count: 100,
             last_updated: 1737072000000,
         }
@@ -852,8 +853,8 @@ mod tests {
         // Test that the struct can be converted to/from flat format
         assert!(!profile_data.price_levels.is_empty());
         assert_eq!(profile_data.price_levels.len(), 2);
-        assert_eq!(profile_data.price_levels[0].price, 50000.0);
-        assert_eq!(profile_data.price_levels[0].volume, 1000.0);
+        assert_eq!(profile_data.price_levels[0].price, dec!(50000.0));
+        assert_eq!(profile_data.price_levels[0].volume, dec!(1000.0));
     }
 
     // Note: Database integration tests would require a running PostgreSQL instance

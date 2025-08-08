@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use crate::common::shared_data::{SymbolHashMap, new_symbol_hashmap};
 use std::sync::Arc;
 
 use chrono::{NaiveDate, Utc, DateTime, Datelike, Timelike};
@@ -431,9 +432,9 @@ pub enum VolumeProfileReply {
 #[derive(Debug, Clone)]
 pub struct GapDetectionManager {
     /// Missing volume profile dates for backfill processing
-    pub missing_dates: HashMap<String, Vec<NaiveDate>>,
+    pub missing_dates: SymbolHashMap<Vec<NaiveDate>>,
     /// Failed processing attempts with retry tracking
-    pub failed_attempts: HashMap<ProfileKey, RetryInfo>,
+    pub failed_attempts: FxHashMap<ProfileKey, RetryInfo>,
     /// Last gap detection scan time
     pub last_scan_time: Option<std::time::Instant>,
 }
@@ -494,8 +495,8 @@ impl GapDetectionManager {
     /// Create new gap detection manager
     pub fn new() -> Self {
         Self {
-            missing_dates: HashMap::new(),
-            failed_attempts: HashMap::new(),
+            missing_dates: new_symbol_hashmap(),
+            failed_attempts: FxHashMap::default(),
             last_scan_time: None,
         }
     }
@@ -547,8 +548,8 @@ impl GapDetectionManager {
     }
 
     /// Get comprehensive reporting of missing date ranges
-    pub fn get_missing_ranges_report(&self) -> HashMap<String, Vec<(NaiveDate, NaiveDate)>> {
-        let mut ranges = HashMap::new();
+    pub fn get_missing_ranges_report(&self) -> SymbolHashMap<Vec<(NaiveDate, NaiveDate)>> {
+        let mut ranges = new_symbol_hashmap();
         
         for (symbol, dates) in &self.missing_dates {
             let mut sorted_dates = dates.clone();
@@ -1136,7 +1137,7 @@ pub struct VolumeProfileActor {
     /// Configuration
     config: VolumeProfileConfig,
     /// Active volume profiles (one per symbol-date combination)
-    profiles: HashMap<ProfileKey, DailyVolumeProfile>,
+    profiles: FxHashMap<ProfileKey, DailyVolumeProfile>,
     /// Reference to PostgreSQL actor
     #[cfg(feature = "postgres")]
     postgres_actor: Option<ActorRef<PostgresActor>>,
@@ -1202,7 +1203,7 @@ impl VolumeProfileActor {
     pub fn new(config: VolumeProfileConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
             config,
-            profiles: HashMap::new(),
+            profiles: FxHashMap::default(),
             postgres_actor: None,
             // kafka_actor: None, // Removed - now handled by IndicatorActor
             lmdb_actor: None,
@@ -1375,7 +1376,7 @@ impl VolumeProfileActor {
         let batch_start = std::time::Instant::now();
 
         // Group candles by profile key
-        let mut grouped_candles: HashMap<ProfileKey, Vec<FuturesOHLCVCandle>> = HashMap::new();
+        let mut grouped_candles: FxHashMap<ProfileKey, Vec<FuturesOHLCVCandle>> = FxHashMap::default();
 
         for (symbol, candle) in batch {
             if let Some(profile_key) = ProfileKey::from_candle(symbol, &candle) {
@@ -2307,16 +2308,16 @@ mod tests {
             enabled: true,
             price_increment_mode: PriceIncrementMode::Fixed,
             target_price_levels: 200,
-            fixed_price_increment: 0.01,
-            min_price_increment: 0.001,
-            max_price_increment: 1.0,
+            fixed_price_increment: dec!(0.01),
+            min_price_increment: dec!(0.001),
+            max_price_increment: dec!(1.0),
             update_frequency: UpdateFrequency::EveryCandle,
             batch_size: 5,
-            value_area_percentage: 70.0,
+            value_area_percentage: dec!(70.0),
             volume_distribution_mode: VolumeDistributionMode::ClosingPrice,
             value_area_calculation_mode: ValueAreaCalculationMode::Traditional,
             calculation_mode: VolumeProfileCalculationMode::Volume,
-            asset_overrides: std::collections::HashMap::new(),
+            asset_overrides: new_symbol_hashmap(),
             historical_days: 60,
         }
     }
@@ -3260,10 +3261,10 @@ mod tests {
         assert!(performance_report.performance_summary.avg_processing_time_per_item_us > 0);
         assert!(performance_report.performance_summary.total_items >= 225); // 50+75+100
         // Memory efficiency might be 0 if no memory tracking occurred
-        assert!(performance_report.performance_summary.items_per_mb >= 0.0);
+        assert!(performance_report.performance_summary.items_per_mb >= dec!(0.0));
         
         // Ensure processing time is recorded
-        assert!(performance_report.performance_summary.total_processing_time_seconds > 0.0);
+        assert!(performance_report.performance_summary.total_processing_time_seconds > dec!(0.0));
     }
 
     #[test]

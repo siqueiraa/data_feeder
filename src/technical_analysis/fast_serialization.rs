@@ -5,6 +5,7 @@
 use crate::technical_analysis::structs::IndicatorOutput;
 use std::io::Write;
 use std::convert::TryInto;
+#[allow(unused_imports)]
 use rust_decimal_macros::dec;
 
 /// Compile-time validation to ensure all IndicatorOutput fields have corresponding serialization

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
@@ -233,7 +233,7 @@ impl VolumeConservationValidator {
         expected_volume: Decimal,
         price_levels: &[PriceLevelData]
     ) -> Result<(), VolumeValidationError> {
-        let mut volume_counts = HashMap::new();
+        let mut volume_counts = FxHashMap::default();
         
         for level in price_levels {
             // Use rounded volume as key to handle decimal precision
@@ -352,43 +352,43 @@ mod tests {
     #[test]
     fn test_volume_conservation_valid() {
         let price_levels = vec![
-            PriceLevelData { price: 100.0, volume: 100.0, percentage: 0.0, candle_count: 1 },
-            PriceLevelData { price: 101.0, volume: 200.0, percentage: 0.0, candle_count: 2 },
-            PriceLevelData { price: 102.0, volume: 300.0, percentage: 0.0, candle_count: 3 },
+            PriceLevelData { price: dec!(100.0), volume: dec!(100.0), percentage: dec!(0.0), candle_count: 1 },
+            PriceLevelData { price: dec!(101.0), volume: dec!(200.0), percentage: dec!(0.0), candle_count: 2 },
+            PriceLevelData { price: dec!(102.0), volume: dec!(300.0), percentage: dec!(0.0), candle_count: 3 },
         ];
         
-        let expected_volume = 600.0;
+        let expected_volume = dec!(600.0);
         let result = VolumeConservationValidator::validate_volume_conservation(expected_volume, &price_levels).unwrap();
         
         assert!(result.is_valid);
-        assert_eq!(result.expected_volume, 600.0);
-        assert_eq!(result.actual_volume, 600.0);
-        assert!(result.difference < 1e-10);
+        assert_eq!(result.expected_volume, dec!(600.0));
+        assert_eq!(result.actual_volume, dec!(600.0));
+        assert!(result.difference < dec!(0.0000000001));
     }
 
     #[test]
     fn test_volume_conservation_violation() {
         let price_levels = vec![
-            PriceLevelData { price: 100.0, volume: 100.0, percentage: 0.0, candle_count: 1 },
-            PriceLevelData { price: 101.0, volume: 200.0, percentage: 0.0, candle_count: 2 },
+            PriceLevelData { price: dec!(100.0), volume: dec!(100.0), percentage: dec!(0.0), candle_count: 1 },
+            PriceLevelData { price: dec!(101.0), volume: dec!(200.0), percentage: dec!(0.0), candle_count: 2 },
         ];
         
-        let expected_volume = 600.0;
+        let expected_volume = dec!(600.0);
         let result = VolumeConservationValidator::validate_volume_conservation(expected_volume, &price_levels).unwrap();
         
         assert!(!result.is_valid);
-        assert_eq!(result.expected_volume, 600.0);
-        assert_eq!(result.actual_volume, 300.0);
-        assert_eq!(result.difference, 300.0);
+        assert_eq!(result.expected_volume, dec!(600.0));
+        assert_eq!(result.actual_volume, dec!(300.0));
+        assert_eq!(result.difference, dec!(300.0));
     }
 
     #[test]
     fn test_invalid_volume_data() {
         let price_levels = vec![
-            PriceLevelData { price: 100.0, volume: -100.0, percentage: 0.0, candle_count: 1 },
+            PriceLevelData { price: dec!(100.0), volume: dec!(-100.0), percentage: dec!(0.0), candle_count: 1 },
         ];
         
-        let expected_volume = 100.0;
+        let expected_volume = dec!(100.0);
         let result = VolumeConservationValidator::validate_volume_conservation(expected_volume, &price_levels);
         
         assert!(matches!(result, Err(VolumeValidationError::InvalidVolumeData(_))));
@@ -397,66 +397,66 @@ mod tests {
     #[test]
     fn test_distribution_metrics() {
         let price_levels = vec![
-            PriceLevelData { price: 100.0, volume: 100.0, percentage: 0.0, candle_count: 1 },
-            PriceLevelData { price: 101.0, volume: 200.0, percentage: 0.0, candle_count: 2 },
-            PriceLevelData { price: 102.0, volume: 0.0, percentage: 0.0, candle_count: 0 },
-            PriceLevelData { price: 103.0, volume: 300.0, percentage: 0.0, candle_count: 3 },
+            PriceLevelData { price: dec!(100.0), volume: dec!(100.0), percentage: dec!(0.0), candle_count: 1 },
+            PriceLevelData { price: dec!(101.0), volume: dec!(200.0), percentage: dec!(0.0), candle_count: 2 },
+            PriceLevelData { price: dec!(102.0), volume: dec!(0.0), percentage: dec!(0.0), candle_count: 0 },
+            PriceLevelData { price: dec!(103.0), volume: dec!(300.0), percentage: dec!(0.0), candle_count: 3 },
         ];
         
         let metrics = VolumeConservationValidator::calculate_distribution_metrics(&price_levels);
         
         assert_eq!(metrics.total_levels, 4);
         assert_eq!(metrics.non_zero_levels, 3);
-        assert_eq!(metrics.max_volume, 300.0);
-        assert_eq!(metrics.min_volume, 0.0);
-        assert_eq!(metrics.average_volume, 150.0);
-        assert!(metrics.volume_concentration >= 0.0 && metrics.volume_concentration <= 1.0);
+        assert_eq!(metrics.max_volume, dec!(300.0));
+        assert_eq!(metrics.min_volume, dec!(0.0));
+        assert_eq!(metrics.average_volume, dec!(150.0));
+        assert!(metrics.volume_concentration >= dec!(0.0) && metrics.volume_concentration <= dec!(1.0));
     }
 
     #[test]
     fn test_distribution_accuracy() {
         let original_trades = vec![
-            (100.0, 100.0),
-            (101.0, 200.0),
-            (102.0, 300.0),
+            (dec!(100.0), dec!(100.0)),
+            (dec!(101.0), dec!(200.0)),
+            (dec!(102.0), dec!(300.0)),
         ];
         
         let price_levels = vec![
-            PriceLevelData { price: 100.0, volume: 100.0, percentage: 0.0, candle_count: 1 },
-            PriceLevelData { price: 101.0, volume: 200.0, percentage: 0.0, candle_count: 2 },
-            PriceLevelData { price: 102.0, volume: 300.0, percentage: 0.0, candle_count: 3 },
+            PriceLevelData { price: dec!(100.0), volume: dec!(100.0), percentage: dec!(0.0), candle_count: 1 },
+            PriceLevelData { price: dec!(101.0), volume: dec!(200.0), percentage: dec!(0.0), candle_count: 2 },
+            PriceLevelData { price: dec!(102.0), volume: dec!(300.0), percentage: dec!(0.0), candle_count: 3 },
         ];
         
         let metrics = VolumeConservationValidator::validate_distribution_accuracy(
             &original_trades, 
             &price_levels, 
-            1.0
+            dec!(1.0)
         ).unwrap();
         
         assert_eq!(metrics.total_levels, 3);
-        assert_eq!(metrics.max_volume, 300.0);
+        assert_eq!(metrics.max_volume, dec!(300.0));
     }
 
     #[test]
     fn test_empty_price_levels() {
         let price_levels = vec![];
-        let expected_volume = 0.0;
+        let expected_volume = dec!(0.0);
         
         let result = VolumeConservationValidator::validate_volume_conservation(expected_volume, &price_levels).unwrap();
         
         assert!(result.is_valid);
-        assert_eq!(result.expected_volume, 0.0);
-        assert_eq!(result.actual_volume, 0.0);
+        assert_eq!(result.expected_volume, dec!(0.0));
+        assert_eq!(result.actual_volume, dec!(0.0));
     }
 
     #[test]
     fn test_generate_validation_report() {
         let price_levels = vec![
-            PriceLevelData { price: 100.0, volume: 100.0, percentage: 0.0, candle_count: 1 },
-            PriceLevelData { price: 101.0, volume: 200.0, percentage: 0.0, candle_count: 2 },
+            PriceLevelData { price: dec!(100.0), volume: dec!(100.0), percentage: dec!(0.0), candle_count: 1 },
+            PriceLevelData { price: dec!(101.0), volume: dec!(200.0), percentage: dec!(0.0), candle_count: 2 },
         ];
         
-        let expected_volume = 300.0;
+        let expected_volume = dec!(300.0);
         let report = VolumeConservationValidator::generate_validation_report(expected_volume, &price_levels);
         
         assert!(report.contains("VALID"));

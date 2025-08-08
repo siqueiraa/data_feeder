@@ -674,7 +674,7 @@ impl IncrementalEMA {
 }
 
 /// Trend detection based on EMA and candle patterns
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum TrendDirection {
     Buy,
     Sell,

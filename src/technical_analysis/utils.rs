@@ -3,6 +3,7 @@ use crate::technical_analysis::structs::{VolumeRecord, TrendDirection, QuantileR
 use tracing::{debug, info, warn};
 use kameo::actor::ActorRef;
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
+use rustc_hash::FxHashMap;
 
 
 /// Load recent candles from LMDB using LmdbActor (prevents environment conflicts)
@@ -110,8 +111,8 @@ pub fn calculate_min_candles_needed(
 pub fn pre_aggregate_historical_candles(
     minute_candles: &[FuturesOHLCVCandle],
     target_timeframes: &[u64],
-) -> std::collections::HashMap<u64, Vec<FuturesOHLCVCandle>> {
-    let mut result = std::collections::HashMap::new();
+) -> FxHashMap<u64, Vec<FuturesOHLCVCandle>> {
+    let mut result = FxHashMap::default();
 
     for &timeframe_seconds in target_timeframes {
         if timeframe_seconds == 60 {

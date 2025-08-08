@@ -4,8 +4,9 @@
 //! in hot paths throughout the application.
 
 use std::sync::Arc;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
+use foldhash::HashMap as FoldHashMap;
 use crate::historical::structs::FuturesOHLCVCandle;
 use crate::technical_analysis::structs::IndicatorOutput;
 
@@ -62,12 +63,16 @@ pub fn unshare_candles(shared_candles: &[SharedCandle]) -> Vec<FuturesOHLCVCandl
     shared_candles.iter().map(|shared| (**shared).clone()).collect()
 }
 
-/// String interner for frequently used symbols and intervals
-static STRING_INTERNER: OnceLock<std::sync::Mutex<HashMap<String, Arc<str>>>> = OnceLock::new();
+/// String interner for frequently used symbols and intervals (general purpose)
+static STRING_INTERNER: OnceLock<std::sync::Mutex<FxHashMap<String, Arc<str>>>> = OnceLock::new();
 
-/// Get or create an interned string for a symbol
+/// Symbol-optimized interner using foldhash for high-frequency symbol lookups
+/// Optimized for short string keys like "BTCUSDT", "ETHUSDT", etc.
+static SYMBOL_INTERNER: OnceLock<std::sync::Mutex<FoldHashMap<String, Arc<str>>>> = OnceLock::new();
+
+/// Get or create an interned string for a symbol (using FxHashMap for general use)
 pub fn intern_symbol(symbol: &str) -> Arc<str> {
-    let interner = STRING_INTERNER.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let interner = STRING_INTERNER.get_or_init(|| std::sync::Mutex::new(FxHashMap::default()));
     let mut map = interner.lock().unwrap();
     
     if let Some(interned) = map.get(symbol) {
@@ -77,6 +82,30 @@ pub fn intern_symbol(symbol: &str) -> Arc<str> {
         map.insert(symbol.to_string(), Arc::clone(&interned));
         interned
     }
+}
+
+/// Get or create an interned string for a symbol using foldhash optimization
+/// This is specifically optimized for short string keys like cryptocurrency symbols
+/// Use this for high-frequency symbol operations in websocket and volume profile modules
+pub fn intern_symbol_fast(symbol: &str) -> Arc<str> {
+    let interner = SYMBOL_INTERNER.get_or_init(|| std::sync::Mutex::new(FoldHashMap::default()));
+    let mut map = interner.lock().unwrap();
+    
+    if let Some(interned) = map.get(symbol) {
+        Arc::clone(interned)
+    } else {
+        let interned: Arc<str> = Arc::from(symbol);
+        map.insert(symbol.to_string(), Arc::clone(&interned));
+        interned
+    }
+}
+
+/// Type alias for foldhash HashMap optimized for symbol keys
+pub type SymbolHashMap<V> = FoldHashMap<String, V>;
+
+/// Create a new foldhash HashMap optimized for symbol lookups
+pub fn new_symbol_hashmap<V>() -> SymbolHashMap<V> {
+    FoldHashMap::default()
 }
 
 /// Get or create an interned string for an interval

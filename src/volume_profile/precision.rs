@@ -468,12 +468,12 @@ mod tests {
 
     #[test]
     fn test_banker_rounding() {
-        assert_eq!(banker_round(2.5), 2);  // Round to even
-        assert_eq!(banker_round(3.5), 4);  // Round to even
-        assert_eq!(banker_round(1.4), 1);  // Round down
-        assert_eq!(banker_round(1.6), 2);  // Round up
-        assert_eq!(banker_round(-2.5), -2); // Negative round to even
-        assert_eq!(banker_round(-3.5), -4); // Negative round to even
+        assert_eq!(banker_round(dec!(2.5)), 2);  // Round to even
+        assert_eq!(banker_round(dec!(3.5)), 4);  // Round to even
+        assert_eq!(banker_round(dec!(1.4)), 1);  // Round down
+        assert_eq!(banker_round(dec!(1.6)), 2);  // Round up
+        assert_eq!(banker_round(dec!(-2.5)), -2); // Negative round to even
+        assert_eq!(banker_round(dec!(-3.5)), -4); // Negative round to even
     }
 
     #[test]
