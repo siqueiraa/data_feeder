@@ -6,6 +6,7 @@
 pub mod actor;
 pub mod calculator;
 pub mod database;
+pub mod numeric;
 pub mod precision;
 pub mod structs;
 pub mod validation;

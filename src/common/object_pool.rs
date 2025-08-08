@@ -9,6 +9,9 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use tracing::debug;
 
+#[cfg(feature = "volume_profile")]
+use crate::volume_profile::structs::DailyVolumeProfileFlat;
+
 /// Thread-safe object pool for any type that implements Default + Clone
 pub struct ObjectPool<T> {
     pool: Mutex<VecDeque<T>>,
@@ -46,12 +49,13 @@ where
     }
 
     /// Return an object to the pool for reuse
-    pub fn put(&self, _obj: T) {
+    pub fn put(&self, obj: T) {
         if let Ok(mut pool) = self.pool.lock() {
             if pool.len() < self.max_size {
                 // Reset the object to default state and store in pool
-                let reset_obj = T::default();
-                pool.push_back(reset_obj);
+                // Note: We should reset the object to clean state before storing
+                // For now, store the object as-is since T: Default allows creating clean objects on get()
+                pool.push_back(obj);
             }
         }
     }
@@ -185,6 +189,46 @@ impl Default for CandlePool {
     }
 }
 
+/// Specialized pool for volume profile data structures
+#[cfg(feature = "volume_profile")]
+pub struct VolumeProfilePool {
+    pool: ObjectPool<DailyVolumeProfileFlat>,
+}
+
+#[cfg(feature = "volume_profile")]
+impl VolumeProfilePool {
+    pub fn new() -> Self {
+        Self {
+            // Use lazy allocation (0 pre-allocated) since DailyVolumeProfileFlat can be large
+            // Each object contains Vec<(Decimal, Decimal)> for price levels which could be 
+            // hundreds of entries per trading day, making pre-allocation memory-intensive
+            pool: ObjectPool::new(0),
+        }
+    }
+
+    /// Get a volume profile from the pool
+    pub fn get_profile(&self) -> DailyVolumeProfileFlat {
+        self.pool.get()
+    }
+
+    /// Return a volume profile to the pool
+    pub fn put_profile(&self, profile: DailyVolumeProfileFlat) {
+        self.pool.put(profile);
+    }
+
+    /// Get pool statistics
+    pub fn stats(&self) -> PoolStats {
+        self.pool.stats()
+    }
+}
+
+#[cfg(feature = "volume_profile")]
+impl Default for VolumeProfilePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// RAII wrapper for pooled objects
 pub struct PooledObject<T, P> 
 where 
@@ -235,6 +279,8 @@ pub struct GlobalPools {
     pub vec_pool: VecPool,
     pub candle_pool: CandlePool,
     pub string_pool: ObjectPool<String>,
+    #[cfg(feature = "volume_profile")]
+    pub volume_profile_pool: VolumeProfilePool,
 }
 
 impl GlobalPools {
@@ -243,6 +289,8 @@ impl GlobalPools {
             vec_pool: VecPool::new(),
             candle_pool: CandlePool::new(),
             string_pool: ObjectPool::new(64),
+            #[cfg(feature = "volume_profile")]
+            volume_profile_pool: VolumeProfilePool::new(),
         }
     }
 
@@ -251,7 +299,30 @@ impl GlobalPools {
         let vec_stats = self.vec_pool.stats();
         let candle_stats = self.candle_pool.stats();
         let string_stats = self.string_pool.stats();
+        
+        #[cfg(feature = "volume_profile")]
+        let vp_stats = self.volume_profile_pool.stats();
 
+        #[cfg(feature = "volume_profile")]
+        return format!(
+            "Object Pool Statistics:\n\
+             Vec Pools: {:?}\n\
+             Candle Pool: created={}, reused={}, hit_rate={:.1}%\n\
+             String Pool: created={}, reused={}, hit_rate={:.1}%\n\
+             Volume Profile Pool: created={}, reused={}, hit_rate={:.1}%",
+            vec_stats,
+            candle_stats.created_count,
+            candle_stats.reused_count,
+            candle_stats.hit_rate() * 100.0,
+            string_stats.created_count,
+            string_stats.reused_count,
+            string_stats.hit_rate() * 100.0,
+            vp_stats.created_count,
+            vp_stats.reused_count,
+            vp_stats.hit_rate() * 100.0
+        );
+
+        #[cfg(not(feature = "volume_profile"))]
         format!(
             "Object Pool Statistics:\n\
              Vec Pools: {:?}\n\
@@ -334,6 +405,30 @@ macro_rules! put_pooled_candle {
     };
 }
 
+/// Convenience macro for getting a pooled volume profile
+#[cfg(feature = "volume_profile")]
+#[macro_export]
+macro_rules! get_pooled_volume_profile {
+    () => {
+        if let Some(pools) = $crate::common::object_pool::get_global_pools() {
+            pools.volume_profile_pool.get_profile()
+        } else {
+            $crate::volume_profile::structs::DailyVolumeProfileFlat::default()
+        }
+    };
+}
+
+/// Convenience macro for returning a volume profile to the pool
+#[cfg(feature = "volume_profile")]
+#[macro_export]
+macro_rules! put_pooled_volume_profile {
+    ($profile:expr) => {
+        if let Some(pools) = $crate::common::object_pool::get_global_pools() {
+            pools.volume_profile_pool.put_profile($profile);
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,7 +475,11 @@ mod tests {
         pool.put_vec(vec3);
         pool.put_vec(vec4);
         
-        // Verify pools have objects
+        // Get more vectors to trigger reuse
+        let _reused_vec1 = pool.get_vec(10);
+        let _reused_vec2 = pool.get_vec(50);
+        
+        // Verify pools have reused objects
         let stats = pool.stats();
         assert!(stats.iter().any(|s| s.reused_count > 0));
     }

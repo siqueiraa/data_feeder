@@ -422,6 +422,25 @@ impl From<DailyVolumeProfileFlat> for VolumeProfileData {
     }
 }
 
+impl Default for DailyVolumeProfileFlat {
+    fn default() -> Self {
+        use rust_decimal_macros::dec;
+        Self {
+            date: String::new(),
+            total_volume: dec!(0.0),
+            vwap: dec!(0.0),
+            poc: dec!(0.0),
+            value_area: ValueArea::default(),
+            price_increment: dec!(0.01),
+            min_price: dec!(0.0),
+            max_price: dec!(0.0),
+            candle_count: 0,
+            last_updated: 0,
+            price_levels: Vec::new(),
+        }
+    }
+}
+
 /// Individual price level data within volume profile
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceLevelData {
@@ -787,26 +806,32 @@ impl PriceLevelMap {
             None => return ValueArea::default(),
         };
         
-        // Get all price keys sorted by price
-        let mut all_levels: Vec<_> = self.candle_counts.keys().collect();
-        all_levels.sort();
-        
-        let poc_index = all_levels.iter().position(|&key| *key == poc_key)
-            .unwrap_or(0);
-        
-        // Start from POC and expand symmetrically
-        let mut included_candles = Decimal::from(self.candle_counts.get(&poc_key).copied().unwrap_or(0));
-        let mut selected_levels = vec![poc_key];
-        let mut low_index = poc_index;
-        let mut high_index = poc_index;
-        
-        // Expand symmetrically to center POC
-        while included_candles < target_candles && (low_index > 0 || high_index < all_levels.len() - 1) {
-            let mut candidates = Vec::new();
+        // Use bumpalo arena allocation for temporary collections in value area calculation
+        crate::volume_profile::calculator::with_calculation_arena(|arena| {
+            use bumpalo::collections::Vec as BumpVec;
+            
+            // Get all price keys sorted by price using arena allocation
+            let mut all_levels = BumpVec::with_capacity_in(self.candle_counts.len(), arena);
+            all_levels.extend(self.candle_counts.keys());
+            all_levels.sort();
+            
+            let poc_index = all_levels.iter().position(|&key: &PriceKey| key == poc_key)
+                .unwrap_or(0);
+            
+            // Start from POC and expand symmetrically using arena-allocated vectors
+            let mut included_candles = Decimal::from(self.candle_counts.get(&poc_key).copied().unwrap_or(0));
+            let mut selected_levels = BumpVec::with_capacity_in(all_levels.len(), arena);
+            selected_levels.push(poc_key);
+            let mut low_index = poc_index;
+            let mut high_index = poc_index;
+            
+            // Expand symmetrically to center POC
+            while included_candles < target_candles && (low_index > 0 || high_index < all_levels.len() - 1) {
+                let mut candidates = BumpVec::with_capacity_in(2, arena); // At most 2 candidates (left/right)
             
             // Check left expansion
             if low_index > 0 {
-                let left_key = *all_levels[low_index - 1];
+                let left_key = all_levels[low_index - 1];
                 let left_candles = Decimal::from(self.candle_counts.get(&left_key).copied().unwrap_or(0));
                 if left_candles > Decimal::ZERO {
                     candidates.push((left_key, left_candles, low_index - 1, "left"));
@@ -815,7 +840,7 @@ impl PriceLevelMap {
             
             // Check right expansion
             if high_index < all_levels.len() - 1 {
-                let right_key = *all_levels[high_index + 1];
+                let right_key = all_levels[high_index + 1];
                 let right_candles = Decimal::from(self.candle_counts.get(&right_key).copied().unwrap_or(0));
                 if right_candles > Decimal::ZERO {
                     candidates.push((right_key, right_candles, high_index + 1, "right"));
@@ -841,28 +866,30 @@ impl PriceLevelMap {
             } else {
                 high_index = selected_index;
             }
-        }
-        
-        // Determine final boundaries
-        let low_key = *all_levels[low_index];
-        let high_key = *all_levels[high_index];
-        let final_low = low_key.to_price(self.price_increment);
-        let final_high = high_key.to_price(self.price_increment);
-        
-        // Calculate actual volume in final range (always return actual volume)
-        let actual_volume = self.levels.iter()
-            .filter(|(key, _)| **key >= low_key && **key <= high_key)
-            .map(|(_, volume)| *volume)
-            .sum::<Decimal>();
-        
-        let total_volume = self.total_volume();
-        
-        ValueArea {
-            low: final_low,
-            high: final_high,
-            volume: actual_volume,
-            volume_percentage: if total_volume > Decimal::ZERO { (actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
-        }
+            }
+            
+            // Determine final boundaries
+            let low_key = all_levels[low_index];
+            let high_key = all_levels[high_index];
+            let final_low = low_key.to_price(self.price_increment);
+            let final_high = high_key.to_price(self.price_increment);
+            
+            // Calculate actual volume in final range (always return actual volume)
+            let actual_volume = self.levels.iter()
+                .filter(|(key, _)| **key >= low_key && **key <= high_key)
+                .map(|(_, volume)| *volume)
+                .sum::<Decimal>();
+            
+            let total_volume = self.total_volume();
+            
+            // Arena memory is automatically freed when this closure exits
+            ValueArea {
+                low: final_low,
+                high: final_high,
+                volume: actual_volume,
+                volume_percentage: if total_volume > Decimal::ZERO { (actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
+            }
+        }) // End of arena allocation closure
     }
     
     /// Expand value area using Volume method
@@ -886,26 +913,32 @@ impl PriceLevelMap {
             None => return ValueArea::default(),
         };
         
-        // Get all price keys sorted by price
-        let mut all_levels: Vec<_> = self.levels.keys().collect();
-        all_levels.sort();
-        
-        let poc_index = all_levels.iter().position(|&key| *key == poc_key)
-            .unwrap_or(0);
-        
-        // Start from POC and expand symmetrically
-        let mut included_volume = self.levels.get(&poc_key).copied().unwrap_or(Decimal::ZERO);
-        let mut selected_levels = vec![poc_key];
-        let mut low_index = poc_index;
-        let mut high_index = poc_index;
-        
-        // Expand symmetrically to center POC
-        while included_volume < target_volume && (low_index > 0 || high_index < all_levels.len() - 1) {
-            let mut candidates = Vec::new();
+        // Use bumpalo arena allocation for temporary collections in volume-based value area calculation
+        crate::volume_profile::calculator::with_calculation_arena(|arena| {
+            use bumpalo::collections::Vec as BumpVec;
+            
+            // Get all price keys sorted by price using arena allocation
+            let mut all_levels = BumpVec::with_capacity_in(self.levels.len(), arena);
+            all_levels.extend(self.levels.keys());
+            all_levels.sort();
+            
+            let poc_index = all_levels.iter().position(|&key: &PriceKey| key == poc_key)
+                .unwrap_or(0);
+            
+            // Start from POC and expand symmetrically using arena-allocated vectors
+            let mut included_volume = self.levels.get(&poc_key).copied().unwrap_or(Decimal::ZERO);
+            let mut selected_levels = BumpVec::with_capacity_in(all_levels.len(), arena);
+            selected_levels.push(poc_key);
+            let mut low_index = poc_index;
+            let mut high_index = poc_index;
+            
+            // Expand symmetrically to center POC
+            while included_volume < target_volume && (low_index > 0 || high_index < all_levels.len() - 1) {
+                let mut candidates = BumpVec::with_capacity_in(2, arena); // At most 2 candidates (left/right)
             
             // Check left expansion
             if low_index > 0 {
-                let left_key = *all_levels[low_index - 1];
+                let left_key = all_levels[low_index - 1];
                 let left_volume = self.levels.get(&left_key).copied().unwrap_or(Decimal::ZERO);
                 if left_volume > Decimal::ZERO {
                     candidates.push((left_key, left_volume, low_index - 1, "left"));
@@ -914,7 +947,7 @@ impl PriceLevelMap {
             
             // Check right expansion
             if high_index < all_levels.len() - 1 {
-                let right_key = *all_levels[high_index + 1];
+                let right_key = all_levels[high_index + 1];
                 let right_volume = self.levels.get(&right_key).copied().unwrap_or(Decimal::ZERO);
                 if right_volume > Decimal::ZERO {
                     candidates.push((right_key, right_volume, high_index + 1, "right"));
@@ -940,62 +973,88 @@ impl PriceLevelMap {
             } else {
                 high_index = selected_index;
             }
-        }
-        
-        // Determine final boundaries
-        let low_key = *all_levels[low_index];
-        let high_key = *all_levels[high_index];
-        let final_low = low_key.to_price(self.price_increment);
-        let final_high = high_key.to_price(self.price_increment);
-        
-        // Calculate actual volume in final range
-        let actual_volume = self.levels.iter()
-            .filter(|(key, _)| **key >= low_key && **key <= high_key)
-            .map(|(_, volume)| *volume)
-            .sum::<Decimal>();
-        
-        ValueArea {
-            low: final_low,
-            high: final_high,
-            volume: actual_volume,
-            volume_percentage: if total_volume > Decimal::ZERO { (actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
-        }
+            }
+            
+            // Determine final boundaries
+            let low_key = all_levels[low_index];
+            let high_key = all_levels[high_index];
+            let final_low = low_key.to_price(self.price_increment);
+            let final_high = high_key.to_price(self.price_increment);
+            
+            // Calculate actual volume in final range
+            let actual_volume = self.levels.iter()
+                .filter(|(key, _)| **key >= low_key && **key <= high_key)
+                .map(|(_, volume)| *volume)
+                .sum::<Decimal>();
+            
+            // Arena memory is automatically freed when this closure exits
+            ValueArea {
+                low: final_low,
+                high: final_high,
+                volume: actual_volume,
+                volume_percentage: if total_volume > Decimal::ZERO { (actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
+            }
+        }) // End of arena allocation closure
     }
 
-    /// Convert to sorted vector of price level data
+    /// Convert to sorted vector of price level data using arena allocation for temporary calculations
     pub fn to_price_levels(&self) -> Vec<PriceLevelData> {
         let total_volume = self.total_volume();
         if total_volume <= Decimal::ZERO {
             return Vec::new();
         }
 
-        self.levels
-            .iter()
-            .map(|(price_key, &volume)| {
+        // Use bumpalo arena allocation for temporary calculation space
+        crate::volume_profile::calculator::with_calculation_arena(|arena| {
+            use bumpalo::collections::Vec as BumpVec;
+            
+            // Create arena-allocated temporary vector for collecting data
+            let mut arena_results = BumpVec::with_capacity_in(self.levels.len(), arena);
+            
+            // Collect price level data using arena-allocated temporary storage
+            for (price_key, &volume) in &self.levels {
                 let candle_count = self.candle_counts.get(price_key).copied().unwrap_or(0);
-                PriceLevelData {
+                let price_level = PriceLevelData {
                     price: price_key.to_price(self.price_increment),
                     volume,
                     percentage: (volume / total_volume) * dec!(100.0),
                     candle_count,
-                }
-            })
-            .collect()
+                };
+                arena_results.push(price_level);
+            }
+            
+            // Convert to standard Vec for return (arena memory freed after this)
+            arena_results.iter().cloned().collect()
+        })
     }
 
-    /// Calculate VWAP (Volume Weighted Average Price)
+    /// Calculate VWAP (Volume Weighted Average Price) using arena allocation for temporary calculations
     pub fn calculate_vwap(&self) -> Decimal {
         let total_volume = self.total_volume();
         if total_volume <= Decimal::ZERO {
             return Decimal::ZERO;
         }
 
-        let weighted_sum: Decimal = self.levels
-            .iter()
-            .map(|(price_key, &volume)| price_key.to_price(self.price_increment) * volume)
-            .sum();
-
-        weighted_sum / total_volume
+        // Use bumpalo arena allocation for temporary calculations to reduce heap allocations
+        crate::volume_profile::calculator::with_calculation_arena(|arena| {
+            use bumpalo::collections::Vec as BumpVec;
+            
+            // Create arena-allocated vector for price-volume pairs
+            let mut weighted_values = BumpVec::with_capacity_in(self.levels.len(), arena);
+            
+            // Calculate weighted values using arena-allocated temporary storage
+            for (price_key, &volume) in &self.levels {
+                let price = price_key.to_price(self.price_increment);
+                let weighted_value = price * volume;
+                weighted_values.push(weighted_value);
+            }
+            
+            // Sum the weighted values
+            let weighted_sum: Decimal = weighted_values.iter().sum();
+            
+            // Arena memory is automatically freed when this closure exits
+            weighted_sum / total_volume
+        })
     }
 
         /// Calculate value area using the specified method and calculation mode

@@ -47,6 +47,9 @@ warp = "0.3"
 tdigest = "0.2"
 rust_decimal = { version = "1.36", features = ["serde"] }
 rust_decimal_macros = "1.36"
+bumpalo = { version = "3.14", features = ["collections"] }
+fixed = "1.24"
+fast-float = "0.2"
 prometheus = "0.13"
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }

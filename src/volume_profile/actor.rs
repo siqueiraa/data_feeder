@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use crate::common::shared_data::{SymbolHashMap, new_symbol_hashmap};
+use crate::common::shared_data::{SymbolHashMap, new_symbol_hashmap, SharedSymbol, intern_symbol_fast};
 use std::sync::Arc;
 
 use chrono::{NaiveDate, Utc, DateTime, Datelike, Timelike};
@@ -1175,16 +1175,19 @@ pub struct VolumeProfileActor {
     reprocessing_coordinator: Option<super::reprocessing::ReprocessingCoordinator>,
 }
 
-/// Key for identifying unique volume profiles (symbol + date)
+/// Key for identifying unique volume profiles (symbol + date) with interned symbol for memory efficiency
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProfileKey {
-    pub symbol: String,
+    pub symbol: SharedSymbol,
     pub date: NaiveDate,
 }
 
 impl ProfileKey {
     fn new(symbol: String, date: NaiveDate) -> Self {
-        Self { symbol, date }
+        Self { 
+            symbol: intern_symbol_fast(&symbol), 
+            date 
+        }
     }
 
     fn from_candle(symbol: String, candle: &FuturesOHLCVCandle) -> Option<Self> {
@@ -1272,13 +1275,13 @@ impl VolumeProfileActor {
                   profile_key.symbol, profile_key.date);
             
             // CRITICAL FIX: Rebuild historical data for the day BEFORE creating empty profile
-            if let Err(e) = self.rebuild_day(profile_key.symbol.clone(), profile_key.date).await {
+            if let Err(e) = self.rebuild_day(profile_key.symbol.to_string(), profile_key.date).await {
                 warn!("⚠️ Failed to rebuild historical data for {} on {}: {}. Creating empty profile.", 
                       profile_key.symbol, profile_key.date, e);
                 
                 // Fallback: create empty profile if historical rebuild fails
-                let profile = DailyVolumeProfile::new(
-                    profile_key.symbol.clone(),
+                let profile = DailyVolumeProfile::new_with_interned_symbol(
+                    Arc::clone(&profile_key.symbol),
                     profile_key.date,
                     &self.config,
                 );
@@ -1389,8 +1392,8 @@ impl VolumeProfileActor {
         for (profile_key, candles) in grouped_candles {
             // Ensure profile exists
             if !self.profiles.contains_key(&profile_key) {
-                let profile = DailyVolumeProfile::new(
-                    profile_key.symbol.clone(),
+                let profile = DailyVolumeProfile::new_with_interned_symbol(
+                    Arc::clone(&profile_key.symbol),
                     profile_key.date,
                     &self.config,
                 );
@@ -1742,7 +1745,7 @@ impl VolumeProfileActor {
                   profile_key.symbol, profile_key.date, 
                   self.gap_manager.failed_attempts.get(&profile_key).map(|r| r.attempt_count + 1).unwrap_or(1));
 
-            match self.rebuild_day(profile_key.symbol.clone(), profile_key.date).await {
+            match self.rebuild_day(profile_key.symbol.to_string(), profile_key.date).await {
                 Ok(()) => {
                     info!("✅ RETRY SUCCESS: Volume profile rebuilt for {} on {}", 
                           profile_key.symbol, profile_key.date);
@@ -1802,7 +1805,7 @@ impl VolumeProfileActor {
             // Send StoreVolumeProfile message to PostgreSQL actor
             #[cfg(feature = "postgres")]
             let message = crate::postgres::actor::PostgresTell::StoreVolumeProfile {
-                symbol: profile_key.symbol.clone(),
+                symbol: profile_key.symbol.to_string(),
                 date: profile_key.date,
                 profile_data: profile_data.clone(),
             };
@@ -2360,7 +2363,7 @@ mod tests {
         assert!(key.is_some());
         
         let key = key.unwrap();
-        assert_eq!(key.symbol, "BTCUSDT");
+        assert_eq!(&*key.symbol, "BTCUSDT");
         // The timestamp 1736985600000 actually converts to 2025-01-16, let's fix the test
         assert_eq!(key.date, NaiveDate::from_ymd_opt(2025, 1, 16).unwrap());
     }
@@ -3100,7 +3103,7 @@ mod tests {
         // Test that ProfileKey can be created and used externally
         let key = ProfileKey::new("BTCUSDT".to_string(), NaiveDate::from_ymd_opt(2025, 1, 15).unwrap());
         
-        assert_eq!(key.symbol, "BTCUSDT");
+        assert_eq!(&*key.symbol, "BTCUSDT");
         assert_eq!(key.date, NaiveDate::from_ymd_opt(2025, 1, 15).unwrap());
 
         // Test ProfileKey::from_candle
@@ -3109,7 +3112,7 @@ mod tests {
         
         assert!(key_from_candle.is_some());
         let key = key_from_candle.unwrap();
-        assert_eq!(key.symbol, "BTCUSDT");
+        assert_eq!(&*key.symbol, "BTCUSDT");
         assert_eq!(key.date, NaiveDate::from_ymd_opt(2025, 1, 16).unwrap());
     }
 

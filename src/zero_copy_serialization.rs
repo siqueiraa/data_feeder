@@ -147,6 +147,12 @@ pub struct ZeroCopySerializer {
     buffer: Vec<u8>,
 }
 
+impl Default for ZeroCopySerializer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZeroCopySerializer {
     /// Create new serializer with initial capacity
     pub fn new() -> Self {
