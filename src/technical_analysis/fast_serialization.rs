@@ -5,6 +5,7 @@
 use crate::technical_analysis::structs::IndicatorOutput;
 use std::io::Write;
 use std::convert::TryInto;
+use rust_decimal_macros::dec;
 
 /// Compile-time validation to ensure all IndicatorOutput fields have corresponding serialization
 /// 
@@ -486,24 +487,24 @@ mod tests {
             date: "2025-08-01".to_string(),
             price_levels: vec![
                 PriceLevelData {
-                    price: 115932.40,
-                    volume: 264.75,
-                    percentage: 100.0,
+                    price: dec!(115932.40),
+                    volume: dec!(264.75),
+                    percentage: dec!(100.0),
                     candle_count: 1,
                 }
             ],
-            total_volume: 264.75,
-            vwap: 115932.40,
-            poc: 115932.40,
+            total_volume: dec!(264.75),
+            vwap: dec!(115932.40),
+            poc: dec!(115932.40),
             value_area: ValueArea {
-                high: 115932.40,
-                low: 115932.40,
-                volume_percentage: 100.0,
-                volume: 264.75,
+                high: dec!(115932.40),
+                low: dec!(115932.40),
+                volume_percentage: dec!(100.0),
+                volume: dec!(264.75),
             },
-            price_increment: 0.01,
-            min_price: 115932.40,
-            max_price: 115932.40,
+            price_increment: dec!(0.01),
+            min_price: dec!(115932.40),
+            max_price: dec!(115932.40),
             candle_count: 1,
             last_updated: 1754053919999,
         };
@@ -523,7 +524,7 @@ mod tests {
         // Test volume profile inclusion (simplified structure without price_levels array)
         assert!(json_str.contains("\"volume_profile\":{"));
         assert!(json_str.contains("\"date\":\"2025-08-01\""));
-        assert!(json_str.contains("\"total_volume\":264.75"));
+        assert!(json_str.contains("\"total_volume\":dec!(264.75)"));
         assert!(json_str.contains("\"vwap\":115932.4"));
         assert!(json_str.contains("\"poc\":115932.4"));
         assert!(json_str.contains("\"value_area\":{"));
@@ -547,24 +548,24 @@ mod tests {
             date: "2025-08-01".to_string(),
             price_levels: vec![
                 PriceLevelData {
-                    price: 115932.40,
-                    volume: 264.75,
-                    percentage: 100.0,
+                    price: dec!(115932.40),
+                    volume: dec!(264.75),
+                    percentage: dec!(100.0),
                     candle_count: 1,
                 }
             ],
-            total_volume: 264.75,
-            vwap: 115932.40,
-            poc: 115932.40,
+            total_volume: dec!(264.75),
+            vwap: dec!(115932.40),
+            poc: dec!(115932.40),
             value_area: ValueArea {
-                high: 115932.40,
-                low: 115932.40,
-                volume_percentage: 100.0,
-                volume: 264.75,
+                high: dec!(115932.40),
+                low: dec!(115932.40),
+                volume_percentage: dec!(100.0),
+                volume: dec!(264.75),
             },
-            price_increment: 0.01,
-            min_price: 115932.40,
-            max_price: 115932.40,
+            price_increment: dec!(0.01),
+            min_price: dec!(115932.40),
+            max_price: dec!(115932.40),
             candle_count: 1,
             last_updated: 1754053919999,
         };
@@ -610,22 +611,22 @@ mod tests {
         let volume_profile = VolumeProfileData {
             date: "2025-08-01".to_string(),
             price_levels: vec![
-                PriceLevelData { price: 100.0, volume: 500.0, percentage: 50.0, candle_count: 5 },
-                PriceLevelData { price: 101.0, volume: 300.0, percentage: 30.0, candle_count: 3 },
-                PriceLevelData { price: 102.0, volume: 200.0, percentage: 20.0, candle_count: 2 },
+                PriceLevelData { price: dec!(100.0), volume: dec!(500.0), percentage: dec!(50.0), candle_count: 5 },
+                PriceLevelData { price: dec!(101.0), volume: dec!(300.0), percentage: dec!(30.0), candle_count: 3 },
+                PriceLevelData { price: dec!(102.0), volume: dec!(200.0), percentage: dec!(20.0), candle_count: 2 },
             ],
-            total_volume: 1000.0,
-            vwap: 100.8,
-            poc: 100.0,
+            total_volume: dec!(1000.0),
+            vwap: dec!(100.8),
+            poc: dec!(100.0),
             value_area: ValueArea {
-                high: 101.0,
-                low: 100.0,
-                volume_percentage: 80.0,
-                volume: 800.0,
+                high: dec!(101.0),
+                low: dec!(100.0),
+                volume_percentage: dec!(80.0),
+                volume: dec!(800.0),
             },
-            price_increment: 0.01,
-            min_price: 100.0,
-            max_price: 102.0,
+            price_increment: dec!(0.01),
+            min_price: dec!(100.0),
+            max_price: dec!(102.0),
             candle_count: 3,
             last_updated: 1754053919999,
         };

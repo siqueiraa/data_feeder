@@ -1,7 +1,6 @@
-use futures_util::{SinkExt, StreamExt};
+use fastwebsockets::{OpCode, Frame, WebSocket, Role};
 use std::time::Duration;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
 use crate::websocket::types::{
@@ -170,66 +169,161 @@ impl ConnectionManager {
     {
         info!("Connecting to WebSocket: {}", url);
 
-        let (ws_stream, _) = connect_async(url)
+        // Parse URL
+        let url_parsed = url::Url::parse(url)
+            .map_err(|e| WebSocketError::Connection(format!("Invalid URL: {}", e)))?;
+        
+        let host = url_parsed.host_str()
+            .ok_or_else(|| WebSocketError::Connection("No host in URL".to_string()))?;
+        
+        let port = if url_parsed.scheme() == "wss" { 443 } else { 80 };
+        let path = url_parsed.path();
+        let query = url_parsed.query().map_or(String::new(), |q| format!("?{}", q));
+        
+        // Create TCP connection
+        let stream = tokio::net::TcpStream::connect((host, port))
             .await
-            .map_err(|e| WebSocketError::Connection(format!("Failed to connect: {}", e)))?;
+            .map_err(|e| WebSocketError::Connection(format!("TCP connection failed: {}", e)))?;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Handle TLS for wss:// URLs
+        if url_parsed.scheme() == "wss" {
+            // TLS connection
+            let connector = tokio_native_tls::TlsConnector::from(
+                native_tls::TlsConnector::new()
+                    .map_err(|e| WebSocketError::Connection(format!("TLS setup failed: {}", e)))?
+            );
+            let mut tls_stream = connector
+                .connect(host, stream)
+                .await
+                .map_err(|e| WebSocketError::Connection(format!("TLS connection failed: {}", e)))?;
+            
+            // Use fastwebsockets client handshake directly
+            let req = format!(
+                "GET {}{} HTTP/1.1\r\n\
+                Host: {}\r\n\
+                Upgrade: websocket\r\n\
+                Connection: Upgrade\r\n\
+                Sec-WebSocket-Key: {}\r\n\
+                Sec-WebSocket-Version: 13\r\n\r\n",
+                path, query, host, fastwebsockets::handshake::generate_key()
+            );
+
+            // Send handshake request manually
+            tls_stream.write_all(req.as_bytes()).await
+                .map_err(|e| WebSocketError::Connection(format!("Failed to send handshake: {}", e)))?;
+
+            // Read response
+            let mut buffer = vec![0u8; 1024];
+            let n = tls_stream.read(&mut buffer).await
+                .map_err(|e| WebSocketError::Connection(format!("Failed to read handshake response: {}", e)))?;
+            
+            let response = String::from_utf8_lossy(&buffer[..n]);
+            if !response.contains("101 Switching Protocols") {
+                return Err(WebSocketError::Connection(format!("Invalid handshake response: {}", response)));
+            }
+
+            // Create WebSocket from the TLS stream
+            let mut websocket = WebSocket::after_handshake(tls_stream, Role::Client);
+            self.run_websocket_loop(&mut websocket, message_handler).await?;
+        } else {
+            // Plain connection
+            let req = format!(
+                "GET {}{} HTTP/1.1\r\n\
+                Host: {}\r\n\
+                Upgrade: websocket\r\n\
+                Connection: Upgrade\r\n\
+                Sec-WebSocket-Key: {}\r\n\
+                Sec-WebSocket-Version: 13\r\n\r\n",
+                path, query, host, fastwebsockets::handshake::generate_key()
+            );
+
+            // Send handshake request manually
+            let mut stream = stream;
+            stream.write_all(req.as_bytes()).await
+                .map_err(|e| WebSocketError::Connection(format!("Failed to send handshake: {}", e)))?;
+
+            // Read response
+            let mut buffer = vec![0u8; 1024];
+            let n = stream.read(&mut buffer).await
+                .map_err(|e| WebSocketError::Connection(format!("Failed to read handshake response: {}", e)))?;
+            
+            let response = String::from_utf8_lossy(&buffer[..n]);
+            if !response.contains("101 Switching Protocols") {
+                return Err(WebSocketError::Connection(format!("Invalid handshake response: {}", response)));
+            }
+
+            // Create WebSocket from the plain stream  
+            let mut websocket = WebSocket::after_handshake(stream, Role::Client);
+            self.run_websocket_loop(&mut websocket, message_handler).await?;
+        };
+
+        Ok(())
+    }
+
+    /// Run the main WebSocket message loop
+    async fn run_websocket_loop<S, F, Fut>(
+        &mut self,
+        websocket: &mut WebSocket<S>, 
+        message_handler: &mut F
+    ) -> Result<(), WebSocketError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<(), WebSocketError>>,
+    {
 
         self.status = ConnectionStatus::Connected;
         self.stats.record_connection();
         info!("✅ WebSocket connected successfully");
 
-        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-
-        // Spawn ping task
-        let ping_interval = self.ping_interval;
-        let ping_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(ping_interval);
-            loop {
-                interval.tick().await;
-                if let Err(e) = ws_sender.send(WsMessage::Ping(vec![])).await {
-                    warn!("Failed to send ping: {}", e);
-                    break;
-                }
-                debug!("🏓 Sent WebSocket ping");
-            }
-        });
-
         // Main message loop
         info!("📡 Starting WebSocket message receiving loop...");
         let result = async {
-            while let Some(msg) = ws_receiver.next().await {
-                match msg {
-                    Ok(WsMessage::Text(text)) => {
-                        self.stats.record_message();
-                        debug!("📨 Received WebSocket message ({}b): {}", text.len(), text.chars().take(200).collect::<String>());
+            loop {
+                match websocket.read_frame().await {
+                    Ok(frame) => {
+                        match frame.opcode {
+                            OpCode::Text => {
+                                let text = String::from_utf8(frame.payload.to_vec())
+                                    .map_err(|e| WebSocketError::Connection(format!("Invalid UTF-8: {}", e)))?;
+                                
+                                self.stats.record_message();
+                                debug!("📨 Received WebSocket message ({}b): {}", text.len(), text.chars().take(200).collect::<String>());
 
-                        match message_handler(text).await {
-                            Ok(_) => {
-                                self.stats.record_parsed();
-                                debug!("✅ Successfully processed WebSocket message");
+                                match message_handler(text).await {
+                                    Ok(_) => {
+                                        self.stats.record_parsed();
+                                        debug!("✅ Successfully processed WebSocket message");
+                                    }
+                                    Err(e) => {
+                                        self.stats.record_parse_error();
+                                        warn!("❌ Failed to handle message: {}", e);
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                self.stats.record_parse_error();
-                                warn!("❌ Failed to handle message: {}", e);
+                            OpCode::Pong => {
+                                debug!("🏓 Received WebSocket pong");
+                            }
+                            OpCode::Close => {
+                                info!("WebSocket closed");
+                                break;
+                            }
+                            OpCode::Ping => {
+                                debug!("Received WebSocket ping, sending pong");
+                                let pong_frame = Frame::new(true, OpCode::Pong, None, frame.payload);
+                                if let Err(e) = websocket.write_frame(pong_frame).await {
+                                    warn!("Failed to send pong: {}", e);
+                                }
+                            }
+                            OpCode::Binary => {
+                                warn!("Received unexpected binary message");
+                            }
+                            OpCode::Continuation => {
+                                debug!("Received continuation frame");
                             }
                         }
-                    }
-                    Ok(WsMessage::Pong(_)) => {
-                        debug!("🏓 Received WebSocket pong");
-                    }
-                    Ok(WsMessage::Close(close_frame)) => {
-                        info!("WebSocket closed: {:?}", close_frame);
-                        break;
-                    }
-                    Ok(WsMessage::Ping(_data)) => {
-                        debug!("Received WebSocket ping, sending pong");
-                        // Note: ws_sender is moved to ping task, would need to restructure for manual pong
-                    }
-                    Ok(WsMessage::Binary(_)) => {
-                        warn!("Received unexpected binary message");
-                    }
-                    Ok(WsMessage::Frame(_)) => {
-                        debug!("Received raw frame message");
                     }
                     Err(e) => {
                         error!("WebSocket error: {}", e);
@@ -239,9 +333,6 @@ impl ConnectionManager {
             }
             Ok(())
         }.await;
-
-        // Clean up ping task
-        ping_handle.abort();
 
         self.status = ConnectionStatus::Disconnected;
         info!("WebSocket disconnected");

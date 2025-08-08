@@ -1,6 +1,7 @@
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
 use kameo::request::MessageSend;
+use crate::adaptive_config::AdaptiveConfig;
 
 use crate::websocket::{
     actor::{WebSocketActor, WebSocketTell, WebSocketAsk, WebSocketReply},
@@ -8,6 +9,10 @@ use crate::websocket::{
     connection::{ConnectionManager, validate_symbol, normalize_symbols},
     types::{StreamType, StreamSubscription, ConnectionStatus, WebSocketError},
 };
+
+fn create_test_config() -> AdaptiveConfig {
+    AdaptiveConfig::default_static_config()
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -257,7 +262,7 @@ mod actor_tests {
     #[tokio::test]
     async fn test_websocket_actor_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         
         // Test that actor starts with empty recent candles cache and no LmdbActor
         assert_eq!(actor.recent_candles_count(), 0);
@@ -267,7 +272,7 @@ mod actor_tests {
     #[tokio::test]
     async fn test_websocket_actor_subscription_management() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         let actor_ref = kameo::spawn(actor);
 
         // Test subscription
@@ -314,7 +319,7 @@ mod actor_tests {
     #[tokio::test]
     async fn test_websocket_actor_connection_status() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         let actor_ref = kameo::spawn(actor);
 
         let status_msg = WebSocketAsk::GetConnectionStatus;
@@ -330,7 +335,7 @@ mod actor_tests {
     #[tokio::test]
     async fn test_websocket_actor_invalid_subscription() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         let actor_ref = kameo::spawn(actor);
 
         // Try to subscribe to unimplemented stream type
@@ -356,7 +361,7 @@ mod actor_tests {
     #[tokio::test]
     async fn test_websocket_actor_recent_candles() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         let actor_ref = kameo::spawn(actor);
 
         // Test getting recent candles for non-existent symbol
@@ -375,7 +380,7 @@ mod actor_tests {
     #[tokio::test]
     async fn test_websocket_actor_partial_unsubscription() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         let actor_ref = kameo::spawn(actor);
 
         // Subscribe to multiple symbols
@@ -532,7 +537,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_actor_lifecycle() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         let actor_ref = kameo::spawn(actor);
 
         // Test initial state
@@ -625,7 +630,7 @@ mod performance_tests {
     #[tokio::test]
     async fn test_actor_subscription_stress() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         let actor_ref = kameo::spawn(actor);
 
         // Add many subscriptions rapidly
@@ -661,7 +666,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             2,   // gap_threshold_minutes 
-            1    // gap_check_delay_seconds (short for testing)
+            1,   // gap_check_delay_seconds (short for testing)
+            &create_test_config()
         ).unwrap();
         let actor_ref = kameo::spawn(actor);
 
@@ -694,7 +700,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             2,   // gap_threshold_minutes
-            1    // gap_check_delay_seconds (short for testing)
+            1,   // gap_check_delay_seconds (short for testing)
+            &create_test_config()
         ).unwrap();
         let actor_ref = kameo::spawn(actor);
 
@@ -731,7 +738,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             5,   // gap_threshold_minutes (custom)
-            3    // gap_check_delay_seconds (custom)
+            3,   // gap_check_delay_seconds (custom)
+            &create_test_config()
         ).unwrap();
 
         // Verify configuration was applied
@@ -746,7 +754,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             2,   // gap_threshold_minutes
-            1    // gap_check_delay_seconds
+            1,   // gap_check_delay_seconds
+            &create_test_config()
         ).unwrap();
         let actor_ref = kameo::spawn(actor);
 
@@ -771,7 +780,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             2,   // gap_threshold_minutes
-            1    // gap_check_delay_seconds
+            1,   // gap_check_delay_seconds
+            &create_test_config()
         ).unwrap();
         let actor_ref = kameo::spawn(actor);
 
@@ -804,7 +814,7 @@ mod gap_detection_tests {
     #[tokio::test]
     async fn test_gap_detection_integration_with_existing_flows() {
         let temp_dir = TempDir::new().unwrap();
-        let actor = WebSocketActor::new(temp_dir.path().to_path_buf()).unwrap();
+        let actor = WebSocketActor::new(temp_dir.path().to_path_buf(), &create_test_config()).unwrap();
         let actor_ref = kameo::spawn(actor);
 
         // Test that gap detection doesn't interfere with normal operations
@@ -852,7 +862,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             1,   // gap_threshold_minutes (low threshold for testing)
-            1    // gap_check_delay_seconds
+            1,   // gap_check_delay_seconds
+            &create_test_config()
         ).unwrap();
         
         // Create LMDB actor first (required for API actor)
@@ -904,7 +915,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             5,   // gap_threshold_minutes
-            1    // gap_check_delay_seconds
+            1,   // gap_check_delay_seconds
+            &create_test_config()
         ).unwrap();
         
         let now = chrono::Utc::now().timestamp_millis();
@@ -943,7 +955,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             2,   // gap_threshold_minutes
-            1    // gap_check_delay_seconds
+            1,   // gap_check_delay_seconds
+            &create_test_config()
         ).unwrap();
         
         let actor_ref = kameo::spawn(actor);
@@ -981,7 +994,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             1,   // gap_threshold_minutes (low for testing)
-            1    // gap_check_delay_seconds (short for testing)
+            1,   // gap_check_delay_seconds (short for testing)
+            &create_test_config()
         ).unwrap();
         
         // Create LMDB and API actors for proper integration
@@ -1038,7 +1052,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             1,   // gap_threshold_minutes (low for testing)
-            1    // gap_check_delay_seconds
+            1,   // gap_check_delay_seconds
+            &create_test_config()
         ).unwrap();
         
         // Set up API integration
@@ -1110,7 +1125,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             2,   // gap_threshold_minutes
-            1    // gap_check_delay_seconds
+            1,   // gap_check_delay_seconds
+            &create_test_config()
         ).unwrap();
         let websocket_ref = kameo::spawn(websocket_actor);
         
@@ -1151,7 +1167,8 @@ mod gap_detection_tests {
             temp_dir.path().to_path_buf(),
             300, // max_idle_secs
             2,   // gap_threshold_minutes (2 minutes for gap filling)
-            1    // gap_check_delay_seconds
+            1,   // gap_check_delay_seconds
+            &create_test_config()
         ).unwrap();
         let websocket_ref = kameo::spawn(websocket_actor);
         
