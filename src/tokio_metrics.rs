@@ -7,7 +7,7 @@ use prometheus::{Gauge, Counter, Registry};
 use std::time::Duration;
 use tokio::time::interval;
 use tokio_metrics::TaskMonitor;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Tokio metrics collector that integrates with Prometheus
 pub struct TokioMetricsCollector {
@@ -51,7 +51,6 @@ impl TokioMetricsCollector {
         
         tokio::spawn(async move {
             let mut interval = interval(collection_interval);
-            info!("🔍 Starting tokio task metrics collection every {:?}", collection_interval);
             
             loop {
                 interval.tick().await;
@@ -155,12 +154,10 @@ pub fn initialize_tokio_metrics(
 ) -> Result<TokioMetricsCollector, Box<dyn std::error::Error + Send + Sync>> {
     let interval = collection_interval.unwrap_or_else(|| Duration::from_secs(30));
     
-    info!("🔍 Initializing tokio metrics collection with {:?} interval", interval);
     
     let collector = TokioMetricsCollector::new(registry, interval)?;
     collector.start_collection();
     
-    info!("✅ Tokio metrics collector initialized and started");
     
     Ok(collector)
 }

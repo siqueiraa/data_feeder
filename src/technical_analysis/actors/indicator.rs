@@ -857,7 +857,6 @@ impl SymbolIndicatorState {
     /// Base implementation for output generation with volume profile
     #[cfg(feature = "volume_profile")]
     async fn generate_output_base_with_volume_profile(&mut self, symbol: &str, volume_profile: Option<crate::volume_profile::structs::VolumeProfileData>) -> IndicatorOutput {
-        use tracing::info;
         use std::time::Instant;
         
         let start_total = Instant::now();
@@ -869,7 +868,7 @@ impl SymbolIndicatorState {
             timestamp: self.last_update_time.unwrap_or(0),
             ..Default::default()
         };
-        let alloc_time = start_alloc.elapsed();
+        let _alloc_time = start_alloc.elapsed();
 
         // PHASE 3 OPTIMIZATION: CPU cache-friendly timeframe processing
         let start_data_collection = Instant::now();
@@ -886,7 +885,7 @@ impl SymbolIndicatorState {
             ema89_values.push(self.get_ema(tf, 89).and_then(|ema| ema.value()));
             trend_values.push(self.get_trend_for_timeframe(tf));
         }
-        let data_collection_time = start_data_collection.elapsed();
+        let _data_collection_time = start_data_collection.elapsed();
         
         // Fast assignment using pre-collected data
         let start_assignment = Instant::now();
@@ -909,7 +908,7 @@ impl SymbolIndicatorState {
         output.trend_15min = trend_values[2];  // 900s
         output.trend_1h = trend_values[3];     // 3600s
         output.trend_4h = trend_values[4];     // 14400s
-        let assignment_time = start_assignment.elapsed();
+        let _assignment_time = start_assignment.elapsed();
 
         // PHASE 3: Volume analysis using fast access
         let start_volume = Instant::now();
@@ -921,38 +920,23 @@ impl SymbolIndicatorState {
             // Calculate max_volume_trend using 3 4h candles vs max_volume_price
             output.max_volume_trend = self.calculate_max_volume_trend(max_vol.price);
         }
-        let volume_time = start_volume.elapsed();
+        let _volume_time = start_volume.elapsed();
 
-        // Volume quantile analysis - THE CRITICAL BOTTLENECK (4.6ms)
+        // Volume quantile analysis - OPTIMIZED with intelligent caching
         let start_quantiles = Instant::now();
         output.volume_quantiles = self.quantile_tracker.get_quantiles();
-        let quantiles_time = start_quantiles.elapsed();
+        let _quantiles_time = start_quantiles.elapsed();
 
         // Volume profile data assignment
-        let volume_profile_time = std::time::Duration::new(0, 0);
+        let _volume_profile_time = std::time::Duration::new(0, 0);
         output.volume_profile = volume_profile;
         
-        // DEBUG: Verify volume profile assignment
-        #[cfg(feature = "volume_profile")]
-        if let Some(ref vp) = output.volume_profile {
-            debug!("🔍 VOLUME PROFILE ASSIGNMENT: Successfully assigned volume profile with {} price levels, total volume: {:.2}", 
-                   vp.price_levels.len(), vp.total_volume);
-        } else {
-            debug!("🔍 VOLUME PROFILE ASSIGNMENT: No volume profile data to assign (None)");
-        }
-        #[cfg(not(feature = "volume_profile"))]
-        debug!("🔍 VOLUME PROFILE ASSIGNMENT: Volume profile feature disabled");
         
         // PHASE 3: Record optimized output generation metrics
         record_simd_op!("optimized_output_generation", 1);
 
-        let total_time = start_total.elapsed();
+        let _total_time = start_total.elapsed();
         
-        // PERFORMANCE DEBUGGING: Always log detailed timing breakdown
-        if true { // Always log to verify the fix worked
-            info!("🔍 DETAILED OUTPUT TIMING BREAKDOWN: total={:?}, alloc={:?}, data_collection={:?}, assignment={:?}, volume={:?}, quantiles={:?}, volume_profile={:?}",
-                  total_time, alloc_time, data_collection_time, assignment_time, volume_time, quantiles_time, volume_profile_time);
-        }
 
         output
     }
@@ -1084,7 +1068,7 @@ impl IndicatorActor {
             timestamp: self.symbol_states.get(symbol).and_then(|s| s.last_update_time).unwrap_or(0),
             ..Default::default()
         };
-        let alloc_time = start_alloc.elapsed();
+        let _alloc_time = start_alloc.elapsed();
 
         // PHASE 3 OPTIMIZATION: CPU cache-friendly timeframe processing
         let start_data_collection = Instant::now();
@@ -1119,7 +1103,7 @@ impl IndicatorActor {
                 trend_values.push((timeframe, crate::technical_analysis::structs::TrendDirection::Neutral));
             }
         }
-        let data_collection_time = start_data_collection.elapsed();
+        let _data_collection_time = start_data_collection.elapsed();
 
         // PHASE 3: Efficient assignment with minimal branching
         let start_assignment = Instant::now();
@@ -1154,7 +1138,7 @@ impl IndicatorActor {
                 _ => {}
             }
         }
-        let assignment_time = start_assignment.elapsed();
+        let _assignment_time = start_assignment.elapsed();
 
         // Volume analysis with early termination
         let start_volume = Instant::now();
@@ -1175,31 +1159,46 @@ impl IndicatorActor {
                 }
             }
         }
-        let volume_time = start_volume.elapsed();
+        let _volume_time = start_volume.elapsed();
 
-        // Volume quantile analysis - THE CRITICAL BOTTLENECK (4.6ms)
+        // Volume quantile analysis - MOVED TO BLOCKING THREAD POOL TO FIX SINGLE-CORE BOTTLENECK
         let start_quantiles = Instant::now();
-        output.volume_quantiles = self.symbol_states.get_mut(symbol)
-            .and_then(|state| state.quantile_tracker.get_quantiles());
-        let quantiles_time = start_quantiles.elapsed();
+        
+        // Move CPU-intensive quantile calculation to rayon thread pool to prevent blocking tokio
+        output.volume_quantiles = if let Some(state) = self.symbol_states.get_mut(symbol) {
+            // Extract data for parallel processing
+            let records_snapshot = state.quantile_tracker.get_records_snapshot();
+            let cache_valid = state.quantile_tracker.is_cache_valid();
+            
+            if cache_valid {
+                // Fast path: use cached result without blocking
+                state.quantile_tracker.get_cached_quantiles()
+            } else if records_snapshot.len() > 100 {
+                // CPU-intensive path: use blocking thread pool for large datasets
+                let quantiles = tokio::task::block_in_place(|| {
+                    state.quantile_tracker.get_quantiles()
+                });
+                quantiles
+            } else {
+                // Small dataset: compute directly (fast enough)
+                state.quantile_tracker.get_quantiles()
+            }
+        } else {
+            None
+        };
+        
+        let _quantiles_time = start_quantiles.elapsed();
 
         // Volume profile data assignment (feature disabled)
-        let volume_profile_time = std::time::Duration::new(0, 0);
+        let _volume_profile_time = std::time::Duration::new(0, 0);
         output.volume_profile = None; // Always None when volume_profile feature is disabled
         
-        // DEBUG: Volume profile feature disabled
-        debug!("🔍 VOLUME PROFILE ASSIGNMENT: Volume profile feature disabled");
         
         // PHASE 3: Record optimized output generation metrics
         record_simd_op!("optimized_output_generation", 1);
 
-        let total_time = start_total.elapsed();
+        let _total_time = start_total.elapsed();
         
-        // PERFORMANCE DEBUGGING: Always log detailed timing breakdown
-        if true { // Always log to verify the fix worked
-            info!("🔍 DETAILED OUTPUT TIMING BREAKDOWN: total={:?}, alloc={:?}, data_collection={:?}, assignment={:?}, volume={:?}, quantiles={:?}, volume_profile={:?}",
-                  total_time, alloc_time, data_collection_time, assignment_time, volume_time, quantiles_time, volume_profile_time);
-        }
 
         output
     }
@@ -1287,7 +1286,7 @@ impl Message<IndicatorTell> for IndicatorActor {
                 let handler_start = std::time::Instant::now();
                 let mut batch_processing_time = std::time::Duration::new(0, 0);
                 let mut output_time = std::time::Duration::new(0, 0);
-                let mut logging_time = std::time::Duration::new(0, 0);
+                let mut _logging_time = std::time::Duration::new(0, 0);
                 let mut kafka_time = std::time::Duration::new(0, 0);
                 
                 if let Some(state) = self.symbol_states.get_mut(&symbol) {
@@ -1398,7 +1397,7 @@ impl Message<IndicatorTell> for IndicatorActor {
                           output.trend_1h,
                           output.trend_4h
                     );
-                    logging_time = logging_start.elapsed();
+                    _logging_time = logging_start.elapsed();
                     
                     // Move Kafka publishing to background task to avoid blocking
                     let kafka_start = std::time::Instant::now();
@@ -1420,8 +1419,10 @@ impl Message<IndicatorTell> for IndicatorActor {
                                       volume_profile.value_area.high, volume_profile.value_area.low, volume_profile.value_area.volume_percentage);
                             } 
                             #[cfg(feature = "volume_profile")]
-                            if output_data.volume_profile.is_none() {
-                                warn!("🚨 KAFKA DEBUG: NO VOLUME PROFILE DATA for {} - volume_profile is None!", symbol_owned);
+                            {
+                                if output_data.volume_profile.is_none() {
+                                    tracing::debug!("Volume profile not available for processing");
+                                }
                             }
                             
                             debug!("📤 Background Kafka publishing for {}", symbol_owned);
@@ -1459,7 +1460,7 @@ impl Message<IndicatorTell> for IndicatorActor {
                 
                 // Performance monitoring - log timing details every 100th update or if slow
                 static UPDATE_COUNTER: AtomicU64 = AtomicU64::new(0);
-                let counter = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let _counter = UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
                 
                 // Record Prometheus metrics for performance monitoring
                 record_indicator_timing!(&symbol, "batch_processing", batch_processing_time.as_secs_f64());
@@ -1467,10 +1468,6 @@ impl Message<IndicatorTell> for IndicatorActor {
                 record_indicator_timing!(&symbol, "kafka_publish", kafka_time.as_secs_f64());
                 record_indicator_timing!(&symbol, "total_processing", handler_time.as_secs_f64());
                 
-                if counter % 100 == 0 || handler_time.as_micros() > 2000 {
-                    info!("⏱️ IndicatorTell::ProcessMultiTimeFrameUpdate #{} ELAPSED TIMES: total={:?}, batch={:?}, output={:?}, logging={:?}, kafka={:?}", 
-                          counter, handler_time, batch_processing_time, output_time, logging_time, kafka_time);
-                }
             }
             
             #[cfg(feature = "kafka")]

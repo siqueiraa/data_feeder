@@ -22,3 +22,4 @@ pub mod system_resources;
 pub mod adaptive_config;
 pub mod deployment_validation;
 pub mod zero_copy_serialization;
+pub mod cpu_topology;

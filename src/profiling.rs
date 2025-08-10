@@ -336,18 +336,48 @@ macro_rules! profile {
     }};
 }
 
-/// Simplified CPU usage tracking (would be enhanced with proper system monitoring)
+/// Real CPU usage tracking using the performance monitoring system
 fn get_current_cpu_usage() -> f64 {
-    // In a real implementation, this would use system calls or crates like `sysinfo`
-    // For now, return a placeholder that indicates profiling is active
-    0.0 // Placeholder - would need actual CPU monitoring
+    // Use the new performance monitoring system if available
+    if let Some(monitor) = crate::performance::get_performance_monitor() {
+        if let Some(snapshot) = monitor.get_current_snapshot() {
+            return snapshot.process_cpu_percent as f64;
+        }
+    }
+    
+    // Fallback to direct sysinfo if performance monitor not available
+    use sysinfo::{System, Pid};
+    let mut system = System::new_all();
+    system.refresh_processes();
+    
+    let pid = Pid::from(std::process::id() as usize);
+    if let Some(process) = system.process(pid) {
+        process.cpu_usage() as f64
+    } else {
+        0.0
+    }
 }
 
-/// Simplified memory usage tracking (would be enhanced with proper system monitoring)
+/// Real memory usage tracking using the performance monitoring system
 fn get_current_memory_usage() -> u64 {
-    // In a real implementation, this would track actual memory usage
-    // For now, return a placeholder
-    0 // Placeholder - would need actual memory monitoring
+    // Use the new performance monitoring system if available
+    if let Some(monitor) = crate::performance::get_performance_monitor() {
+        if let Some(snapshot) = monitor.get_current_snapshot() {
+            return (snapshot.memory_usage_mb * 1_048_576.0) as u64; // Convert MB to bytes
+        }
+    }
+    
+    // Fallback to direct sysinfo if performance monitor not available
+    use sysinfo::{System, Pid};
+    let mut system = System::new_all();
+    system.refresh_processes();
+    
+    let pid = Pid::from(std::process::id() as usize);
+    if let Some(process) = system.process(pid) {
+        process.memory() * 1024 // Convert KB to bytes
+    } else {
+        0
+    }
 }
 
 /// Enhanced profiling with system resource monitoring

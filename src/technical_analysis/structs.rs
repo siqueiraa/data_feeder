@@ -893,6 +893,8 @@ pub struct QuantileTracker {
     window_duration_ms: i64,
     /// Counter for updates since last expiry check (lazy expiry optimization)
     updates_since_expiry_check: u32,
+    /// Counter for updates since last cache invalidation (separate from expiry)
+    updates_since_cache_invalidation: u32,
     /// MEMORY POOL: Reusable QuantileRecord to avoid struct allocations in hot path
     record_buffer: QuantileRecord,
     /// Frequency of expiry checks (check every N updates)
@@ -907,13 +909,16 @@ impl QuantileTracker {
     /// Create a new quantile tracker with 30-day lookback window using t-digest
     pub fn new(window_days: u32) -> Self {
         let window_duration_ms = window_days as i64 * 24 * 3600 * 1000;
-        // Pre-allocate for ~30 days of 1-minute candles (30 * 24 * 60 = 43200)
-        let expected_capacity = (window_days as usize * 24 * 60).max(1000);
+        // MEMORY OPTIMIZATION: Use reasonable initial capacity instead of full pre-allocation
+        // Start with 1000 records (~16 hours of data) and let it grow organically
+        // This avoids massive memory allocation on startup (43,200 * 64 bytes = ~2.7MB per tracker)
+        let expected_capacity = 1000;
         
         Self {
             records: VecDeque::with_capacity(expected_capacity),
             window_duration_ms,
             updates_since_expiry_check: 0,
+            updates_since_cache_invalidation: 0,
             // MEMORY POOL: Pre-allocate QuantileRecord buffer to avoid struct allocations
             record_buffer: QuantileRecord {
                 volume: 0.0,
@@ -954,18 +959,20 @@ impl QuantileTracker {
         // Add new record to deque for rolling window management (O(1))
         self.records.push_back(self.record_buffer.clone());
         
-        // PERFORMANCE OPTIMIZATION: Smart caching - only invalidate cache every 10 updates
-        // This reduces T-Digest rebuilds from every candle (1min) to every 10 candles (10min)
-        static CACHE_INVALIDATION_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let counter = CACHE_INVALIDATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // PERFORMANCE OPTIMIZATION: Ultra-smart caching - only invalidate when statistically significant
+        // Instead of invalidating every N updates, use statistical significance to determine when to rebuild
         
-        // Only invalidate cache every 10 updates instead of every update
-        if counter % 10 == 0 {
+        // Track updates since last cache rebuild (separate counter from expiry check)
+        self.updates_since_cache_invalidation += 1;
+        
+        // Only invalidate cache when:
+        // 1. Records were removed (data composition changed significantly) - handled in remove_expired_records
+        // 2. Accumulate enough new samples to statistically affect quantiles (5% of total dataset)
+        let statistical_threshold = (self.records.len() / 20).max(100); // At least 100 updates, or 5% of dataset
+        
+        if self.updates_since_cache_invalidation >= statistical_threshold as u32 {
             self.cache_dirty = true;
-        }
-        // Still invalidate immediately if records were removed (data changed significantly)
-        if self.updates_since_expiry_check == 0 {
-            self.cache_dirty = true;
+            self.updates_since_cache_invalidation = 0; // Reset counter after invalidation
         }
     }
 
@@ -994,6 +1001,8 @@ impl QuantileTracker {
         // If records were removed, mark cache as dirty for lazy rebuild
         if removed_count > 0 {
             self.cache_dirty = true;
+            // Reset the cache invalidation counter since we just invalidated due to data removal
+            self.updates_since_cache_invalidation = 0;
         }
     }
 
@@ -1006,18 +1015,30 @@ impl QuantileTracker {
             return None; 
         }
         
-        // PERFORMANCE FIX: Only build T-Digests when cache is dirty
+        // PERFORMANCE FIX: Fast path - return cached quantiles if still valid
+        if !self.cache_dirty && self.cached_quantiles.is_some() {
+            return self.cached_quantiles.clone();
+        }
+        
+        // Slow path: Only build T-Digests when cache is dirty
         if self.cache_dirty || self.cached_quantiles.is_none() {
             use tracing::info;
             info!("🔧 T-Digest cache miss: rebuilding with {} records", self.records.len());
             // **MAJOR PERFORMANCE OPTIMIZATION**: Use pre-sorted data with merge_sorted() instead of merge_unsorted()
             // This eliminates the expensive sorting step and reduces complexity significantly
             
-            // PERFORMANCE OPTIMIZATION: Sample data for large datasets to reduce T-Digest complexity
-            let sample_size = if self.records.len() > 1000 {
-                // For large datasets, use every 10th record to dramatically reduce computation
+            // PERFORMANCE OPTIMIZATION: Aggressive sampling for large datasets to reduce T-Digest complexity
+            let sample_size = if self.records.len() > 5000 {
+                // For very large datasets, use every 20th record to dramatically reduce computation
+                self.records.len() / 20
+            } else if self.records.len() > 2000 {
+                // For large datasets, use every 10th record
                 self.records.len() / 10
+            } else if self.records.len() > 1000 {
+                // For moderate datasets, use every 5th record
+                self.records.len() / 5
             } else {
+                // For small datasets, use all records
                 self.records.len()
             };
             
@@ -1045,11 +1066,15 @@ impl QuantileTracker {
                 }
             }
             
-            // Sort each vector once (much more efficient than merge_unsorted which sorts internally)
-            volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            taker_buys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            avg_trades.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            trade_counts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // PARALLEL SORTING: Use rayon to sort all vectors in parallel (major bottleneck fix)
+            use rayon::prelude::*;
+            
+            // Sort all 4 vectors in parallel using rayon - this distributes work across cores
+            [&mut volumes, &mut taker_buys, &mut avg_trades, &mut trade_counts]
+                .par_iter_mut()
+                .for_each(|vec| {
+                    vec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                });
             
             // Build T-Digests from pre-sorted data (much faster than merge_unsorted)
             let compression = 75;
@@ -1106,8 +1131,33 @@ impl QuantileTracker {
     }
     
     /// Get performance monitoring metrics for the quantile tracker
-    pub fn get_performance_metrics(&self) -> (usize, u32, u32) {
-        (self.records.len(), self.updates_since_expiry_check, self.expiry_check_frequency)
+    pub fn get_performance_metrics(&self) -> (usize, u32, u32, u32, bool) {
+        (
+            self.records.len(), 
+            self.updates_since_expiry_check, 
+            self.updates_since_cache_invalidation,
+            self.expiry_check_frequency,
+            !self.cache_dirty
+        )
+    }
+    
+    /// Get snapshot of records count for parallel processing decisions
+    pub fn get_records_snapshot(&self) -> &std::collections::VecDeque<QuantileRecord> {
+        &self.records
+    }
+    
+    /// Check if cached quantiles are still valid (for fast path optimization)
+    pub fn is_cache_valid(&self) -> bool {
+        !self.cache_dirty && self.cached_quantiles.is_some()
+    }
+    
+    /// Get cached quantiles without recomputation (fast path)
+    pub fn get_cached_quantiles(&self) -> Option<QuantileResults> {
+        if !self.cache_dirty {
+            self.cached_quantiles.clone()
+        } else {
+            None
+        }
     }
 
     /// Get current number of records in the tracker

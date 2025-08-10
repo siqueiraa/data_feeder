@@ -29,7 +29,7 @@ http = "1.0"
 crossbeam-channel = "0.5"
 sharded-slab = "0.1"
 sonic-rs = "0.3"
-rkyv = "0.7"
+rkyv = { version = "0.7", features = ["validation"] }
 url = "2.5"
 bytes = "1.8"
 futures-util = "0.3"
@@ -48,6 +48,7 @@ tdigest = "0.2"
 rust_decimal = { version = "1.36", features = ["serde"] }
 rust_decimal_macros = "1.36"
 bumpalo = { version = "3.14", features = ["collections"] }
+sysinfo = "0.30"
 fixed = "1.24"
 fast-float = "0.2"
 prometheus = "0.13"
@@ -118,3 +119,7 @@ path = "src/bin/cpu_profile.rs"
 [[bin]]
 name = "validate_optimizations"
 path = "src/bin/validate_optimizations.rs"
+
+[[bin]]
+name = "test_performance_monitoring"
+path = "src/bin/test_performance_monitoring.rs"

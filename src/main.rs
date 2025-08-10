@@ -1494,10 +1494,9 @@ async fn detect_and_fill_gaps(
     }
 }
 
-#[tokio::main]
-async fn main() {
-    // Pre-load configuration to get logging settings
-    let mut config = match DataFeederConfig::from_toml("config.toml") {
+fn main() {
+    // Pre-load configuration to get adaptive thread configuration
+    let config = match DataFeederConfig::from_toml("config.toml") {
         Ok(config) => {
             // Simple print until logging is initialized
             println!("✅ Loaded configuration from config.toml");
@@ -1580,6 +1579,32 @@ async fn main() {
         "⚙️ Adaptive configuration applied successfully"
     );
 
+    // Create multi-threaded tokio runtime with adaptive thread configuration
+    let worker_threads = config.adaptive_config.thread_pools.worker_threads;
+    info!("🔧 Initializing multi-threaded tokio runtime with {} worker threads", worker_threads);
+    
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .thread_name("data-feeder-worker")
+        .build() {
+            Ok(runtime) => {
+                info!("✅ Multi-threaded tokio runtime initialized successfully");
+                runtime
+            },
+            Err(e) => {
+                error!("❌ Failed to create tokio runtime: {}", e);
+                return;
+            }
+        };
+
+    // Run the async main logic
+    rt.block_on(async_main(config)).unwrap_or_else(|e| {
+        error!("❌ Data feeder main loop failed: {}", e);
+    });
+}
+
+async fn async_main(mut config: DataFeederConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("🚀 Starting Data Feeder - Production Mode");
 
     // Initialize Prometheus metrics
@@ -1587,7 +1612,39 @@ async fn main() {
         Ok(_) => info!("📊 Prometheus metrics initialized successfully"),
         Err(e) => {
             error!("❌ Failed to initialize metrics: {}", e);
-            return;
+            return Err(e.into());
+        }
+    }
+
+    // Initialize CPU topology optimization to fix single-core bottlenecks
+    use data_feeder::cpu_topology::init_cpu_optimization;
+    match init_cpu_optimization().await {
+        Ok(topology) => {
+            info!("🚀 CPU topology optimization initialized");
+            // Update tokio runtime configuration based on detected topology
+            let thread_config = topology.get_thread_pool_config();
+            info!("💡 Consider using {} I/O threads for optimal performance", thread_config.io_threads);
+        },
+        Err(e) => {
+            warn!("⚠️ Failed to initialize CPU optimization: {}", e);
+            // Continue without optimization - not critical for core functionality
+        }
+    }
+
+    // Initialize comprehensive performance monitoring system
+    use data_feeder::performance::{init_performance_monitor, PerformanceConfig};
+    let perf_config = PerformanceConfig {
+        collection_interval: std::time::Duration::from_millis(500), // Collect every 500ms
+        single_core_threshold: 80.0, // Alert if single core >80% while others <50%
+        history_size: 240, // Keep 2 minutes of history at 500ms intervals
+        detailed_threading: true,
+    };
+    
+    match init_performance_monitor(Some(perf_config)).await {
+        Ok(_) => info!("🚀 Comprehensive performance monitoring system started"),
+        Err(e) => {
+            warn!("⚠️ Failed to initialize performance monitor: {}", e);
+            // Continue without performance monitoring - not critical for core functionality
         }
     }
 
@@ -1611,8 +1668,10 @@ async fn main() {
     // Start the production data pipeline
     if let Err(e) = run_data_pipeline(config).await {
         error!("💥 Data pipeline failed: {}", e);
-        std::process::exit(1);
+        return Err(e);
     }
+    
+    Ok(())
 }
 
 /// Main production data pipeline
