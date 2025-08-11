@@ -12,7 +12,7 @@ use crate::volume_profile::output_cache::{OutputCache, CacheKey, CacheConfig};
 use crate::technical_analysis::async_batching::{AsyncBatchingSystem, BatchConfig, IndicatorType, IndicatorParameters};
 use crate::common::hybrid_serialization::{
     HybridSerializer, SerializationStrategy, SerializationFormat,
-    HybridSerializationError, SerializedData, ConsumerType
+    HybridSerializationError, SerializedData
 };
 use crate::common::streaming_serialization::{StreamingConfig, utils as streaming_utils};
 
@@ -447,6 +447,7 @@ pub enum HealthStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::hybrid_serialization::ConsumerType;
     use crate::volume_profile::structs::{PriceLevelData, ValueArea};
     use crate::technical_analysis::async_batching::PriceType;
     use rust_decimal_macros::dec;
