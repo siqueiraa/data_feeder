@@ -12,7 +12,7 @@ use crate::volume_profile::output_cache::{OutputCache, CacheKey, CacheConfig};
 use crate::technical_analysis::async_batching::{AsyncBatchingSystem, BatchConfig, IndicatorType, IndicatorParameters};
 use crate::common::hybrid_serialization::{
     HybridSerializer, SerializationStrategy, SerializationFormat,
-    HybridSerializationError, SerializedData
+    HybridSerializationError, SerializedData, ConsumerType
 };
 use crate::common::streaming_serialization::{StreamingConfig, utils as streaming_utils};
 

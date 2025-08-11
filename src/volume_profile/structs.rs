@@ -1268,27 +1268,24 @@ impl PriceLevelMap {
         let mut all_levels: Vec<_> = self.levels.iter().collect();
         all_levels.sort_by(|(a, _), (b, _)| a.cmp(b));
         
-        // Find POC index
+        // Find POC index in price-sorted levels
         let poc_index = all_levels.iter().position(|(key, _)| **key == poc_key).unwrap_or(0);
         
-        // Start from POC and expand symmetrically to center it
+        // CORRECT Sierra Chart Algorithm: Bidirectional expansion from POC
+        // Start with POC and expand symmetrically to capture 70% of volume
         let mut included_metric = match calculation_mode {
             VolumeProfileCalculationMode::Volume => self.levels.get(&poc_key).copied().unwrap_or(Decimal::ZERO),
             VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(&poc_key).copied().unwrap_or(0)),
         };
         let mut low_index = poc_index;
         let mut high_index = poc_index;
-        
-        // Ensure we start with POC volume
         let mut selected_levels = vec![poc_key];
         
-        // TRUE Traditional Market Profile: Strict symmetric expansion to guarantee POC centering
-        // Expand one level on each side alternately, ensuring perfect symmetry
+        // Bidirectional expansion: add one level above and below alternately
         while included_metric < target_metric && (low_index > 0 || high_index < all_levels.len() - 1) {
-            let mut added_this_round = false;
+            let mut added_level = false;
             
-            // Always try to expand both sides equally for perfect symmetry
-            // Left expansion
+            // Try to expand downward (lower prices)
             if low_index > 0 {
                 let left_key = all_levels[low_index - 1].0;
                 let left_metric = match calculation_mode {
@@ -1296,19 +1293,17 @@ impl PriceLevelMap {
                     VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(left_key).copied().unwrap_or(0)),
                 };
                 
-                // Add left level
                 selected_levels.push(*left_key);
                 included_metric += left_metric;
                 low_index -= 1;
-                added_this_round = true;
+                added_level = true;
                 
-                // Check if we've reached target after left expansion
                 if included_metric >= target_metric {
                     break;
                 }
             }
             
-            // Right expansion (symmetric to left)
+            // Try to expand upward (higher prices)
             if high_index < all_levels.len() - 1 {
                 let right_key = all_levels[high_index + 1].0;
                 let right_metric = match calculation_mode {
@@ -1316,41 +1311,28 @@ impl PriceLevelMap {
                     VolumeProfileCalculationMode::TPO => Decimal::from(self.candle_counts.get(right_key).copied().unwrap_or(0)),
                 };
                 
-                // Add right level
                 selected_levels.push(*right_key);
                 included_metric += right_metric;
                 high_index += 1;
-                added_this_round = true;
+                added_level = true;
                 
-                // Check if we've reached target after right expansion
                 if included_metric >= target_metric {
                     break;
                 }
             }
             
-            // If we couldn't expand either side, break
-            if !added_this_round {
+            if !added_level {
                 break;
             }
         }
 
-        // Ensure POC is always included and centered
+        // Find the range of selected levels
         selected_levels.sort();
         let low_key = *selected_levels.first().unwrap_or(&poc_key);
         let high_key = *selected_levels.last().unwrap_or(&poc_key);
         
         let low_price = low_key.to_price(self.price_increment);
         let high_price = high_key.to_price(self.price_increment);
-        let poc_price = poc_key.to_price(self.price_increment);
-
-        // Ensure POC is within the range and adjust if necessary
-        let (final_low, final_high) = if poc_price < low_price {
-            (poc_price, high_price)
-        } else if poc_price > high_price {
-            (low_price, poc_price)
-        } else {
-            (low_price, high_price)
-        };
 
         // Calculate actual volume in final range (always return actual volume, not metric)
         let actual_volume = self.levels.iter()
@@ -1361,8 +1343,8 @@ impl PriceLevelMap {
         let total_volume = self.total_volume();
 
         ValueArea {
-            low: final_low,
-            high: final_high,
+            low: low_price,
+            high: high_price,
             volume: actual_volume,
             volume_percentage: if total_volume > Decimal::ZERO { (actual_volume / total_volume) * Decimal::from(100) } else { Decimal::ZERO },
         }
