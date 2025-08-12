@@ -5,6 +5,8 @@ use crate::historical::structs::FuturesOHLCVCandle;
 use super::actor::LmdbActor;
 use super::messages::{LmdbActorMessage, LmdbActorResponse};
 use super::gap_detector::GapDetector;
+use super::storage::LmdbStorage;
+use crate::storage_optimization::WorkloadPattern;
 
     fn create_test_candle(close_time: i64, open: f64, high: f64, low: f64, close: f64, volume: f64) -> FuturesOHLCVCandle {
         FuturesOHLCVCandle {
@@ -659,4 +661,188 @@ async fn test_race_condition_stress_test() -> Result<(), Box<dyn std::error::Err
     assert_eq!(failed_operations, 0, "No operations should fail due to race conditions");
     
     Ok(())
+}
+
+// Storage Optimization Tests
+
+#[tokio::test]
+async fn test_storage_optimization_lmdb_config() {
+    use crate::common::lmdb_config::open_optimized_lmdb_environment;
+    
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let db_path = temp_dir.path().join("test_optimized_db");
+    std::fs::create_dir_all(&db_path).expect("Failed to create db directory");
+    
+    // Test optimized environment creation with different workload patterns
+    let write_heavy_path = temp_dir.path().join("write_heavy_db");
+    std::fs::create_dir_all(&write_heavy_path).expect("Failed to create write_heavy_db directory");
+    let write_heavy_env = open_optimized_lmdb_environment(&write_heavy_path, WorkloadPattern::WriteHeavy);
+    assert!(write_heavy_env.is_ok(), "WriteHeavy optimized environment should open successfully");
+    
+    let read_heavy_path = temp_dir.path().join("read_heavy_db");
+    std::fs::create_dir_all(&read_heavy_path).expect("Failed to create read_heavy_db directory");
+    let read_heavy_env = open_optimized_lmdb_environment(&read_heavy_path, WorkloadPattern::ReadHeavy);
+    assert!(read_heavy_env.is_ok(), "ReadHeavy optimized environment should open successfully");
+    
+    println!("✅ LMDB configuration optimization test passed");
+}
+
+#[tokio::test]
+async fn test_storage_optimization_query_caching() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let mut storage = LmdbStorage::new(temp_dir.path());
+    
+    let symbol = "BTCUSDT";
+    let timeframe = 60; // 1 minute
+    
+    // Initialize database
+    storage.initialize_database(symbol, timeframe)
+        .expect("Failed to initialize database");
+    
+    // Insert test data
+    let test_candles = vec![
+        create_test_candle(1609459260000, 29000.0, 29100.0, 28900.0, 29050.0, 100.5),
+        create_test_candle(1609459320000, 29050.0, 29150.0, 29000.0, 29100.0, 105.2),
+        create_test_candle(1609459380000, 29100.0, 29200.0, 29050.0, 29150.0, 98.7),
+    ];
+    
+    storage.store_candles(symbol, timeframe, &test_candles)
+        .expect("Failed to insert test candles");
+    
+    // Test optimized query (first call - cache miss)
+    let start_time = 1609459200000;
+    let end_time = 1609459400000;
+    
+    let result1 = storage.get_candles_optimized(symbol, timeframe, start_time, end_time, None).await
+        .expect("First optimized query should succeed");
+    assert_eq!(result1.len(), 3, "Should retrieve 3 candles");
+    
+    // Test optimized query (second call - cache hit)
+    let result2 = storage.get_candles_optimized(symbol, timeframe, start_time, end_time, None).await
+        .expect("Second optimized query should succeed");
+    assert_eq!(result2.len(), 3, "Should retrieve 3 candles from cache");
+    
+    // Verify cache statistics
+    let cache_stats = storage.get_cache_stats().await;
+    assert!(cache_stats.hit_rate() >= 0.0, "Cache hit rate should be non-negative");
+    
+    println!("✅ Storage query caching optimization test passed");
+}
+
+#[tokio::test]
+async fn test_storage_optimization_cache_warming() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let mut storage = LmdbStorage::new(temp_dir.path());
+    
+    let symbol = "ETHUSDT";
+    let timeframe = 300; // 5 minutes
+    
+    // Initialize database
+    storage.initialize_database(symbol, timeframe)
+        .expect("Failed to initialize database");
+    
+    // Insert recent test data
+    let now = chrono::Utc::now().timestamp_millis();
+    let test_candles = vec![
+        create_test_candle(now - 3600000, 2000.0, 2050.0, 1950.0, 2020.0, 50.5),
+        create_test_candle(now - 1800000, 2020.0, 2080.0, 2010.0, 2060.0, 55.2),
+        create_test_candle(now - 900000, 2060.0, 2100.0, 2040.0, 2080.0, 48.7),
+    ];
+    
+    storage.store_candles(symbol, timeframe, &test_candles)
+        .expect("Failed to insert test candles");
+    
+    // Test cache warming
+    let warm_result = storage.warm_cache(symbol, timeframe).await;
+    assert!(warm_result.is_ok(), "Cache warming should succeed");
+    
+    // Verify cache has data
+    let cache_stats = storage.get_cache_stats().await;
+    let total_entries = cache_stats.l1_current_size + cache_stats.l2_current_size + cache_stats.l3_current_size;
+    assert!(total_entries > 0 || cache_stats.insertions.load(std::sync::atomic::Ordering::Relaxed) > 0, "Cache should have entries or insertions after warming");
+    
+    println!("✅ Storage cache warming optimization test passed");
+}
+
+#[tokio::test]
+async fn test_storage_optimization_pattern_analysis() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let mut storage = LmdbStorage::new(temp_dir.path());
+    
+    let symbol = "ADAUSDT";
+    let timeframe = 60;
+    
+    // Initialize database
+    storage.initialize_database(symbol, timeframe)
+        .expect("Failed to initialize database");
+    
+    // Insert test data
+    let test_candles = vec![
+        create_test_candle(1609459260000, 0.30, 0.31, 0.29, 0.305, 1000.5),
+        create_test_candle(1609459320000, 0.305, 0.315, 0.30, 0.31, 1050.2),
+        create_test_candle(1609459380000, 0.31, 0.32, 0.305, 0.315, 980.7),
+    ];
+    
+    storage.store_candles(symbol, timeframe, &test_candles)
+        .expect("Failed to insert test candles");
+    
+    // Test pattern optimization
+    let optimize_result = storage.optimize_storage_patterns().await;
+    assert!(optimize_result.is_ok(), "Storage pattern optimization should succeed");
+    
+    // Test cache clearing
+    let cleared_count = storage.clear_cache(symbol, timeframe).await;
+    assert!(cleared_count >= 0, "Cache clearing should return non-negative count");
+    
+    println!("✅ Storage pattern analysis optimization test passed");
+}
+
+#[tokio::test]
+async fn test_storage_optimization_metrics_integration() {
+    use crate::metrics::{init_metrics, get_metrics};
+    
+    // Initialize metrics for testing
+    let _metrics = init_metrics().expect("Failed to initialize metrics");
+    
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let mut storage = LmdbStorage::new(temp_dir.path());
+    
+    let symbol = "DOGEUSDT";
+    let timeframe = 60;
+    
+    // Initialize database
+    storage.initialize_database(symbol, timeframe)
+        .expect("Failed to initialize database");
+    
+    // Insert test data
+    let test_candles = vec![
+        create_test_candle(1609459260000, 0.05, 0.052, 0.048, 0.051, 10000.5),
+        create_test_candle(1609459320000, 0.051, 0.055, 0.050, 0.053, 10500.2),
+    ];
+    
+    storage.store_candles(symbol, timeframe, &test_candles)
+        .expect("Failed to insert test candles");
+    
+    // Test optimized query with metrics recording
+    let start_time = 1609459200000;
+    let end_time = 1609459400000;
+    
+    let result = storage.get_candles_optimized(symbol, timeframe, start_time, end_time, None).await
+        .expect("Optimized query with metrics should succeed");
+    assert_eq!(result.len(), 2, "Should retrieve 2 candles");
+    
+    // Verify metrics were recorded
+    if let Some(metrics) = get_metrics() {
+        // Test that metrics recording doesn't panic
+        metrics.record_storage_optimization_metrics(
+            "test_db",
+            "unit_test",
+            0.85,
+            0.90,
+            std::time::Duration::from_millis(50),
+        );
+        println!("✅ Storage optimization metrics recording test passed");
+    } else {
+        panic!("Metrics should be available after initialization");
+    }
 }

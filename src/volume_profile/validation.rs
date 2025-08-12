@@ -1012,7 +1012,7 @@ mod tests {
         let our_val = dec!(2479.5);   // 0.5 difference (within tolerance)
         
         // Calculate our volume percentage - should be close to 70%
-        let our_volume_percentage = VolumeAccuracyValidator::calculate_actual_volume_percentage(
+        let _our_volume_percentage = VolumeAccuracyValidator::calculate_actual_volume_percentage(
             &eth_ref.price_levels,
             our_vah,
             our_val,
@@ -1234,7 +1234,7 @@ mod tests {
                 .collect();
 
             // Find POC and simulate value area bounds
-            let poc_level = price_levels
+            let _poc_level = price_levels
                 .iter()
                 .max_by(|a, b| a.volume.cmp(&b.volume))
                 .unwrap();

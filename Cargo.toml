@@ -60,6 +60,7 @@ num_cpus = "1.16"
 ahash = "0.8"
 ureq = "2.9"
 libc = "0.2"
+flate2 = "1.0"
 
 [features]
 default = ["kafka", "postgres", "volume_profile"]
@@ -74,6 +75,7 @@ tokio-test = "0.4"
 mockall = "0.12"
 tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports"] }
+tracing-test = "0.2"
 
 [[bench]]
 name = "performance_benchmark"
@@ -123,3 +125,15 @@ path = "src/bin/validate_optimizations.rs"
 [[bin]]
 name = "test_performance_monitoring"
 path = "src/bin/test_performance_monitoring.rs"
+
+[[bin]]
+name = "benchmark_optimization"
+path = "src/bin/benchmark_optimization.rs"
+
+[[bin]]
+name = "simple_benchmark"
+path = "src/bin/simple_benchmark.rs"
+
+[[bin]]
+name = "realistic_benchmark"
+path = "src/bin/realistic_benchmark.rs"

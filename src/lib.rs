@@ -23,3 +23,8 @@ pub mod adaptive_config;
 pub mod deployment_validation;
 pub mod zero_copy_serialization;
 pub mod cpu_topology;
+pub mod processing_optimization;
+pub mod network_optimization;
+pub mod storage_optimization;
+pub mod concurrency_optimization;
+pub mod integration_validation;

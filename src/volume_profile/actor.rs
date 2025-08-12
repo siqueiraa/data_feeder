@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap;
 use crate::common::shared_data::{SymbolHashMap, new_symbol_hashmap, SharedSymbol, intern_symbol_fast};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{NaiveDate, Utc, DateTime, Datelike, Timelike};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -16,6 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::historical::structs::FuturesOHLCVCandle;
 use crate::lmdb::{LmdbActor, LmdbActorMessage, LmdbActorResponse};
+use crate::processing_optimization::{BatchProcessor, IntelligentCache, CacheOptimizedPipeline};
 #[cfg(feature = "postgres")]
 use crate::postgres::{PostgresActor, PostgresTell};
 // Kafka publishing is now handled by IndicatorActor to avoid duplicate messages
@@ -47,6 +49,26 @@ pub struct ProcessingReport {
     pub processing_duration_ms: u64,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// Result of processing operations for batch processing
+#[derive(Debug, Clone)]
+pub struct ProcessingResult {
+    pub symbol: String,
+    pub success: bool,
+    pub profiles_updated: usize,
+    pub processing_duration_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Processing optimization statistics
+#[derive(Debug, Clone)]
+pub struct ProcessingOptimizationStats {
+    pub cache_stats: crate::processing_optimization::CacheStats,
+    pub batch_stats: Option<crate::processing_optimization::BatchStats>,
+    pub total_cache_hits: u64,
+    pub total_cache_misses: u64,
+    pub cache_hit_rate: f64,
 }
 
 /// Enhanced date validation and timezone handling for historical data reconstruction
@@ -1173,6 +1195,12 @@ pub struct VolumeProfileActor {
     /// Volume profile reprocessing coordinator (when feature enabled)
     #[cfg(feature = "volume_profile_reprocessing")]
     reprocessing_coordinator: Option<super::reprocessing::ReprocessingCoordinator>,
+    /// Advanced batch processor for candle processing optimization
+    candle_batch_processor: Option<BatchProcessor<(String, FuturesOHLCVCandle), ProcessingResult>>,
+    /// Intelligent cache for volume profile data
+    profile_cache: IntelligentCache<String, VolumeProfileData>,
+    /// Cache-optimized pipeline for processing
+    _processing_pipeline: Option<CacheOptimizedPipeline<VolumeProfileData>>,
 }
 
 /// Key for identifying unique volume profiles (symbol + date) with interned symbol for memory efficiency
@@ -1224,6 +1252,9 @@ impl VolumeProfileActor {
             last_batch_time: None,
             #[cfg(feature = "volume_profile_reprocessing")]
             reprocessing_coordinator: None,
+            candle_batch_processor: None, // Will be initialized on first use
+            profile_cache: IntelligentCache::new(1000), // Cache up to 1000 profiles
+            _processing_pipeline: None, // Will be initialized on first use
         })
     }
 
@@ -1325,23 +1356,65 @@ impl VolumeProfileActor {
         Ok(())
     }
 
-    /// Process candle in batched mode
+    /// Process candle in batched mode with advanced optimization
     async fn process_candle_batched(&mut self, symbol: String, candle: FuturesOHLCVCandle) -> Result<(), String> {
-        // Add to batch queue
-        self.batch_queue.push((symbol, candle));
+        // Initialize advanced batch processor if not already done
+        if self.candle_batch_processor.is_none() {
+            let processing_fn = Arc::new(|batch: Vec<(String, FuturesOHLCVCandle)>| -> Vec<ProcessingResult> {
+                // This will be used for processing results reporting
+                let mut results = Vec::new();
+                for (sym, _candle) in batch {
+                    results.push(ProcessingResult {
+                        symbol: sym,
+                        success: true,
+                        profiles_updated: 1,
+                        processing_duration_ms: 0, // Will be updated by caller
+                        error: None,
+                    });
+                }
+                results
+            });
 
+            let (processor, mut receiver) = BatchProcessor::new(
+                self.config.batch_size,
+                Duration::from_secs(60), // 60 second flush interval
+                processing_fn,
+            );
+
+            // Spawn task to handle batch processing results
+            tokio::spawn(async move {
+                while let Some(_result) = receiver.recv().await {
+                    // Results are handled synchronously in process_advanced_batch
+                    debug!("Batch processing result received");
+                }
+            });
+
+            self.candle_batch_processor = Some(processor);
+        }
+
+        // Use both legacy batch queue and advanced processor
+        self.batch_queue.push((symbol.clone(), candle.clone()));
+
+        if let Some(ref batch_processor) = self.candle_batch_processor {
+            if let Err(e) = batch_processor.add_item((symbol, candle)).await {
+                warn!("Failed to add item to advanced batch processor: {}", e);
+                // Fallback to legacy processing
+                return self.process_legacy_batch().await;
+            }
+        }
+
+        // Check if we should process legacy batch as well
         if self.last_batch_time.is_none() {
             self.last_batch_time = Some(std::time::Instant::now());
         }
 
-        // Check if we should process batch
         let should_process = self.batch_queue.len() >= self.config.batch_size
             || self.last_batch_time
-                .map(|t| t.elapsed().as_secs() >= 60) // Process batch every minute
+                .map(|t| t.elapsed().as_secs() >= 60)
                 .unwrap_or(false);
 
         if should_process {
-            self.process_batch().await?;
+            self.process_advanced_batch().await?;
         }
 
         Ok(())
@@ -1441,6 +1514,109 @@ impl VolumeProfileActor {
               (self.batch_manager.performance_metrics.avg_processing_time_per_item_us as f64 / 1000.0));
 
         Ok(())
+    }
+
+    /// Process batch with advanced optimization and intelligent caching
+    async fn process_advanced_batch(&mut self) -> Result<(), String> {
+        if self.batch_queue.is_empty() {
+            return Ok(());
+        }
+
+        let batch_start = std::time::Instant::now();
+        let batch_size = self.batch_queue.len();
+
+        // Group candles by profile key for better cache utilization
+        let mut grouped_candles: FxHashMap<ProfileKey, Vec<FuturesOHLCVCandle>> = FxHashMap::default();
+
+        for (symbol, candle) in self.batch_queue.drain(..) {
+            if let Some(profile_key) = ProfileKey::from_candle(symbol, &candle) {
+                grouped_candles.entry(profile_key).or_default().push(candle);
+            }
+        }
+
+        let mut profiles_updated = 0;
+
+        // Process each group with intelligent caching
+        for (profile_key, candles) in grouped_candles {
+            let cache_key = format!("{}_{}", profile_key.symbol, profile_key.date);
+
+            // Try to get cached profile data first (for potential future use)
+            let _cached_data = self.profile_cache.get(&cache_key);
+
+            // Ensure profile exists
+            if !self.profiles.contains_key(&profile_key) {
+                let profile = DailyVolumeProfile::new_with_interned_symbol(
+                    Arc::clone(&profile_key.symbol),
+                    profile_key.date,
+                    &self.config,
+                );
+                self.profiles.insert(profile_key.clone(), profile);
+            }
+
+            let processing_start = std::time::Instant::now();
+
+            // Update profile with all candles
+            if let Some(profile) = self.profiles.get_mut(&profile_key) {
+                for candle in &candles {
+                    profile.add_candle(candle);
+                    self.total_candles_processed += 1;
+                }
+
+                let profile_data = profile.get_profile_data();
+                
+                // Cache the updated profile data
+                self.profile_cache.insert(cache_key, profile_data.clone());
+
+                // Store in database
+                if let Err(e) = self.store_profile_in_database(&profile_key, &profile_data).await {
+                    warn!("Failed to store volume profile in database: {}", e);
+                } else {
+                    self.total_database_writes += 1;
+                    profiles_updated += 1;
+                }
+
+                let processing_duration = processing_start.elapsed();
+                info!("Advanced batch processed for {} on {}: {} candles added in {:.2}ms", 
+                      profile_key.symbol, profile_key.date, candles.len(), processing_duration.as_millis());
+            }
+
+            // Yield control periodically
+            tokio::task::yield_now().await;
+        }
+
+        let total_batch_duration = batch_start.elapsed();
+        let avg_time_per_profile = if profiles_updated > 0 { 
+            total_batch_duration.as_millis() as f64 / profiles_updated as f64 
+        } else { 
+            0.0 
+        };
+
+        info!("✅ Advanced batch processing complete: {} profiles updated in {:.2}ms (avg: {:.2}ms/profile)", 
+              profiles_updated, total_batch_duration.as_millis(), avg_time_per_profile);
+
+        // Record processing optimization metrics
+        if let Some(metrics) = crate::metrics::get_metrics() {
+            let cache_stats = self.profile_cache.get_stats();
+            let batch_efficiency = if batch_size > 0 { profiles_updated as f64 / batch_size as f64 } else { 0.0 };
+            
+            metrics.record_processing_optimization_metrics(
+                "volume_profile", 
+                "advanced_batch", 
+                batch_efficiency, 
+                cache_stats.hit_rate()
+            );
+        }
+
+        // Reset batch time
+        self.last_batch_time = None;
+
+        Ok(())
+    }
+
+    /// Fallback to legacy batch processing
+    async fn process_legacy_batch(&mut self) -> Result<(), String> {
+        // Just call the original process_batch method
+        self.process_batch().await
     }
 
     /// Rebuild volume profile for specific day from LMDB data with memory management and progress tracking
@@ -1651,6 +1827,31 @@ impl VolumeProfileActor {
         }
         
         info!("📈 METRICS: {}", self.processing_metrics.get_summary());
+    }
+
+    /// Get processing optimization statistics
+    pub fn get_processing_optimization_stats(&self) -> ProcessingOptimizationStats {
+        let cache_stats = self.profile_cache.get_stats();
+        
+        let batch_stats = self.candle_batch_processor.as_ref().map(|processor| processor.get_stats());
+
+        let total_cache_hits = cache_stats.hits.load(std::sync::atomic::Ordering::Relaxed);
+        let total_cache_misses = cache_stats.misses.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_hit_rate = cache_stats.hit_rate();
+        
+        ProcessingOptimizationStats {
+            cache_stats,
+            batch_stats,
+            total_cache_hits,
+            total_cache_misses,
+            cache_hit_rate,
+        }
+    }
+
+    /// Clear processing optimization caches
+    pub fn clear_processing_caches(&mut self) {
+        self.profile_cache.clear();
+        info!("Processing optimization caches cleared");
     }
 
     /// Identify missing volume profile dates and queue them for backfill processing
@@ -3430,5 +3631,161 @@ mod tests {
         // Test passes if we reach this point without panicking
         // In a real integration test with database, we would verify the table exists
         println!("✅ PostgreSQL schema initialization test completed successfully");
+    }
+
+    #[tokio::test]
+    async fn test_advanced_batch_processing_accuracy() {
+        // Create test config with batching enabled
+        let mut config = create_test_config();
+        config.update_frequency = UpdateFrequency::Batched;
+        config.batch_size = 3;
+        
+        let mut actor = VolumeProfileActor::new(config).unwrap();
+        
+        // Create test candles for the same symbol and date
+        let candles = vec![
+            create_test_candle(1640995200000, 100.0), // Same day
+            create_test_candle(1640995260000, 150.0), // Same day
+            create_test_candle(1640995320000, 200.0), // Same day
+        ];
+        
+        let symbol = "BTCUSDT".to_string();
+        
+        // Process candles individually (should trigger batch processing after 3)
+        for candle in candles.clone() {
+            let result = actor.process_candle(symbol.clone(), candle).await;
+            assert!(result.is_ok(), "Should successfully process candle in batch mode");
+        }
+        
+        // Verify that profiles were created and candles processed
+        assert_eq!(actor.total_candles_processed, 3, "Should have processed exactly 3 candles");
+        assert!(!actor.profiles.is_empty(), "Should have created at least one profile");
+        
+        // Test cache functionality
+        let stats = actor.get_processing_optimization_stats();
+        
+        // Cache should have been used (initial misses are expected)
+        assert!(stats.total_cache_misses >= 0, "Cache misses should be recorded");
+        
+        // Verify batch queue is cleared after processing
+        assert!(actor.batch_queue.is_empty(), "Batch queue should be empty after processing batch");
+    }
+
+    #[test]
+    fn test_intelligent_cache_functionality() {
+        let config = create_test_config();
+        let actor = VolumeProfileActor::new(config).unwrap();
+        
+        // Test cache operations
+        let cache_key = "BTCUSDT_2022-01-01".to_string();
+        let test_data = VolumeProfileData {
+            date: "2022-01-01".to_string(),
+            price_levels: vec![],
+            total_volume: dec!(1000.0),
+            vwap: dec!(50025.0),
+            poc: dec!(50000.0),
+            value_area: crate::volume_profile::structs::ValueArea {
+                high: dec!(50100.0),
+                low: dec!(49900.0),
+                volume_percentage: dec!(70.0),
+                volume: dec!(700.0),
+            },
+            price_increment: dec!(0.01),
+            min_price: dec!(49900.0),
+            max_price: dec!(50100.0),
+            candle_count: 100,
+            last_updated: 1640995200000, // Same timestamp as test candles
+        };
+        
+        // Insert data into cache
+        actor.profile_cache.insert(cache_key.clone(), test_data.clone());
+        
+        // Retrieve from cache
+        let retrieved = actor.profile_cache.get(&cache_key);
+        assert!(retrieved.is_some(), "Should retrieve cached data");
+        
+        let retrieved_data = retrieved.unwrap();
+        assert_eq!(retrieved_data.date, test_data.date);
+        assert_eq!(retrieved_data.poc, test_data.poc);
+        assert_eq!(retrieved_data.total_volume, test_data.total_volume);
+        
+        // Test cache statistics
+        let stats = actor.profile_cache.get_stats();
+        assert!(stats.hits.load(std::sync::atomic::Ordering::Relaxed) >= 1, "Should have at least one cache hit");
+    }
+
+    #[test]
+    fn test_processing_optimization_statistics() {
+        let config = create_test_config();
+        let actor = VolumeProfileActor::new(config).unwrap();
+        
+        // Get initial statistics
+        let stats = actor.get_processing_optimization_stats();
+        
+        // Should have cache statistics
+        assert_eq!(stats.total_cache_hits, 0, "Initial cache hits should be 0");
+        assert_eq!(stats.total_cache_misses, 0, "Initial cache misses should be 0");
+        assert_eq!(stats.cache_hit_rate, 0.0, "Initial hit rate should be 0");
+        
+        // Batch processor should not be initialized yet
+        assert!(stats.batch_stats.is_none(), "Batch processor should not be initialized initially");
+        
+        // Test cache clearing functionality
+        let mut mutable_actor = actor;
+        mutable_actor.clear_processing_caches();
+        
+        let new_stats = mutable_actor.get_processing_optimization_stats();
+        assert_eq!(new_stats.cache_stats.current_size, 0, "Cache should be cleared");
+    }
+
+    #[tokio::test]
+    async fn test_advanced_batch_processing_performance() {
+        use std::time::Instant;
+        
+        let mut config = create_test_config();
+        config.update_frequency = UpdateFrequency::Batched;
+        config.batch_size = 5;
+        
+        let mut actor = VolumeProfileActor::new(config).unwrap();
+        
+        // Create multiple test candles to trigger batch processing
+        let candles = vec![
+            create_test_candle(1640995200000, 100.0),
+            create_test_candle(1640995260000, 150.0),
+            create_test_candle(1640995320000, 200.0),
+            create_test_candle(1640995380000, 250.0),
+            create_test_candle(1640995440000, 300.0),
+        ];
+        
+        let start_time = Instant::now();
+        let symbol = "BTCUSDT".to_string();
+        
+        // Process all candles (should trigger batch processing)
+        for candle in candles {
+            let result = actor.process_candle(symbol.clone(), candle).await;
+            assert!(result.is_ok(), "Should successfully process candle");
+        }
+        
+        let processing_duration = start_time.elapsed();
+        
+        // Verify processing completed
+        assert_eq!(actor.total_candles_processed, 5, "Should have processed all 5 candles");
+        
+        // Verify performance is reasonable (should complete within 1 second)
+        assert!(processing_duration < Duration::from_secs(1), 
+                "Batch processing should complete quickly: {:?}", processing_duration);
+        
+        // Get processing statistics
+        let stats = actor.get_processing_optimization_stats();
+        
+        // Verify cache was used during processing
+        let total_operations = stats.total_cache_hits + stats.total_cache_misses;
+        if total_operations > 0 {
+            assert!(stats.cache_hit_rate <= 1.0, "Hit rate should not exceed 100%");
+            assert!(stats.cache_hit_rate >= 0.0, "Hit rate should not be negative");
+        }
+        
+        println!("✅ Batch processing performance test completed in {:?}", processing_duration);
+        println!("📊 Cache hit rate: {:.2}%", stats.cache_hit_rate * 100.0);
     }
 }

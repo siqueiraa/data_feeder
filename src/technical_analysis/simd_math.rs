@@ -2,6 +2,11 @@
 /// 
 /// This module provides optimized implementations of common mathematical operations
 /// used in technical analysis, designed for maximum performance in hot paths.
+/// Enhanced for Story 6.2 with advanced SIMD vectorization and CPU optimizations.
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use std::arch::x86_64::*;
+
 /// Branch prediction hints for performance-critical paths
 #[inline(always)]
 pub fn likely(b: bool) -> bool {
@@ -315,6 +320,286 @@ pub fn batch_readiness_ratios(ema_counts: &[u32], periods: &[u32], ratios: &mut 
     }
 }
 
+/// SIMD-optimized volume-weighted average price calculations
+/// Uses AVX2 vectorization when available for 4x parallel processing
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn simd_vwap_calculation(prices: &[f64], volumes: &[f64], result: &mut [f64]) {
+    debug_assert_eq!(prices.len(), volumes.len());
+    debug_assert_eq!(prices.len(), result.len());
+    
+    let len = prices.len();
+    let simd_len = len & !3; // Round down to nearest multiple of 4
+    
+    // Process 4 elements at once with AVX2
+    for i in (0..simd_len).step_by(4) {
+        let price_vec = _mm256_loadu_pd(prices.as_ptr().add(i));
+        let volume_vec = _mm256_loadu_pd(volumes.as_ptr().add(i));
+        let product = _mm256_mul_pd(price_vec, volume_vec);
+        _mm256_storeu_pd(result.as_mut_ptr().add(i), product);
+    }
+    
+    // Handle remaining elements
+    for i in simd_len..len {
+        result[i] = prices[i] * volumes[i];
+    }
+}
+
+/// SIMD-optimized standard deviation calculation
+/// Uses SSE2/AVX for vectorized operations
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+#[inline]
+unsafe fn simd_standard_deviation(values: &[f64], mean: f64) -> f64 {
+    let len = values.len();
+    if len == 0 { return 0.0; }
+    
+    let simd_len = len & !1; // Round down to nearest multiple of 2
+    let mut sum_squares = 0.0;
+    
+    let mean_vec = _mm_set1_pd(mean);
+    let mut acc = _mm_setzero_pd();
+    
+    // Process 2 elements at once with SSE2
+    for i in (0..simd_len).step_by(2) {
+        let val_vec = _mm_loadu_pd(values.as_ptr().add(i));
+        let diff = _mm_sub_pd(val_vec, mean_vec);
+        let square = _mm_mul_pd(diff, diff);
+        acc = _mm_add_pd(acc, square);
+    }
+    
+    // Extract and sum the accumulated values
+    let mut acc_array = [0.0; 2];
+    _mm_storeu_pd(acc_array.as_mut_ptr(), acc);
+    sum_squares += acc_array[0] + acc_array[1];
+    
+    // Handle remaining elements
+    for i in simd_len..len {
+        let diff = values[i] - mean;
+        sum_squares += diff * diff;
+    }
+    
+    (sum_squares / len as f64).sqrt()
+}
+
+/// High-performance vectorized EMA calculation with SIMD optimization
+/// Fallback to scalar when SIMD unavailable
+pub fn optimized_vectorized_ema_batch(
+    price: f64, 
+    alphas: &[f64], 
+    betas: &[f64], 
+    prev_emas: &mut [f64]
+) -> usize {
+    debug_assert_eq!(alphas.len(), betas.len());
+    debug_assert_eq!(alphas.len(), prev_emas.len());
+    
+    // Use CPU-specific optimizations when available
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        let len = prev_emas.len();
+        if is_x86_feature_detected!("avx2") && len >= 4 {
+            unsafe { simd_ema_batch_avx2(price, alphas, betas, prev_emas) }
+        } else if is_x86_feature_detected!("sse2") && len >= 2 {
+            unsafe { simd_ema_batch_sse2(price, alphas, betas, prev_emas) }
+        } else {
+            // Fallback to optimized scalar version
+            vectorized_ema_batch_update(price, alphas, betas, prev_emas)
+        }
+    }
+    
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        // ARM/other architectures: use optimized scalar implementation
+        vectorized_ema_batch_update(price, alphas, betas, prev_emas)
+    }
+}
+
+/// AVX2-optimized EMA batch calculation (4x parallel)
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_ema_batch_avx2(
+    price: f64,
+    alphas: &[f64],
+    betas: &[f64], 
+    prev_emas: &mut [f64]
+) -> usize {
+    let len = prev_emas.len();
+    let simd_len = len & !3; // Round down to nearest multiple of 4
+    
+    let price_vec = _mm256_set1_pd(price);
+    
+    // Process 4 EMAs at once with AVX2
+    for i in (0..simd_len).step_by(4) {
+        let alpha_vec = _mm256_loadu_pd(alphas.as_ptr().add(i));
+        let beta_vec = _mm256_loadu_pd(betas.as_ptr().add(i));
+        let prev_vec = _mm256_loadu_pd(prev_emas.as_ptr().add(i));
+        
+        // EMA = alpha * price + beta * prev_ema
+        let alpha_price = _mm256_mul_pd(alpha_vec, price_vec);
+        let beta_prev = _mm256_mul_pd(beta_vec, prev_vec);
+        let result = _mm256_add_pd(alpha_price, beta_prev);
+        
+        _mm256_storeu_pd(prev_emas.as_mut_ptr().add(i), result);
+    }
+    
+    // Handle remaining elements with scalar operations
+    for i in simd_len..len {
+        prev_emas[i] = alphas[i] * price + betas[i] * prev_emas[i];
+    }
+    
+    len
+}
+
+/// SSE2-optimized EMA batch calculation (2x parallel)
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn simd_ema_batch_sse2(
+    price: f64,
+    alphas: &[f64],
+    betas: &[f64],
+    prev_emas: &mut [f64]
+) -> usize {
+    let len = prev_emas.len();
+    let simd_len = len & !1; // Round down to nearest multiple of 2
+    
+    let price_vec = _mm_set1_pd(price);
+    
+    // Process 2 EMAs at once with SSE2
+    for i in (0..simd_len).step_by(2) {
+        let alpha_vec = _mm_loadu_pd(alphas.as_ptr().add(i));
+        let beta_vec = _mm_loadu_pd(betas.as_ptr().add(i));
+        let prev_vec = _mm_loadu_pd(prev_emas.as_ptr().add(i));
+        
+        // EMA = alpha * price + beta * prev_ema  
+        let alpha_price = _mm_mul_pd(alpha_vec, price_vec);
+        let beta_prev = _mm_mul_pd(beta_vec, prev_vec);
+        let result = _mm_add_pd(alpha_price, beta_prev);
+        
+        _mm_storeu_pd(prev_emas.as_mut_ptr().add(i), result);
+    }
+    
+    // Handle remaining elements
+    for i in simd_len..len {
+        prev_emas[i] = alphas[i] * price + betas[i] * prev_emas[i];
+    }
+    
+    len
+}
+
+/// CPU feature detection and optimization selection
+pub fn get_cpu_features() -> CpuFeatures {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        CpuFeatures {
+            sse2: is_x86_feature_detected!("sse2"),
+            sse41: is_x86_feature_detected!("sse4.1"),
+            avx: is_x86_feature_detected!("avx"),
+            avx2: is_x86_feature_detected!("avx2"),
+            fma: is_x86_feature_detected!("fma"),
+        }
+    }
+    
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        // ARM/other architectures don't have these x86 features
+        CpuFeatures {
+            sse2: false,
+            sse41: false,
+            avx: false,
+            avx2: false,
+            fma: false,
+        }
+    }
+}
+
+/// CPU feature detection result
+#[derive(Debug, Clone)]
+pub struct CpuFeatures {
+    pub sse2: bool,
+    pub sse41: bool,
+    pub avx: bool,
+    pub avx2: bool,
+    pub fma: bool,
+}
+
+/// High-performance vectorized mathematical operations dispatcher
+pub fn dispatch_vectorized_operation<T>(
+    operation: VectorizedOperation,
+    input1: &[T],
+    input2: Option<&[T]>,
+    output: &mut [T]
+) where T: Copy + Default + std::ops::Add<Output = T> + std::ops::Mul<Output = T> {
+    let features = get_cpu_features();
+    
+    match operation {
+        VectorizedOperation::Add => {
+            if features.avx2 && input1.len() >= 4 {
+                // Use AVX2 implementation
+                vectorized_add_avx2(input1, input2.unwrap(), output);
+            } else if features.sse2 && input1.len() >= 2 {
+                // Use SSE2 implementation  
+                vectorized_add_sse2(input1, input2.unwrap(), output);
+            } else {
+                // Fallback scalar implementation
+                vectorized_add_scalar(input1, input2.unwrap(), output);
+            }
+        },
+        VectorizedOperation::Multiply => {
+            if features.fma && features.avx2 && input1.len() >= 4 {
+                // Use FMA + AVX2 for fused multiply-add
+                vectorized_multiply_fma_avx2(input1, input2.unwrap(), output);
+            } else {
+                // Standard multiplication
+                vectorized_multiply_scalar(input1, input2.unwrap(), output);
+            }
+        }
+    }
+}
+
+/// Vectorized operation types
+#[derive(Debug, Clone, Copy)]
+pub enum VectorizedOperation {
+    Add,
+    Multiply,
+}
+
+// Placeholder implementations for vector operations
+fn vectorized_add_avx2<T: Copy + std::ops::Add<Output = T>>(input1: &[T], input2: &[T], output: &mut [T]) {
+    // For now, use scalar implementation - could implement AVX2 intrinsics later
+    for i in 0..input1.len().min(input2.len()).min(output.len()) {
+        output[i] = input1[i] + input2[i];
+    }
+}
+
+fn vectorized_add_sse2<T: Copy + std::ops::Add<Output = T>>(input1: &[T], input2: &[T], output: &mut [T]) {
+    // For now, use scalar implementation - could implement SSE2 intrinsics later
+    for i in 0..input1.len().min(input2.len()).min(output.len()) {
+        output[i] = input1[i] + input2[i];
+    }
+}
+
+fn vectorized_add_scalar<T: Copy + std::ops::Add<Output = T>>(input1: &[T], input2: &[T], output: &mut [T]) {
+    // Scalar fallback implementation
+    for i in 0..input1.len().min(input2.len()).min(output.len()) {
+        output[i] = input1[i] + input2[i];
+    }
+}
+
+fn vectorized_multiply_fma_avx2<T: Copy + std::ops::Mul<Output = T>>(input1: &[T], input2: &[T], output: &mut [T]) {
+    // For now, use scalar implementation - could implement FMA + AVX2 intrinsics later
+    for i in 0..input1.len().min(input2.len()).min(output.len()) {
+        output[i] = input1[i] * input2[i];
+    }
+}
+
+fn vectorized_multiply_scalar<T: Copy + std::ops::Mul<Output = T>>(input1: &[T], input2: &[T], output: &mut [T]) {
+    // Scalar fallback implementation
+    for i in 0..input1.len().min(input2.len()).min(output.len()) {
+        output[i] = input1[i] * input2[i];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +701,65 @@ mod tests {
         
         assert!((prev_emas[0] - expected_ema21).abs() < 1e-6);
         assert!((prev_emas[1] - expected_ema89).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_optimized_vectorized_ema_batch() {
+        let price = 100.0;
+        let alphas = vec![0.1, 0.2, 0.3, 0.4];
+        let betas = vec![0.9, 0.8, 0.7, 0.6];
+        let mut prev_emas = vec![95.0, 90.0, 85.0, 80.0];
+        
+        let processed = optimized_vectorized_ema_batch(price, &alphas, &betas, &mut prev_emas);
+        assert_eq!(processed, 4);
+        
+        // Verify results are mathematically correct
+        let expected = [
+            0.1 * 100.0 + 0.9 * 95.0, // 10.0 + 85.5 = 95.5
+            0.2 * 100.0 + 0.8 * 90.0, // 20.0 + 72.0 = 92.0
+            0.3 * 100.0 + 0.7 * 85.0, // 30.0 + 59.5 = 89.5
+            0.4 * 100.0 + 0.6 * 80.0, // 40.0 + 48.0 = 88.0
+        ];
+        
+        for i in 0..4 {
+            assert!((prev_emas[i] - expected[i]).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_cpu_features_detection() {
+        let features = get_cpu_features();
+        
+        // Print feature availability for debugging
+        println!("CPU Features: {:?}", features);
+        
+        // On x86_64, SSE2 should be available; on ARM it should be false
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(features.sse2, "SSE2 should be available on x86_64");
+        
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        assert!(!features.sse2, "SSE2 should not be available on non-x86 architectures");
+    }
+
+    #[test] 
+    fn test_simd_ema_consistency() {
+        // Test that SIMD and scalar versions produce identical results
+        let price = 123.456;
+        let alphas = vec![0.05, 0.1, 0.15, 0.2];
+        let betas = vec![0.95, 0.9, 0.85, 0.8];
+        
+        let mut scalar_emas = vec![100.0, 200.0, 300.0, 400.0];
+        let mut simd_emas = scalar_emas.clone();
+        
+        // Calculate with both methods
+        let scalar_result = vectorized_ema_batch_update(price, &alphas, &betas, &mut scalar_emas);
+        let simd_result = optimized_vectorized_ema_batch(price, &alphas, &betas, &mut simd_emas);
+        
+        assert_eq!(scalar_result, simd_result);
+        
+        // Results should be identical
+        for i in 0..4 {
+            assert!((scalar_emas[i] - simd_emas[i]).abs() < 1e-12);
+        }
     }
 }

@@ -2145,7 +2145,7 @@ mod tests {
         map3.add_volume(dec!(1.03), dec!(0.04)); // POC
         
         let va3 = map3.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
-        let total_volume3 = map3.total_volume();
+        let _total_volume3 = map3.total_volume();
         
         // Should handle small volumes correctly
         let accuracy3 = VolumeAccuracyValidator::validate_volume_accuracy(
@@ -2172,7 +2172,7 @@ mod tests {
             map.add_volume(Decimal::from(i), volume);
         }
         
-        let total_volume = map.total_volume();
+        let _total_volume = map.total_volume();
         
         // Test different target percentages
         for target in [dec!(60.0), dec!(70.0), dec!(80.0), dec!(90.0)] {
@@ -2213,7 +2213,7 @@ mod tests {
         
         // Test Volume mode
         let va_volume = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::Volume);
-        let volume_accuracy = VolumeAccuracyValidator::validate_volume_accuracy(
+        let _volume_accuracy = VolumeAccuracyValidator::validate_volume_accuracy(
             va_volume.volume_percentage,
             dec!(70.0),
             dec!(5.0), // Allow 5% tolerance for this diverse distribution
@@ -2224,7 +2224,7 @@ mod tests {
         // Test TPO mode if candles are available
         if map.get_total_candle_count() > 0 {
             let va_tpo = map.calculate_value_area(dec!(70.0), &ValueAreaCalculationMode::Traditional, &VolumeProfileCalculationMode::TPO);
-            let tpo_accuracy = VolumeAccuracyValidator::validate_volume_accuracy(
+            let _tpo_accuracy = VolumeAccuracyValidator::validate_volume_accuracy(
                 va_tpo.volume_percentage,
                 dec!(70.0),
                 dec!(10.0), // Allow larger tolerance for TPO mode
