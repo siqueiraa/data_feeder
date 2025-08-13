@@ -3,6 +3,12 @@
 //! This module implements real-time CPU monitoring, bottleneck detection, and performance
 //! analysis specifically designed to identify single-core usage patterns and performance issues.
 //! Enhanced for Story 6.1 with detailed hotspot identification and flame graph integration.
+//! Story 6.3: Advanced compiler optimizations, intelligent resource management, and production validation.
+
+pub mod compiler;
+pub mod resource_management;
+pub mod validation;
+pub mod production;
 
 use sysinfo::{System, Pid};
 use std::collections::HashMap;

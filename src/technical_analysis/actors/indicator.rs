@@ -498,7 +498,7 @@ impl SymbolIndicatorState {
         let processing_start = Instant::now();
         
         let close_price = candle.close;
-        self.last_update_time = Some(candle.close_time);
+        self.last_update_time = Some(candle.open_time);
         
         // Update current close price for this timeframe (includes live candles)
         self.set_current_close(timeframe_seconds, close_price);

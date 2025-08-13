@@ -4,7 +4,6 @@
 //! from the multi-layered optimization implementation.
 
 use std::env;
-use tokio;
 
 // Re-export the benchmark module from tests
 mod benchmark_suite {

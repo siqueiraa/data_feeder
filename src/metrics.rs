@@ -92,6 +92,34 @@ pub struct MetricsRegistry {
     pub resource_pattern_detection: IntCounterVec,
     pub configuration_adaptation_events: IntCounterVec,
     pub resource_threshold_breaches: IntCounterVec,
+    
+    // Story 6.3: Compiler Optimization Metrics (AC: 1)
+    pub compiler_optimization_operations: IntCounterVec,
+    pub build_profile_usage: IntCounterVec,
+    pub pgo_optimization_effectiveness: IntGaugeVec,
+    pub native_cpu_feature_utilization: IntGaugeVec,
+    pub lto_binary_size_reduction: IntGaugeVec,
+    
+    // Story 6.3: Intelligent Resource Management Metrics (AC: 2)
+    pub adaptive_resource_scaling_events: IntCounterVec,
+    pub predictive_scaling_accuracy: IntGaugeVec,
+    pub thread_pool_efficiency: IntGaugeVec,
+    pub resource_prediction_confidence: IntGaugeVec,
+    pub intelligent_scaling_decisions: IntCounterVec,
+    
+    // Story 6.3: Comprehensive Validation Metrics (AC: 3)
+    pub validation_suite_executions: IntCounterVec,
+    pub benchmark_execution_time: HistogramVec,
+    pub optimization_effectiveness_score: IntGaugeVec,
+    pub regression_detection_events: IntCounterVec,
+    pub validation_coverage_percentage: IntGaugeVec,
+    
+    // Story 6.3: Production Readiness Metrics (AC: 4)
+    pub load_test_executions: IntCounterVec,
+    pub stress_test_executions: IntCounterVec,
+    pub health_check_status: IntGaugeVec,
+    pub production_readiness_score: IntGaugeVec,
+    pub system_breaking_point: IntGaugeVec,
 }
 
 impl MetricsRegistry {
@@ -400,6 +428,110 @@ impl MetricsRegistry {
             &["threshold_type", "breach_level", "recovery_action"]
         )?;
         
+        // Story 6.3: Compiler Optimization Metrics (AC: 1)
+        let compiler_optimization_operations = IntCounterVec::new(
+            Opts::new("compiler_optimization_operations_total", "Total compiler optimization operations performed"),
+            &["optimization_type", "build_profile", "target_arch"]
+        )?;
+        
+        let build_profile_usage = IntCounterVec::new(
+            Opts::new("build_profile_usage_total", "Usage count of different build profiles"),
+            &["profile_name", "optimization_level", "target_triple"]
+        )?;
+        
+        let pgo_optimization_effectiveness = IntGaugeVec::new(
+            Opts::new("pgo_optimization_effectiveness", "Profile-guided optimization effectiveness percentage"),
+            &["function_name", "optimization_type", "coverage_level"]
+        )?;
+        
+        let native_cpu_feature_utilization = IntGaugeVec::new(
+            Opts::new("native_cpu_feature_utilization", "Native CPU feature utilization percentage"),
+            &["feature_name", "target_arch", "simd_type"]
+        )?;
+        
+        let lto_binary_size_reduction = IntGaugeVec::new(
+            Opts::new("lto_binary_size_reduction", "Binary size reduction percentage from LTO"),
+            &["lto_type", "optimization_level", "build_profile"]
+        )?;
+        
+        // Story 6.3: Intelligent Resource Management Metrics (AC: 2)
+        let adaptive_resource_scaling_events = IntCounterVec::new(
+            Opts::new("adaptive_resource_scaling_events_total", "Total adaptive resource scaling events"),
+            &["scaling_type", "trigger_reason", "success"]
+        )?;
+        
+        let predictive_scaling_accuracy = IntGaugeVec::new(
+            Opts::new("predictive_scaling_accuracy", "Predictive scaling accuracy percentage"),
+            &["prediction_type", "time_horizon", "confidence_level"]
+        )?;
+        
+        let thread_pool_efficiency = IntGaugeVec::new(
+            Opts::new("thread_pool_efficiency", "Thread pool utilization efficiency percentage"),
+            &["pool_type", "sizing_strategy", "load_level"]
+        )?;
+        
+        let resource_prediction_confidence = IntGaugeVec::new(
+            Opts::new("resource_prediction_confidence", "Resource usage prediction confidence score"),
+            &["resource_type", "trend_direction", "data_quality"]
+        )?;
+        
+        let intelligent_scaling_decisions = IntCounterVec::new(
+            Opts::new("intelligent_scaling_decisions_total", "Total intelligent scaling decisions made"),
+            &["decision_type", "resource_type", "urgency_level"]
+        )?;
+        
+        // Story 6.3: Comprehensive Validation Metrics (AC: 3)
+        let validation_suite_executions = IntCounterVec::new(
+            Opts::new("validation_suite_executions_total", "Total validation suite executions"),
+            &["suite_name", "validation_status", "hardware_config"]
+        )?;
+        
+        let benchmark_execution_time = HistogramVec::new(
+            HistogramOpts::new("benchmark_execution_time_seconds", "Benchmark execution time distribution"),
+            &["optimization_dimension", "test_name", "hardware_config"]
+        )?;
+        
+        let optimization_effectiveness_score = IntGaugeVec::new(
+            Opts::new("optimization_effectiveness_score", "Optimization effectiveness score by dimension"),
+            &["optimization_dimension", "measurement_type", "comparison_baseline"]
+        )?;
+        
+        let regression_detection_events = IntCounterVec::new(
+            Opts::new("regression_detection_events_total", "Total performance regression detection events"),
+            &["dimension", "severity", "detection_confidence"]
+        )?;
+        
+        let validation_coverage_percentage = IntGaugeVec::new(
+            Opts::new("validation_coverage_percentage", "Validation test coverage percentage"),
+            &["optimization_dimension", "test_category", "coverage_type"]
+        )?;
+        
+        // Story 6.3: Production Readiness Metrics (AC: 4)
+        let load_test_executions = IntCounterVec::new(
+            Opts::new("load_test_executions_total", "Total load test executions"),
+            &["test_name", "test_result", "load_level"]
+        )?;
+        
+        let stress_test_executions = IntCounterVec::new(
+            Opts::new("stress_test_executions_total", "Total stress test executions"),
+            &["test_name", "max_load_multiplier", "breaking_point_detected"]
+        )?;
+        
+        let health_check_status = IntGaugeVec::new(
+            Opts::new("health_check_status", "Health check status by component"),
+            &["check_type", "status", "last_check"]
+        )?;
+        
+        let production_readiness_score = IntGaugeVec::new(
+            Opts::new("production_readiness_score", "Overall production readiness score"),
+            &["environment", "deployment_target", "validation_level"]
+        )?;
+        
+        let system_breaking_point = IntGaugeVec::new(
+            Opts::new("system_breaking_point", "System breaking point under stress (load multiplier)"),
+            &["stress_test_type", "failure_mode", "recovery_time"]
+        )?;
+        
         // Register all metrics
         registry.register(Box::new(indicator_processing_duration.clone()))?;
         registry.register(Box::new(indicator_processing_total.clone()))?;
@@ -470,12 +602,40 @@ impl MetricsRegistry {
         registry.register(Box::new(configuration_adaptation_events.clone()))?;
         registry.register(Box::new(resource_threshold_breaches.clone()))?;
         
+        // Register Story 6.3 compiler optimization metrics
+        registry.register(Box::new(compiler_optimization_operations.clone()))?;
+        registry.register(Box::new(build_profile_usage.clone()))?;
+        registry.register(Box::new(pgo_optimization_effectiveness.clone()))?;
+        registry.register(Box::new(native_cpu_feature_utilization.clone()))?;
+        registry.register(Box::new(lto_binary_size_reduction.clone()))?;
+        
+        // Register Story 6.3 intelligent resource management metrics
+        registry.register(Box::new(adaptive_resource_scaling_events.clone()))?;
+        registry.register(Box::new(predictive_scaling_accuracy.clone()))?;
+        registry.register(Box::new(thread_pool_efficiency.clone()))?;
+        registry.register(Box::new(resource_prediction_confidence.clone()))?;
+        registry.register(Box::new(intelligent_scaling_decisions.clone()))?;
+        
+        // Register Story 6.3 comprehensive validation metrics
+        registry.register(Box::new(validation_suite_executions.clone()))?;
+        registry.register(Box::new(benchmark_execution_time.clone()))?;
+        registry.register(Box::new(optimization_effectiveness_score.clone()))?;
+        registry.register(Box::new(regression_detection_events.clone()))?;
+        registry.register(Box::new(validation_coverage_percentage.clone()))?;
+        
+        // Register Story 6.3 production readiness metrics
+        registry.register(Box::new(load_test_executions.clone()))?;
+        registry.register(Box::new(stress_test_executions.clone()))?;
+        registry.register(Box::new(health_check_status.clone()))?;
+        registry.register(Box::new(production_readiness_score.clone()))?;
+        registry.register(Box::new(system_breaking_point.clone()))?;
+        
         let _total_metrics = if tokio_metrics_collector.is_some() { 
-            info!("Prometheus metrics registry initialized with {} business metrics + tokio task metrics", 35);
-            35 + 9 // 35 business metrics + 9 tokio task metrics
+            info!("Prometheus metrics registry initialized with {} business metrics + tokio task metrics", 55);
+            55 + 9 // 55 business metrics (35 + 5 compiler + 5 resource + 5 validation + 5 production) + 9 tokio task metrics
         } else {
-            info!("Prometheus metrics registry initialized with {} business metrics (tokio metrics disabled)", 35);
-            35
+            info!("Prometheus metrics registry initialized with {} business metrics (tokio metrics disabled)", 55);
+            55
         };
         
         // Add some initial test data to verify metrics are working
@@ -533,6 +693,34 @@ impl MetricsRegistry {
             resource_pattern_detection,
             configuration_adaptation_events,
             resource_threshold_breaches,
+            
+            // Story 6.3: Compiler Optimization Metrics
+            compiler_optimization_operations,
+            build_profile_usage,
+            pgo_optimization_effectiveness,
+            native_cpu_feature_utilization,
+            lto_binary_size_reduction,
+            
+            // Story 6.3: Intelligent Resource Management Metrics
+            adaptive_resource_scaling_events,
+            predictive_scaling_accuracy,
+            thread_pool_efficiency,
+            resource_prediction_confidence,
+            intelligent_scaling_decisions,
+            
+            // Story 6.3: Comprehensive Validation Metrics
+            validation_suite_executions,
+            benchmark_execution_time,
+            optimization_effectiveness_score,
+            regression_detection_events,
+            validation_coverage_percentage,
+            
+            // Story 6.3: Production Readiness Metrics
+            load_test_executions,
+            stress_test_executions,
+            health_check_status,
+            production_readiness_score,
+            system_breaking_point,
         };
         
         // Add some test data so metrics show up immediately
@@ -553,6 +741,74 @@ impl MetricsRegistry {
         metrics_registry.adaptive_config_effectiveness
             .with_label_values(&["thread_pool", "standard"])
             .set(85);
+        
+        // Initialize Story 6.3 compiler optimization metrics with test data
+        metrics_registry.compiler_optimization_operations
+            .with_label_values(&["pgo", "production", "x86_64"])
+            .inc();
+        metrics_registry.build_profile_usage
+            .with_label_values(&["production", "3", "x86_64-apple-darwin"])
+            .inc();
+        metrics_registry.pgo_optimization_effectiveness
+            .with_label_values(&["hot_function", "pgo", "high"])
+            .set(92);
+        metrics_registry.native_cpu_feature_utilization
+            .with_label_values(&["avx2", "x86_64", "vector"])
+            .set(85);
+        metrics_registry.lto_binary_size_reduction
+            .with_label_values(&["fat", "3", "production"])
+            .set(12);
+        
+        // Initialize Story 6.3 intelligent resource management metrics with test data
+        metrics_registry.adaptive_resource_scaling_events
+            .with_label_values(&["scale_up", "cpu_threshold", "success"])
+            .inc();
+        metrics_registry.predictive_scaling_accuracy
+            .with_label_values(&["cpu", "5min", "high"])
+            .set(88);
+        metrics_registry.thread_pool_efficiency
+            .with_label_values(&["adaptive", "predictive", "medium"])
+            .set(82);
+        metrics_registry.resource_prediction_confidence
+            .with_label_values(&["memory", "increasing", "good"])
+            .set(75);
+        metrics_registry.intelligent_scaling_decisions
+            .with_label_values(&["scale_up", "cpu", "warning"])
+            .inc();
+        
+        // Initialize Story 6.3 comprehensive validation metrics with test data
+        metrics_registry.validation_suite_executions
+            .with_label_values(&["comprehensive_validation", "passed", "x86_64"])
+            .inc();
+        metrics_registry.benchmark_execution_time
+            .with_label_values(&["cpu", "simd_operations", "x86_64"])
+            .observe(0.125); // 125ms
+        metrics_registry.optimization_effectiveness_score
+            .with_label_values(&["memory", "improvement", "baseline_v1"])
+            .set(92);
+        metrics_registry.regression_detection_events
+            .with_label_values(&["storage", "none", "high"])
+            .inc();
+        metrics_registry.validation_coverage_percentage
+            .with_label_values(&["concurrency", "unit_tests", "functional"])
+            .set(95);
+        
+        // Initialize Story 6.3 production readiness metrics with test data
+        metrics_registry.load_test_executions
+            .with_label_values(&["sustained_load", "passed", "100_concurrent"])
+            .inc();
+        metrics_registry.stress_test_executions
+            .with_label_values(&["ramp_up_stress", "10x", "false"])
+            .inc();
+        metrics_registry.health_check_status
+            .with_label_values(&["memory", "healthy", "recent"])
+            .set(1);
+        metrics_registry.production_readiness_score
+            .with_label_values(&["production", "kubernetes", "full"])
+            .set(94);
+        metrics_registry.system_breaking_point
+            .with_label_values(&["load_stress", "none", "fast"])
+            .set(12); // 12x load capacity
         
         Ok(metrics_registry)
     }

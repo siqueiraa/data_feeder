@@ -1341,7 +1341,7 @@ impl PriceLevelMap {
                         };
                         included_metric += metric;
                     }
-                    low_index -= 2;
+                    low_index = low_index.saturating_sub(2);
                 }
             } else if can_expand_above {
                 // Only above direction available
@@ -1364,7 +1364,7 @@ impl PriceLevelMap {
                     };
                     included_metric += metric;
                 }
-                low_index -= 2;
+                low_index = low_index.saturating_sub(2);
             } else {
                 // No more groups available
                 break;
@@ -1516,7 +1516,7 @@ impl PriceLevelMap {
                         };
                         included_metric += metric;
                     }
-                    low_index -= 2;
+                    low_index = low_index.saturating_sub(2);
                 }
             } else if can_expand_above {
                 // Only above direction available
@@ -1539,7 +1539,7 @@ impl PriceLevelMap {
                     };
                     included_metric += metric;
                 }
-                low_index -= 2;
+                low_index = low_index.saturating_sub(2);
             } else {
                 // No more groups available
                 break;
@@ -3356,6 +3356,147 @@ mod tests {
             // This is the DESIRED behavior - asymmetric expansion based on volume priority
             assert!(va.volume_percentage >= dec!(50.0), "Should still achieve reasonable volume percentage");
         }
+    }
+
+    // CRITICAL BUG FIX TESTS: Integer underflow prevention in value area calculations
+    
+    #[test]
+    fn test_value_area_minimal_single_level_no_underflow() {
+        // Test case that triggered the original underflow panic
+        // Single price level should not cause index underflow
+        let mut profile = VolumeProfileData::new(dec!(0.01));
+        
+        // Add single candle - this creates minimal dataset that caused original panic
+        profile.distribute_candle_volume(
+            dec!(100.0), dec!(100.1), dec!(99.9), dec!(100.0), dec!(1000.0),
+            &VolumeDistributionMode::WeightedOHLC
+        );
+        
+        // This should not panic with integer underflow
+        let value_area = profile.calculate_value_area_traditional(dec!(70.0), &VolumeProfileCalculationMode::Volume);
+        
+        // Should return valid result, not crash
+        assert_eq!(value_area.high, dec!(100.0));
+        assert_eq!(value_area.low, dec!(100.0));
+        assert!(value_area.volume > dec!(0.0));
+    }
+    
+    #[test]
+    fn test_value_area_two_levels_no_underflow() {
+        // Test with just 2 price levels - boundary case for low_index -= 2 operations
+        let mut profile = VolumeProfileData::new(dec!(0.01));
+        
+        // Add two distinct price levels
+        profile.distribute_candle_volume(
+            dec!(100.0), dec!(100.0), dec!(100.0), dec!(100.0), dec!(500.0),
+            &VolumeDistributionMode::WeightedOHLC
+        );
+        profile.distribute_candle_volume(
+            dec!(100.1), dec!(100.1), dec!(100.1), dec!(100.1), dec!(500.0),
+            &VolumeDistributionMode::WeightedOHLC
+        );
+        
+        // Should handle 2-level case without underflow
+        let value_area = profile.calculate_value_area_traditional(dec!(70.0), &VolumeProfileCalculationMode::Volume);
+        
+        assert!(value_area.high >= value_area.low);
+        assert!(value_area.volume > dec!(0.0));
+        assert!(value_area.volume_percentage >= dec!(50.0));
+    }
+    
+    #[test] 
+    fn test_value_area_three_levels_edge_case() {
+        // Test with exactly 3 price levels - another boundary case
+        let mut profile = VolumeProfileData::new(dec!(0.01));
+        
+        let prices = [dec!(99.99), dec!(100.0), dec!(100.01)];
+        let volumes = [dec!(300.0), dec!(1000.0), dec!(400.0)]; // POC at middle
+        
+        for (price, volume) in prices.iter().zip(volumes.iter()) {
+            profile.distribute_candle_volume(*price, *price, *price, *price, *volume, &VolumeDistributionMode::WeightedOHLC);
+        }
+        
+        // Should handle expansion without underflow when starting from middle POC
+        let value_area = profile.calculate_value_area_traditional(dec!(70.0), &VolumeProfileCalculationMode::Volume);
+        
+        assert!(value_area.high >= value_area.low);
+        assert!(value_area.volume > dec!(0.0));
+        // With POC in middle, expansion should work safely
+        let poc = profile.get_poc().unwrap();
+        assert!(poc >= value_area.low && poc <= value_area.high);
+    }
+    
+    #[test]
+    fn test_value_area_poc_at_index_zero_no_underflow() {
+        // Specifically test when POC is at lowest price (index 0)
+        // This was a high-risk scenario for low_index -= 2 underflow
+        let mut profile = VolumeProfileData::new(dec!(0.01));
+        
+        // POC will be at lowest price
+        profile.distribute_candle_volume(dec!(99.0), dec!(99.0), dec!(99.0), dec!(99.0), dec!(2000.0), &VolumeDistributionMode::WeightedOHLC); // POC
+        profile.distribute_candle_volume(dec!(99.5), dec!(99.5), dec!(99.5), dec!(99.5), dec!(500.0), &VolumeDistributionMode::WeightedOHLC);
+        profile.distribute_candle_volume(dec!(100.0), dec!(100.0), dec!(100.0), dec!(100.0), dec!(300.0), &VolumeDistributionMode::WeightedOHLC);
+        
+        let poc = profile.get_poc().unwrap();
+        assert_eq!(poc, dec!(99.0)); // Verify POC is at lowest price
+        
+        // This should not cause underflow when low_index starts at 0
+        let value_area = profile.calculate_value_area_traditional(dec!(70.0), &VolumeProfileCalculationMode::Volume);
+        
+        assert!(value_area.high >= value_area.low);
+        assert!(poc >= value_area.low && poc <= value_area.high);
+    }
+    
+    #[test]
+    fn test_value_area_poc_at_index_one_no_underflow() {
+        // Test when POC is at index 1 - boundary case for underflow
+        let mut profile = VolumeProfileData::new(dec!(0.01));
+        
+        profile.distribute_candle_volume(dec!(99.0), dec!(99.0), dec!(99.0), dec!(99.0), dec!(500.0), &VolumeDistributionMode::WeightedOHLC);
+        profile.distribute_candle_volume(dec!(99.5), dec!(99.5), dec!(99.5), dec!(99.5), dec!(2000.0), &VolumeDistributionMode::WeightedOHLC); // POC at index 1
+        profile.distribute_candle_volume(dec!(100.0), dec!(100.0), dec!(100.0), dec!(100.0), dec!(300.0), &VolumeDistributionMode::WeightedOHLC);
+        
+        let poc = profile.get_poc().unwrap();
+        assert_eq!(poc, dec!(99.5)); // Verify POC is at second-lowest price
+        
+        // This should handle low_index -= 2 when starting from index 1
+        let value_area = profile.calculate_value_area_traditional(dec!(70.0), &VolumeProfileCalculationMode::Volume);
+        
+        assert!(value_area.high >= value_area.low);
+        assert!(poc >= value_area.low && poc <= value_area.high);
+    }
+    
+    #[test]
+    fn test_value_area_tpo_mode_no_underflow() {
+        // Test TPO calculation mode with minimal data to ensure no underflow
+        let mut profile = VolumeProfileData::new(dec!(0.01));
+        
+        // Single candle in TPO mode  
+        profile.distribute_candle_volume(
+            dec!(100.0), dec!(100.2), dec!(99.8), dec!(100.1), dec!(1000.0),
+            &VolumeDistributionMode::WeightedOHLC
+        );
+        
+        // Should not cause underflow in TPO calculation mode
+        let value_area = profile.calculate_value_area_traditional(dec!(70.0), &VolumeProfileCalculationMode::TPO);
+        
+        assert!(value_area.high >= value_area.low);
+        assert!(value_area.volume > dec!(0.0));
+    }
+
+    #[test]
+    fn test_saturating_sub_behavior() {
+        // Verify that saturating_sub prevents the underflow that caused original panic
+        let mut index: usize = 1;
+        
+        // This would have caused underflow: 1 - 2 = -1 → u64::MAX - 1 
+        index = index.saturating_sub(2);
+        assert_eq!(index, 0); // saturating_sub clamps to 0 instead of underflowing
+        
+        // Verify it works correctly for valid cases
+        index = 5;
+        index = index.saturating_sub(2);
+        assert_eq!(index, 3);
     }
 }
 

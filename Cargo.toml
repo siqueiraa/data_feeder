@@ -61,6 +61,7 @@ ahash = "0.8"
 ureq = "2.9"
 libc = "0.2"
 flate2 = "1.0"
+rand = "0.8"
 
 [features]
 default = ["kafka", "postgres", "volume_profile"]
@@ -85,25 +86,67 @@ harness = false
 name = "library_migration_benchmark_fixed"
 harness = false
 
-# PHASE 11 + SIMD OPTIMIZATION: Maximum performance compiler settings
+# STORY 6.3: Advanced Compiler Optimization Profiles
+
+# Production release profile with full optimizations
 [profile.release]
 lto = "fat"                    # Full Link Time Optimization
 codegen-units = 1              # Single codegen unit for better optimization
 panic = "abort"                # Remove panic handling overhead
 opt-level = 3                  # Maximum optimization level
 
-# PHASE 4: Native CPU target for maximum SIMD utilization
-# ARM64/AArch64 optimizations (Apple Silicon):
-# Enable with: RUSTFLAGS="-C target-cpu=native -C target-feature=+neon,+fp16,+dotprod" cargo build --release
-# Intel x86_64 optimizations:
-# Enable with: RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2,+fma" cargo build --release
+# Profile-Guided Optimization (PGO) profile
+[profile.pgo-gen]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+# PGO generation flags will be set via RUSTFLAGS
+
+# Profile-Guided Optimization optimized build
+[profile.pgo-use]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+# PGO usage flags will be set via RUSTFLAGS
+
+# Native CPU optimized profile for maximum SIMD utilization
+[profile.native]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+# Native CPU flags will be set via RUSTFLAGS
+
+# Development profile with moderate optimizations for faster builds
+[profile.dev-optimized]
+inherits = "dev"
+opt-level = 1
+debug = true
+lto = "thin"
+
+# Benchmark profile for performance testing
+[profile.bench]
+inherits = "release"
+debug = true                   # Keep debug symbols for profiling
+lto = "fat"
+
+# Apple M3 Max optimized profile for local testing
+[profile.m3-max]
+inherits = "release"
+lto = "thin"                   # Use thin LTO to avoid conflicts
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+# Target-specific optimization configurations:
+# ARM64/AArch64 (Apple Silicon M3 Max): RUSTFLAGS="-C target-cpu=native -C target-feature=+neon,+fp16,+dotprod,+crypto"
+# Intel x86_64: RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2,+fma"
 # 
-# Profile-Guided Optimization (PGO) setup:
-# 1. cargo build --release
-# 2. ./target/release/data_feeder  # Run with representative workload
-# 3. RUSTFLAGS="-C profile-use=/path/to/profile" cargo build --release
+# Profile-Guided Optimization workflow:
+# 1. PGO Generation: RUSTFLAGS="-C profile-generate=/tmp/pgo-data" cargo build --profile pgo-gen
+# 2. Profile Collection: ./target/pgo-gen/data_feeder (run with representative workload)
+# 3. PGO Optimization: RUSTFLAGS="-C profile-use=/tmp/pgo-data" cargo build --profile pgo-use
 #
-# Alternative: Use bolt for post-link optimization:
+# Link-Time Optimization with BOLT:
 # llvm-bolt ./target/release/data_feeder -data=profile.fdata -reorder-functions -o data_feeder_bolt
 
 [[bin]]
