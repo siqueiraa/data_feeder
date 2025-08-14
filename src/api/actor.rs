@@ -267,7 +267,7 @@ impl ApiActor {
         let max_retries = self.config.max_retries;
 
         loop {
-            match self.klines_client.fetch_klines(request.clone()).await {
+            match self.klines_client.fetch_klines(&request).await {
                 Ok(response) => {
                     let candles = response.data;
                     self.stats.record_success(candles.len() as u64);

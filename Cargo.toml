@@ -62,6 +62,7 @@ ureq = "2.9"
 libc = "0.2"
 flate2 = "1.0"
 rand = "0.8"
+async-trait = "0.1"
 
 [features]
 default = ["kafka", "postgres", "volume_profile"]

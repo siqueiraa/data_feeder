@@ -23,6 +23,15 @@ impl ApiEndpoint {
             ApiEndpoint::ExchangeInfo => "/fapi/v1/exchangeInfo",
         }
     }
+
+    /// Get the Gate.io Futures API path for this endpoint
+    pub fn gate_io_path(&self) -> &'static str {
+        match self {
+            ApiEndpoint::Klines => "/api/v4/futures/usdt/candlesticks",
+            ApiEndpoint::Ticker24hr => "/api/v4/futures/usdt/tickers",
+            ApiEndpoint::ExchangeInfo => "/api/v4/futures/usdt/symbols",
+        }
+    }
 }
 
 /// API request configuration
@@ -57,6 +66,28 @@ impl ApiRequest {
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
+    }
+
+    pub fn new_ticker_24hr(symbol: String) -> Self {
+        Self {
+            endpoint: ApiEndpoint::Ticker24hr,
+            symbol,
+            interval: "".to_string(), // Not used for ticker
+            start_time: None,
+            end_time: None,
+            limit: None,
+        }
+    }
+
+    pub fn new_exchange_info() -> Self {
+        Self {
+            endpoint: ApiEndpoint::ExchangeInfo,
+            symbol: "".to_string(), // Not used for exchange info
+            interval: "".to_string(), // Not used for exchange info
+            start_time: None,
+            end_time: None,
+            limit: None,
+        }
     }
 }
 
@@ -177,15 +208,33 @@ pub struct ApiConfig {
     pub max_requests_per_minute: u32,
 }
 
-impl Default for ApiConfig {
-    fn default() -> Self {
+impl ApiConfig {
+    /// Create Binance Futures API configuration
+    pub fn binance_futures() -> Self {
         Self {
             base_url: "https://fapi.binance.com".to_string(),
             timeout_seconds: 30,
             max_retries: 3,
-            rate_limit_delay_ms: 100,
+            rate_limit_delay_ms: 50,
             max_requests_per_minute: 1200, // Binance Futures limit
         }
+    }
+
+    /// Create Gate.io Futures API configuration
+    pub fn gate_io_futures() -> Self {
+        Self {
+            base_url: "https://api.gateio.ws".to_string(),
+            timeout_seconds: 30,
+            max_retries: 3,
+            rate_limit_delay_ms: 50,
+            max_requests_per_minute: 1000, // Gate.io conservative limit
+        }
+    }
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self::binance_futures()
     }
 }
 
