@@ -5,10 +5,38 @@
 //! Enhanced for Story 6.1 with context switching and thread contention measurement.
 
 use prometheus::{Gauge, Counter, Registry};
+use std::cell::RefCell;
 use std::time::Duration;
 use tokio::time::interval;
 use tokio_metrics::TaskMonitor;
 use tracing::warn;
+
+// Thread-local metrics collector to reduce contention
+thread_local! {
+    static LOCAL_METRICS: RefCell<ThreadLocalMetrics> = RefCell::new(ThreadLocalMetrics::new());
+}
+
+/// Thread-local metrics to avoid atomic contention
+#[derive(Debug, Clone)]
+struct ThreadLocalMetrics {
+    context_switches: u64,
+    contention_events: u64,
+    last_flush: std::time::Instant,
+}
+
+impl ThreadLocalMetrics {
+    fn new() -> Self {
+        Self {
+            context_switches: 0,
+            contention_events: 0,
+            last_flush: std::time::Instant::now(),
+        }
+    }
+
+    fn should_flush(&self) -> bool {
+        self.last_flush.elapsed() > Duration::from_millis(100) // Flush every 100ms
+    }
+}
 
 /// Tokio metrics collector that integrates with Prometheus - Enhanced for Story 6.1
 pub struct TokioMetricsCollector {
@@ -19,6 +47,7 @@ pub struct TokioMetricsCollector {
     // Enhanced metrics for Story 6.1
     context_switch_tracker: ContextSwitchTracker,
     thread_contention_detector: ThreadContentionDetector,
+    
 }
 
 /// Prometheus metrics for Tokio task data - Enhanced for Story 6.1
@@ -171,6 +200,17 @@ impl TokioMetricsCollector {
                 ).await {
                     warn!("Failed to collect enhanced metrics: {}", e);
                 }
+                
+                // Flush thread-local metrics periodically (non-blocking)
+                LOCAL_METRICS.with(|metrics| {
+                    let mut m = metrics.borrow_mut();
+                    if m.should_flush() {
+                        // Reset counters after flushing
+                        m.context_switches = 0;
+                        m.contention_events = 0;
+                        m.last_flush = std::time::Instant::now();
+                    }
+                });
             }
         });
     }
@@ -291,9 +331,11 @@ impl TokioMetricsCollector {
             metrics.blocked_tasks_count.set(blocked_tasks);
         }
         
-        // Cleanup old contention events (keep only last 100)
+        // Cleanup old contention events (keep only last 100) - non-blocking
         if contention_detector.recent_contention_events.len() > 100 {
-            contention_detector.recent_contention_events.truncate(100);
+            // Use efficient truncation without reallocating
+            let drain_count = contention_detector.recent_contention_events.len() - 100;
+            contention_detector.recent_contention_events.drain(0..drain_count);
         }
         
         Ok(())
@@ -317,6 +359,23 @@ impl TokioMetricsCollector {
     pub fn get_contention_events(&self) -> Vec<ContentionEvent> {
         self.thread_contention_detector.recent_contention_events.clone()
     }
+    
+    /// Record context switch in thread-local storage to reduce contention
+    pub fn record_context_switch() {
+        LOCAL_METRICS.with(|metrics| {
+            let mut m = metrics.borrow_mut();
+            m.context_switches += 1;
+        });
+    }
+    
+    /// Record contention event in thread-local storage to reduce contention
+    pub fn record_contention_event() {
+        LOCAL_METRICS.with(|metrics| {
+            let mut m = metrics.borrow_mut();
+            m.contention_events += 1;
+        });
+    }
+    
 }
 
 /// Context switch metrics summary

@@ -8,7 +8,7 @@ use serde::{Serialize, Deserialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, debug, warn};
 use tokio::time::interval;
 use sysinfo::{System, Pid};
@@ -124,13 +124,18 @@ pub struct AdaptiveThreadPool {
     active_tasks: AtomicUsize,
     completed_tasks: AtomicU64,
     task_duration_sum: AtomicU64, // in nanoseconds
-    last_resize: Arc<Mutex<Instant>>,
+    last_resize_timestamp: AtomicU64, // unix timestamp in seconds
     resize_cooldown: Duration,
 }
 
 impl AdaptiveThreadPool {
     /// Create new adaptive thread pool
     pub fn new(config: &ResourceManagementConfig) -> Self {
+        let now_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+            
         Self {
             current_size: AtomicUsize::new(config.min_thread_pool_size),
             min_size: config.min_thread_pool_size,
@@ -138,18 +143,21 @@ impl AdaptiveThreadPool {
             active_tasks: AtomicUsize::new(0),
             completed_tasks: AtomicU64::new(0),
             task_duration_sum: AtomicU64::new(0),
-            last_resize: Arc::new(Mutex::new(Instant::now())),
+            last_resize_timestamp: AtomicU64::new(now_timestamp),
             resize_cooldown: config.adjustment_cooldown,
         }
     }
 
     /// Adapt thread pool size based on current load
     pub fn adapt_size(&self, cpu_usage: f32, pending_tasks: usize) -> bool {
-        let now = Instant::now();
-        let mut last_resize = self.last_resize.lock().unwrap();
+        let now_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let last_resize = self.last_resize_timestamp.load(Ordering::Relaxed);
         
         // Check cooldown period
-        if now.duration_since(*last_resize) < self.resize_cooldown {
+        if now_timestamp - last_resize < self.resize_cooldown.as_secs() {
             return false;
         }
 
@@ -172,7 +180,7 @@ impl AdaptiveThreadPool {
 
         if new_size != current_size {
             self.current_size.store(new_size, Ordering::Relaxed);
-            *last_resize = now;
+            self.last_resize_timestamp.store(now_timestamp, Ordering::Relaxed);
             debug!("Thread pool resized: {} -> {} (CPU: {:.1}%, utilization: {:.1}%)", 
                    current_size, new_size, cpu_usage, utilization * 100.0);
             true
@@ -221,7 +229,10 @@ impl AdaptiveThreadPool {
             completed_tasks,
             average_task_duration_ms,
             efficiency_score,
-            last_resize_timestamp: self.last_resize.lock().unwrap().elapsed().as_secs(),
+            last_resize_timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() - self.last_resize_timestamp.load(Ordering::Relaxed),
             resize_reason: "adaptive_scaling".to_string(),
         }
     }
@@ -409,7 +420,7 @@ pub struct ResourceManager {
     system: Arc<Mutex<System>>,
     thread_pool: Arc<AdaptiveThreadPool>,
     predictor: Arc<Mutex<ResourcePredictor>>,
-    resource_history: Arc<Mutex<VecDeque<ResourceSnapshot>>>,
+    resource_history: Arc<tokio::sync::RwLock<VecDeque<ResourceSnapshot>>>,
     metrics_counter: AtomicU64,
 }
 
@@ -419,7 +430,7 @@ impl ResourceManager {
         let system = System::new_all();
         let thread_pool = Arc::new(AdaptiveThreadPool::new(&config));
         let predictor = Arc::new(Mutex::new(ResourcePredictor::new(config.prediction_window_size)));
-        let resource_history = Arc::new(Mutex::new(VecDeque::with_capacity(100)));
+        let resource_history = Arc::new(tokio::sync::RwLock::new(VecDeque::with_capacity(100)));
 
         Self {
             config,
@@ -441,8 +452,12 @@ impl ResourceManager {
         let metrics_counter = Arc::new(AtomicU64::new(self.metrics_counter.load(Ordering::Relaxed)));
 
         tokio::spawn(async move {
-            let mut interval = interval(config.monitoring_interval);
-            info!("Resource monitoring started with {:.1}s interval", config.monitoring_interval.as_secs_f32());
+            let base_interval = config.monitoring_interval;
+            let mut current_interval = base_interval;
+            let mut interval = interval(current_interval);
+            let mut load_samples = Vec::with_capacity(10);
+            
+            info!("Resource monitoring started with adaptive intervals (base: {:.1}s)", base_interval.as_secs_f32());
 
             loop {
                 interval.tick().await;
@@ -483,9 +498,9 @@ impl ResourceManager {
                     pred.add_sample(snapshot.timestamp, snapshot.cpu_usage_percent, snapshot.memory_usage_percent);
                 }
 
-                // Add to history
+                // Add to history (non-blocking)
                 {
-                    let mut history = resource_history.lock().unwrap();
+                    let mut history = resource_history.write().await;
                     if history.len() >= 100 {
                         history.pop_front();
                     }
@@ -525,6 +540,37 @@ impl ResourceManager {
                 }
 
                 metrics_counter.fetch_add(1, Ordering::Relaxed);
+                
+                // Adaptive polling interval based on system load
+                load_samples.push((snapshot.cpu_usage_percent, snapshot.memory_usage_percent));
+                if load_samples.len() > 10 {
+                    load_samples.remove(0);
+                }
+                
+                if load_samples.len() >= 5 {
+                    let avg_cpu: f32 = load_samples.iter().map(|(cpu, _)| *cpu).sum::<f32>() / load_samples.len() as f32;
+                    let avg_memory: f32 = load_samples.iter().map(|(_, mem)| *mem).sum::<f32>() / load_samples.len() as f32;
+                    
+                    // Adjust polling interval based on load
+                    let new_interval = if avg_cpu > 80.0 || avg_memory > 85.0 {
+                        // High load: poll more frequently (reduce interval by 50%)
+                        Duration::from_millis((base_interval.as_millis() / 2).max(1000) as u64)
+                    } else if avg_cpu < 30.0 && avg_memory < 50.0 {
+                        // Low load: poll less frequently (increase interval by 2x)
+                        Duration::from_millis((base_interval.as_millis() * 2).min(30000) as u64)
+                    } else {
+                        // Normal load: use base interval
+                        base_interval
+                    };
+                    
+                    // Only update interval if it changed significantly
+                    if (new_interval.as_millis() as i64 - current_interval.as_millis() as i64).abs() > 1000 {
+                        current_interval = new_interval;
+                        interval = tokio::time::interval(current_interval);
+                        debug!("Adaptive polling interval updated to {:.1}s (CPU: {:.1}%, Memory: {:.1}%)", 
+                               current_interval.as_secs_f32(), avg_cpu, avg_memory);
+                    }
+                }
             }
         })
     }
@@ -570,9 +616,9 @@ impl ResourceManager {
         self.thread_pool.get_stats()
     }
 
-    /// Get resource history
-    pub fn get_resource_history(&self) -> Vec<ResourceSnapshot> {
-        let history = self.resource_history.lock().unwrap();
+    /// Get resource history (async for non-blocking access)
+    pub async fn get_resource_history(&self) -> Vec<ResourceSnapshot> {
+        let history = self.resource_history.read().await;
         history.iter().cloned().collect()
     }
 

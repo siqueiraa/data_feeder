@@ -5,7 +5,7 @@
 //! Enhanced for Story 6.2 to achieve 15-25% concurrency performance improvements.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -20,35 +20,40 @@ pub struct LockFreeRingBuffer<T> {
     size: AtomicUsize,
 }
 
-/// Atomic option wrapper for lock-free data structures
+/// True atomic option wrapper for lock-free data structures
+/// Uses atomic pointers for zero-lock operations
 struct AtomicOption<T> {
-    inner: std::sync::RwLock<Option<T>>,
+    inner: AtomicPtr<T>,
 }
 
 impl<T> AtomicOption<T> {
     fn new() -> Self {
         Self {
-            inner: std::sync::RwLock::new(None),
+            inner: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
     fn take(&self) -> Option<T> {
-        self.inner.write().unwrap().take()
-    }
-
-    fn store(&self, value: T) -> bool {
-        let mut guard = self.inner.write().unwrap();
-        if guard.is_none() {
-            *guard = Some(value);
-            true
+        let ptr = self.inner.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if ptr.is_null() {
+            None
         } else {
-            false
+            unsafe { Some(*Box::from_raw(ptr)) }
         }
     }
 
     #[allow(dead_code)]
     fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_none()
+        self.inner.load(Ordering::Acquire).is_null()
+    }
+}
+
+impl<T> Drop for AtomicOption<T> {
+    fn drop(&mut self) {
+        let ptr = self.inner.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr)); }
+        }
     }
 }
 
@@ -71,33 +76,50 @@ impl<T: Send + Sync + 'static> LockFreeRingBuffer<T> {
 
     /// Try to push an item (non-blocking)
     pub fn try_push(&self, item: T) -> Result<(), T> {
-        let current_size = self.size.load(Ordering::Acquire);
+        // Optimistic fast path: check size with relaxed ordering first
+        let current_size = self.size.load(Ordering::Relaxed);
         if current_size >= self.capacity {
             return Err(item);
         }
 
-        let write_pos = self.write_pos.fetch_add(1, Ordering::AcqRel) % self.capacity;
+        let write_pos = self.write_pos.fetch_add(1, Ordering::Relaxed) % self.capacity;
         
-        if self.buffer[write_pos].store(item) {
-            self.size.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        } else {
-            // Slot was not empty, buffer is full
-            Err(self.buffer[write_pos].inner.write().unwrap().take().unwrap())
+        // Try to store the item, if slot is occupied, we'll get false and need to return the item
+        let new_ptr = Box::into_raw(Box::new(item));
+        let old_ptr = self.buffer[write_pos].inner.compare_exchange(
+            std::ptr::null_mut(),
+            new_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        
+        match old_ptr {
+            Ok(_) => {
+                // Successfully stored, increment size
+                self.size.fetch_add(1, Ordering::Release);
+                Ok(())
+            }
+            Err(_) => {
+                // Slot was not empty, buffer is full - clean up and return error
+                let item = unsafe { *Box::from_raw(new_ptr) };
+                Err(item)
+            }
         }
     }
 
     /// Try to pop an item (non-blocking)
     pub fn try_pop(&self) -> Option<T> {
-        let current_size = self.size.load(Ordering::Acquire);
+        // Optimistic fast path: check size with relaxed ordering first
+        let current_size = self.size.load(Ordering::Relaxed);
         if current_size == 0 {
             return None;
         }
 
-        let read_pos = self.read_pos.fetch_add(1, Ordering::AcqRel) % self.capacity;
+        let read_pos = self.read_pos.fetch_add(1, Ordering::Relaxed) % self.capacity;
         
         if let Some(item) = self.buffer[read_pos].take() {
-            self.size.fetch_sub(1, Ordering::AcqRel);
+            // Only use acquire-release ordering when actually modifying size
+            self.size.fetch_sub(1, Ordering::Release);
             Some(item)
         } else {
             None
@@ -417,8 +439,8 @@ where
                     batch_size, processing_time
                 );
             } else {
-                // No messages, small delay to avoid busy-waiting
-                tokio::time::sleep(Duration::from_micros(100)).await;
+                // No messages, yield to other tasks without sleeping to reduce context switches
+                tokio::task::yield_now().await;
             }
         }
         
