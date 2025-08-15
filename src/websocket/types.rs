@@ -13,6 +13,11 @@ pub enum StreamType {
     Depth,
     /// Individual trade data
     Trade,
+    /// Gate.io trading streams
+    GateOrders,
+    GatePositions,
+    GateBalances,
+    GateTrades,
 }
 
 impl StreamType {
@@ -23,6 +28,24 @@ impl StreamType {
             StreamType::Ticker24hr => "ticker",
             StreamType::Depth => "depth@100ms",
             StreamType::Trade => "trade",
+            StreamType::GateOrders => "orders",
+            StreamType::GatePositions => "positions", 
+            StreamType::GateBalances => "balances",
+            StreamType::GateTrades => "trades",
+        }
+    }
+
+    /// Get the Gate.io futures stream path for this stream type
+    pub fn gate_io_suffix(&self) -> &'static str {
+        match self {
+            StreamType::Kline1m => "futures.candlesticks",
+            StreamType::Ticker24hr => "futures.tickers",
+            StreamType::Depth => "futures.order_book_update",
+            StreamType::Trade => "futures.trades",
+            StreamType::GateOrders => "futures.orders",
+            StreamType::GatePositions => "futures.positions",
+            StreamType::GateBalances => "futures.balances",
+            StreamType::GateTrades => "futures.trades",
         }
     }
 
@@ -30,6 +53,10 @@ impl StreamType {
     pub fn is_implemented(&self) -> bool {
         match self {
             StreamType::Kline1m => true,
+            StreamType::GateOrders => true,
+            StreamType::GatePositions => true,
+            StreamType::GateBalances => true, 
+            StreamType::GateTrades => true,
             _ => false, // Future implementations
         }
     }
@@ -42,6 +69,10 @@ impl fmt::Display for StreamType {
             StreamType::Ticker24hr => write!(f, "ticker_24hr"),
             StreamType::Depth => write!(f, "depth"),
             StreamType::Trade => write!(f, "trade"),
+            StreamType::GateOrders => write!(f, "gate_orders"),
+            StreamType::GatePositions => write!(f, "gate_positions"),
+            StreamType::GateBalances => write!(f, "gate_balances"),
+            StreamType::GateTrades => write!(f, "gate_trades"),
         }
     }
 }
@@ -96,6 +127,25 @@ impl StreamSubscription {
             .iter()
             .map(|symbol| format!("{}@{}", symbol.to_lowercase(), self.stream_type.binance_suffix()))
             .collect()
+    }
+
+    /// Generate Gate.io WebSocket subscription data for this subscription
+    pub fn gate_io_subscription(&self, id: u64) -> serde_json::Value {
+        let channel = self.stream_type.gate_io_suffix();
+        let payload = if self.symbols.is_empty() {
+            // For user data streams (orders, positions, balances), no symbols needed
+            vec![]
+        } else {
+            self.symbols.clone()
+        };
+        
+        serde_json::json!({
+            "time": chrono::Utc::now().timestamp(),
+            "channel": channel,
+            "event": "subscribe",
+            "payload": payload,
+            "id": id
+        })
     }
 }
 

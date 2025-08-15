@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::time::Duration;
 
-use crate::api::types::{ApiError, ApiRequest, ApiResponse};
+use crate::api::types::{ApiError, ApiRequest, ApiResponse, OrderRequest, OrderResponse, ModifyOrderRequest};
 use crate::historical::structs::FuturesOHLCVCandle;
 
 /// Ticker 24hr statistics
@@ -72,6 +72,28 @@ pub trait Exchange: Send + Sync {
     
     /// Check if the exchange connection is healthy
     fn is_healthy(&self) -> bool;
+}
+
+/// Extended trading operations for exchanges that support WebSocket trading
+#[async_trait]
+pub trait TradingExchange: Exchange {
+    /// Place a new order via WebSocket
+    async fn place_order(&mut self, order_request: &OrderRequest) -> Result<OrderResponse, ApiError>;
+    
+    /// Cancel an existing order via WebSocket
+    async fn cancel_order(&mut self, symbol: &str, order_id: &str) -> Result<OrderResponse, ApiError>;
+    
+    /// Modify an existing order via WebSocket
+    async fn modify_order(&mut self, modify_request: &ModifyOrderRequest) -> Result<OrderResponse, ApiError>;
+    
+    /// Get current open orders via WebSocket
+    async fn get_open_orders(&mut self, symbol: Option<&str>) -> Result<Vec<crate::api::types::Order>, ApiError>;
+    
+    /// Get current positions via WebSocket
+    async fn get_positions(&mut self, symbol: Option<&str>) -> Result<Vec<crate::api::types::Position>, ApiError>;
+    
+    /// Get account balance via WebSocket
+    async fn get_balance(&mut self) -> Result<Vec<crate::api::types::Balance>, ApiError>;
 }
 
 #[cfg(test)]

@@ -16,6 +16,8 @@ rustc-hash = "2.1"
 foldhash = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
@@ -85,6 +87,10 @@ harness = false
 
 [[bench]]
 name = "library_migration_benchmark_fixed"
+harness = false
+
+[[bench]]
+name = "trading_performance"
 harness = false
 
 # STORY 6.3: Advanced Compiler Optimization Profiles

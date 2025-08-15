@@ -347,6 +347,233 @@ pub struct VolumeProfileData {
     pub last_updated: TimestampMS,
 }
 
+impl VolumeProfileData {
+    /// Create a new empty volume profile with the specified price increment
+    pub fn new(price_increment: Decimal) -> Self {
+        use rust_decimal_macros::dec;
+        
+        Self {
+            date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            price_levels: Vec::new(),
+            total_volume: dec!(0.0),
+            vwap: dec!(0.0),
+            poc: dec!(0.0),
+            value_area: ValueArea::default(),
+            price_increment,
+            min_price: Decimal::MAX,
+            max_price: dec!(0.0),
+            candle_count: 0,
+            last_updated: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// Distribute candle volume across price levels using the specified distribution mode
+    pub fn distribute_candle_volume(&mut self, open: Decimal, high: Decimal, low: Decimal, close: Decimal, volume: Decimal, mode: &VolumeDistributionMode) {
+        if volume <= Decimal::ZERO {
+            return;
+        }
+
+        // Create temporary price level map to handle the distribution
+        let mut price_map = PriceLevelMap::new(self.price_increment);
+        price_map.distribute_candle_volume(open, high, low, close, volume, mode);
+        
+        // Update min/max prices
+        if low < self.min_price {
+            self.min_price = low;
+        }
+        if high > self.max_price {
+            self.max_price = high;
+        }
+        
+        // Convert price map back to our price levels format
+        for (price_key, vol) in price_map.levels {
+            let price = price_key.to_price(self.price_increment);
+            
+            // Find existing price level or create new one
+            if let Some(existing_level) = self.price_levels.iter_mut().find(|level| level.price == price) {
+                existing_level.volume += vol;
+            } else {
+                self.price_levels.push(PriceLevelData {
+                    price,
+                    volume: vol,
+                    percentage: dec!(0.0), // Will be calculated later
+                    candle_count: *price_map.candle_counts.get(&price_key).unwrap_or(&0),
+                });
+            }
+        }
+        
+        // Update totals
+        self.total_volume += volume;
+        self.candle_count += 1;
+        self.last_updated = chrono::Utc::now().timestamp_millis();
+        
+        // Recalculate percentages and derived values
+        self.recalculate_derived_values();
+    }
+    
+    /// Recalculate VWAP, POC, value area, and percentages
+    fn recalculate_derived_values(&mut self) {
+        if self.price_levels.is_empty() || self.total_volume.is_zero() {
+            return;
+        }
+        
+        // Sort price levels by price for consistent processing
+        self.price_levels.sort_by(|a, b| a.price.cmp(&b.price));
+        
+        // Calculate VWAP
+        let mut vwap_numerator = Decimal::ZERO;
+        for level in &self.price_levels {
+            vwap_numerator += level.price * level.volume;
+        }
+        self.vwap = vwap_numerator / self.total_volume;
+        
+        // Update percentages
+        for level in &mut self.price_levels {
+            level.percentage = (level.volume / self.total_volume) * dec!(100.0);
+        }
+        
+        // Find POC (Point of Control - highest volume price)
+        if let Some(poc_level) = self.price_levels.iter().max_by(|a, b| a.volume.cmp(&b.volume)) {
+            self.poc = poc_level.price;
+        }
+        
+        // Calculate value area (simplified version - 70% of volume around POC)
+        self.calculate_value_area();
+    }
+    
+    /// Calculate value area (70% of volume concentration around POC)
+    fn calculate_value_area(&mut self) {
+        if self.price_levels.is_empty() {
+            return;
+        }
+        
+        let target_volume = self.total_volume * dec!(0.70);
+        let mut accumulated_volume = Decimal::ZERO;
+        
+        // Find POC index
+        let poc_index = self.price_levels.iter()
+            .position(|level| level.price == self.poc)
+            .unwrap_or(0);
+        
+        // Start from POC and expand outward
+        let mut low_index = poc_index;
+        let mut high_index = poc_index;
+        accumulated_volume += self.price_levels[poc_index].volume;
+        
+        // Expand value area by adding adjacent price levels with highest volume
+        while accumulated_volume < target_volume {
+            let can_expand_down = low_index > 0;
+            let can_expand_up = high_index < self.price_levels.len() - 1;
+            
+            if !can_expand_down && !can_expand_up {
+                break;
+            }
+            
+            let down_volume = if can_expand_down { 
+                self.price_levels[low_index - 1].volume 
+            } else { 
+                Decimal::ZERO 
+            };
+            let up_volume = if can_expand_up { 
+                self.price_levels[high_index + 1].volume 
+            } else { 
+                Decimal::ZERO 
+            };
+            
+            if down_volume >= up_volume && can_expand_down {
+                low_index -= 1;
+                accumulated_volume += self.price_levels[low_index].volume;
+            } else if can_expand_up {
+                high_index += 1;
+                accumulated_volume += self.price_levels[high_index].volume;
+            } else if can_expand_down {
+                low_index -= 1;
+                accumulated_volume += self.price_levels[low_index].volume;
+            }
+        }
+        
+        // Update value area
+        self.value_area = ValueArea {
+            high: self.price_levels[high_index].price,
+            low: self.price_levels[low_index].price,
+            volume_percentage: (accumulated_volume / self.total_volume) * dec!(100.0),
+            volume: accumulated_volume,
+        };
+    }
+    
+    /// Get the Point of Control (POC) price
+    pub fn get_poc(&self) -> Option<Decimal> {
+        if self.poc.is_zero() && !self.price_levels.is_empty() {
+            // POC hasn't been calculated yet, find it dynamically
+            self.price_levels.iter()
+                .max_by(|a, b| a.volume.cmp(&b.volume))
+                .map(|level| level.price)
+        } else {
+            Some(self.poc)
+        }
+    }
+    
+    /// Calculate value area using traditional method
+    pub fn calculate_value_area_traditional(&mut self, target_percentage: Decimal, _calculation_mode: &VolumeProfileCalculationMode) -> ValueArea {
+        if self.price_levels.is_empty() {
+            return ValueArea::default();
+        }
+        
+        let target_volume = self.total_volume * target_percentage / dec!(100.0);
+        let mut accumulated_volume = Decimal::ZERO;
+        
+        // Find POC index
+        let poc_index = self.price_levels.iter()
+            .position(|level| level.price == self.poc)
+            .unwrap_or(0);
+        
+        // Start from POC and expand outward
+        let mut low_index = poc_index;
+        let mut high_index = poc_index;
+        accumulated_volume += self.price_levels[poc_index].volume;
+        
+        // Expand value area by adding adjacent price levels with highest volume
+        while accumulated_volume < target_volume {
+            let can_expand_down = low_index > 0;
+            let can_expand_up = high_index < self.price_levels.len() - 1;
+            
+            if !can_expand_down && !can_expand_up {
+                break;
+            }
+            
+            let down_volume = if can_expand_down { 
+                self.price_levels[low_index - 1].volume 
+            } else { 
+                Decimal::ZERO 
+            };
+            let up_volume = if can_expand_up { 
+                self.price_levels[high_index + 1].volume 
+            } else { 
+                Decimal::ZERO 
+            };
+            
+            if down_volume >= up_volume && can_expand_down {
+                low_index -= 1;
+                accumulated_volume += self.price_levels[low_index].volume;
+            } else if can_expand_up {
+                high_index += 1;
+                accumulated_volume += self.price_levels[high_index].volume;
+            } else if can_expand_down {
+                low_index -= 1;
+                accumulated_volume += self.price_levels[low_index].volume;
+            }
+        }
+        
+        // Return value area
+        ValueArea {
+            high: self.price_levels[high_index].price,
+            low: self.price_levels[low_index].price,
+            volume_percentage: (accumulated_volume / self.total_volume) * dec!(100.0),
+            volume: accumulated_volume,
+        }
+    }
+}
+
 /// Flat volume profile data without JSON - for direct database storage
 #[derive(Debug, Clone)]
 pub struct DailyVolumeProfileFlat {

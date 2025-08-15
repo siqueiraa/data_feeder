@@ -31,6 +31,18 @@ impl ConnectionManager {
         }
     }
 
+    /// Create a new connection manager for Gate.io futures
+    pub fn new_gate_io_futures() -> Self {
+        Self {
+            base_url: "wss://fx-ws.gateio.ws".to_string(),
+            stats: ConnectionStats::new(),
+            status: ConnectionStatus::Disconnected,
+            max_reconnect_attempts: 10,
+            reconnect_delay: Duration::from_secs(5),
+            ping_interval: Duration::from_secs(20), // Gate.io recommends more frequent pings
+        }
+    }
+
     /// Create a new connection manager with custom settings
     pub fn new(base_url: String) -> Self {
         Self {
@@ -86,6 +98,31 @@ impl ConnectionManager {
         }
 
         Ok(format!("{}/stream?streams={}", self.base_url, all_streams.join("/")))
+    }
+
+    /// Build Gate.io WebSocket URL for trading streams
+    pub fn build_gate_io_url(&self) -> String {
+        format!("{}/v4/ws", self.base_url)
+    }
+
+    /// Generate Gate.io subscription message for multiple subscriptions
+    pub fn build_gate_io_subscription_message(&self, subscriptions: &[StreamSubscription]) -> Result<String, WebSocketError> {
+        if subscriptions.is_empty() {
+            return Err(WebSocketError::Subscription(
+                "At least one subscription required".to_string()
+            ));
+        }
+
+        let mut messages = Vec::new();
+        for (i, subscription) in subscriptions.iter().enumerate() {
+            let subscription_data = subscription.gate_io_subscription(i as u64 + 1);
+            messages.push(subscription_data);
+        }
+
+        // For Gate.io, we typically send one subscription message at a time
+        // Return the first subscription message as JSON string
+        serde_json::to_string(&messages[0])
+            .map_err(|e| WebSocketError::Subscription(format!("Failed to serialize Gate.io subscription: {}", e)))
     }
 
     /// Connect to WebSocket with automatic reconnection

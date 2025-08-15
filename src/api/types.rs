@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use crate::historical::structs::{TimestampMS};
 
 /// Supported API endpoints and data types
@@ -245,5 +246,286 @@ impl fmt::Display for ApiEndpoint {
             ApiEndpoint::Ticker24hr => write!(f, "ticker_24hr"),
             ApiEndpoint::ExchangeInfo => write!(f, "exchange_info"),
         }
+    }
+}
+
+/// Order side enumeration for trading
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+/// Order type enumeration for trading
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub enum OrderType {
+    Market,
+    Limit,
+    StopLoss,
+    StopLimit,
+    TakeProfit,
+}
+
+/// Order status enumeration
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub enum OrderStatus {
+    New,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+    Rejected,
+}
+
+/// Position side enumeration
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub enum PositionSide {
+    Long,
+    Short,
+    None,
+}
+
+/// Order structure with zero-copy serialization support
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct Order {
+    pub id: String,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub order_type: OrderType,
+    pub quantity: f64,
+    pub price: Option<f64>,
+    pub status: OrderStatus,
+    pub timestamp: i64,
+}
+
+/// Position structure with zero-copy serialization support
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct Position {
+    pub symbol: String,
+    pub side: PositionSide,
+    pub size: f64,
+    pub entry_price: f64,
+    pub mark_price: f64,
+    pub unrealized_pnl: f64,
+    pub margin_required: f64,
+    pub timestamp: i64,
+}
+
+/// Balance structure for account balances
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct Balance {
+    pub asset: String,
+    pub available: f64,
+    pub locked: f64,
+    pub total: f64,
+    pub timestamp: i64,
+}
+
+/// Trade execution structure
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct TradeExecution {
+    pub id: String,
+    pub order_id: String,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub quantity: f64,
+    pub price: f64,
+    pub fee: f64,
+    pub fee_asset: String,
+    pub timestamp: i64,
+}
+
+/// Order request structure for placing orders
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct OrderRequest {
+    pub symbol: String,
+    pub side: OrderSide,
+    pub order_type: OrderType,
+    pub quantity: f64,
+    pub price: Option<f64>,
+    pub time_in_force: Option<String>,
+    pub client_order_id: Option<String>,
+    pub reduce_only: bool,
+}
+
+/// Modify order request structure
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct ModifyOrderRequest {
+    pub symbol: String,
+    pub order_id: String,
+    pub quantity: Option<f64>,
+    pub price: Option<f64>,
+}
+
+/// Order response structure
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct OrderResponse {
+    pub order: Order,
+    pub success: bool,
+    pub message: Option<String>,
+    pub timestamp: i64,
+}
+
+impl OrderRequest {
+    /// Create a new market order request
+    pub fn market_order(symbol: String, side: OrderSide, quantity: f64) -> Self {
+        Self {
+            symbol,
+            side,
+            order_type: OrderType::Market,
+            quantity,
+            price: None,
+            time_in_force: Some("IOC".to_string()),
+            client_order_id: None,
+            reduce_only: false,
+        }
+    }
+
+    /// Create a new limit order request
+    pub fn limit_order(symbol: String, side: OrderSide, quantity: f64, price: f64) -> Self {
+        Self {
+            symbol,
+            side,
+            order_type: OrderType::Limit,
+            quantity,
+            price: Some(price),
+            time_in_force: Some("GTC".to_string()),
+            client_order_id: None,
+            reduce_only: false,
+        }
+    }
+
+    /// Set client order ID for tracking
+    pub fn with_client_order_id(mut self, client_order_id: String) -> Self {
+        self.client_order_id = Some(client_order_id);
+        self
+    }
+
+    /// Set as reduce-only order
+    pub fn reduce_only(mut self) -> Self {
+        self.reduce_only = true;
+        self
+    }
+
+    /// Validate order request parameters
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.symbol.is_empty() {
+            return Err(ApiError::InvalidSymbol("Symbol cannot be empty".to_string()));
+        }
+
+        if self.quantity <= 0.0 {
+            return Err(ApiError::InvalidTimeframe("Quantity must be positive".to_string()));
+        }
+
+        if self.order_type == OrderType::Limit && self.price.is_none() {
+            return Err(ApiError::InvalidTimeframe("Limit orders require a price".to_string()));
+        }
+
+        if let Some(price) = self.price {
+            if price <= 0.0 {
+                return Err(ApiError::InvalidTimeframe("Price must be positive".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Cross-exchange pricing comparison data
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct CrossExchangePrices {
+    pub symbol: String,
+    pub binance_price: Option<f64>,
+    pub gate_io_price: Option<f64>,
+    pub spread: Option<f64>,
+    pub spread_percentage: Option<f64>,
+    pub timestamp: i64,
+}
+
+impl CrossExchangePrices {
+    pub fn new(symbol: String) -> Self {
+        Self {
+            symbol,
+            binance_price: None,
+            gate_io_price: None,
+            spread: None,
+            spread_percentage: None,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    pub fn with_binance_price(mut self, price: f64) -> Self {
+        self.binance_price = Some(price);
+        self.update_spread();
+        self
+    }
+
+    pub fn with_gate_io_price(mut self, price: f64) -> Self {
+        self.gate_io_price = Some(price);
+        self.update_spread();
+        self
+    }
+
+    fn update_spread(&mut self) {
+        if let (Some(binance), Some(gate_io)) = (self.binance_price, self.gate_io_price) {
+            self.spread = Some((binance - gate_io).abs());
+            if gate_io != 0.0 {
+                self.spread_percentage = Some(((binance - gate_io).abs() / gate_io) * 100.0);
+            }
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.binance_price.is_some() && self.gate_io_price.is_some()
+    }
+}
+
+/// Arbitrage opportunity detection
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize)]
+pub struct ArbitrageOpportunity {
+    pub symbol: String,
+    pub buy_exchange: String,
+    pub sell_exchange: String,
+    pub buy_price: f64,
+    pub sell_price: f64,
+    pub price_difference: f64,
+    pub percentage_profit: f64,
+    pub min_quantity: f64,
+    pub max_quantity: f64,
+    pub timestamp: i64,
+}
+
+impl ArbitrageOpportunity {
+    pub fn new(
+        symbol: String,
+        buy_exchange: String,
+        sell_exchange: String,
+        buy_price: f64,
+        sell_price: f64,
+        min_quantity: f64,
+        max_quantity: f64,
+    ) -> Self {
+        let price_difference = sell_price - buy_price;
+        let percentage_profit = if buy_price != 0.0 {
+            (price_difference / buy_price) * 100.0
+        } else {
+            0.0
+        };
+
+        Self {
+            symbol,
+            buy_exchange,
+            sell_exchange,
+            buy_price,
+            sell_price,
+            price_difference,
+            percentage_profit,
+            min_quantity,
+            max_quantity,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    pub fn is_profitable(&self, min_profit_percentage: f64) -> bool {
+        self.percentage_profit >= min_profit_percentage && self.price_difference > 0.0
     }
 }
