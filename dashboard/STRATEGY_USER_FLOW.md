@@ -1,0 +1,512 @@
+# Strategy Management User Flow Guide
+
+Complete guide for the Trading Strategy Management system in Data Feeder Dashboard.
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [User Registration & Authentication](#user-registration--authentication)
+3. [Strategy Creation](#strategy-creation)
+4. [Strategy Management](#strategy-management)
+5. [Backtesting](#backtesting)
+6. [Signal Monitoring](#signal-monitoring)
+7. [API Endpoints Reference](#api-endpoints-reference)
+
+---
+
+## Overview
+
+The Strategy Management system allows users to create, test, and deploy automated trading strategies for cryptocurrency markets. The system includes:
+
+- **User Authentication**: Secure registration and login
+- **Strategy Builder**: Visual interface for creating trading strategies
+- **Backtesting Engine**: Test strategies on historical data
+- **Signal Generation**: Real-time trading signal generation
+- **Performance Tracking**: Monitor strategy performance metrics
+
+### Supported Strategy Types
+
+1. **EMA Crossover**: Moving average crossover signals
+2. **RSI Divergence**: RSI-based overbought/oversold detection
+3. **MACD Signal**: MACD indicator-based signals
+4. **Bollinger Bands**: Bollinger band breakout/reversal
+5. **Volume Profile**: Volume-based POC and value area trading
+6. **Trend Following**: Trend identification and following
+7. **Mean Reversion**: Price reversion to mean strategies
+8. **Breakout**: Support/resistance breakout detection
+9. **Custom**: Build your own strategy logic
+
+---
+
+## User Registration & Authentication
+
+### 1. Registration Flow
+
+**Path**: `/register`
+
+**Steps**:
+1. Navigate to the registration page
+2. Fill in required fields:
+   - Username (unique identifier)
+   - Email address
+   - Password (minimum 8 characters)
+   - Confirm password
+   - Role selection (Trader, Viewer, or Admin)
+3. Click "Create Account"
+4. Upon success, automatically redirected to strategies page
+
+**User Roles**:
+- **Trader**: Can create, manage, and execute strategies
+- **Viewer**: Read-only access to strategies and signals
+- **Admin**: Full access including user management
+
+### 2. Login Flow
+
+**Path**: `/login`
+
+**Steps**:
+1. Navigate to the login page
+2. Enter username and password
+3. Click "Sign In"
+4. Upon success, redirected to `/strategies`
+5. Authentication token stored in localStorage
+
+**Session Management**:
+- JWT token-based authentication
+- Token included in all API requests via `Authorization` header
+- Automatic redirect to login on 401 (unauthorized) responses
+- Token expiration handled automatically
+
+---
+
+## Strategy Creation
+
+### Path: `/strategies/new`
+
+### Step-by-Step Process
+
+#### 1. Basic Information
+```
+Name: "My BTC EMA Strategy"
+Description: "21/89 EMA crossover on BTCUSDT 15m"
+Strategy Type: EMA Crossover
+Exchange: Binance or Gate.io
+```
+
+#### 2. Market Configuration
+- **Symbol**: Select from BTCUSDT, ETHUSDT, BNBUSDT, ADAUSDT, SOLUSDT, DOGEUSDT
+- **Timeframe**: 1m, 5m, 15m, 30m, 1h, 4h, 1d
+- **Position Size**: Amount in USDT per trade
+- **Max Positions**: Maximum concurrent positions (1-10)
+
+#### 3. Risk Management
+- **Stop Loss**: Percentage (0.1% - 10%)
+- **Take Profit**: Percentage (0.1% - 20%)
+- **Max Drawdown**: Maximum account drawdown (1% - 50%)
+- **Daily Loss Limit**: Daily loss threshold (1% - 25%)
+- **Risk Per Trade**: Risk percentage per trade (0.1% - 5%)
+
+#### 4. Indicator Parameters
+
+**EMA Crossover/Trend Following**:
+- Fast EMA Period: 5-50 (default: 21)
+- Slow EMA Period: 20-200 (default: 89)
+
+**RSI Divergence/Mean Reversion**:
+- RSI Period: 5-30 (default: 14)
+- RSI Overbought: 60-90 (default: 70)
+- RSI Oversold: 10-40 (default: 30)
+
+#### 5. Submit
+- Click "Create Strategy"
+- Strategy created with "draft" status
+- Redirected to strategies list page
+
+---
+
+## Strategy Management
+
+### Path: `/strategies`
+
+### Strategy List View
+
+**Features**:
+- View all strategies with status badges
+- Filter and search strategies
+- Quick status overview cards:
+  - Active Strategies
+  - Draft Strategies
+  - Paused Strategies
+
+**Strategy Actions**:
+- **View**: See detailed strategy information
+- **Edit**: Modify strategy parameters
+- **Start/Pause**: Control strategy execution
+- **Delete**: Remove strategy (with confirmation)
+
+### Strategy Status States
+
+| Status | Description | Color |
+|--------|-------------|-------|
+| **Draft** | Not yet deployed | Gray |
+| **Active** | Currently running and generating signals | Green |
+| **Paused** | Temporarily stopped | Yellow |
+| **Stopped** | Manually stopped | Red |
+| **Backtesting** | Running backtest | Blue |
+
+### Strategy Detail View
+
+**Path**: `/strategies/[id]`
+
+**Tabs**:
+
+1. **Overview**
+   - Performance metrics (Win rate, Total PnL, Sharpe Ratio, Max Drawdown)
+   - Configuration summary
+   - Indicator settings
+   - Creation and execution timestamps
+
+2. **Backtesting**
+   - View historical backtest results
+   - Run new backtests
+   - Equity curve visualization
+   - Performance statistics
+
+3. **Signals**
+   - Recent signals generated by strategy
+   - Signal status (pending, executed, cancelled, failed)
+   - Signal details (price, quantity, confidence, reason)
+
+4. **Settings**
+   - Risk management parameters
+   - Position sizing configuration
+   - Strategy-specific settings
+
+---
+
+## Backtesting
+
+### Purpose
+Test strategy performance on historical data before live deployment
+
+### Running a Backtest
+
+**Path**: From strategy detail page, "Backtesting" tab
+
+**Steps**:
+1. Click "Run New Backtest"
+2. Configure backtest parameters:
+   - **Start Date**: Historical start date
+   - **End Date**: Historical end date
+   - **Initial Capital**: Starting capital in USDT
+   - **Commission**: Trading fee (default: 0.1%)
+   - **Slippage**: Price slippage (default: 0.05%)
+3. Click "Run Backtest"
+4. Wait for completion (processing time varies)
+
+### Backtest Results
+
+**Performance Metrics**:
+- **Total Trades**: Number of trades executed
+- **Win Rate**: Percentage of winning trades
+- **Total PnL**: Total profit/loss in USDT and percentage
+- **Average Win/Loss**: Average winning and losing trade amounts
+- **Profit Factor**: Gross profit / Gross loss
+- **Sharpe Ratio**: Risk-adjusted return
+- **Max Drawdown**: Maximum peak-to-trough decline
+
+**Visualizations**:
+- **Equity Curve**: Portfolio value over time
+- **Drawdown Chart**: Drawdown percentage timeline
+- **Trade Distribution**: Win/loss distribution
+
+**Trade Log**:
+- Timestamp of each trade
+- Buy/Sell action
+- Entry and exit prices
+- PnL per trade
+- Trade reason/signal
+
+---
+
+## Signal Monitoring
+
+### Path: `/signals`
+
+### Overview
+Monitor real-time trading signals generated by active strategies
+
+**Features**:
+- Real-time signal updates (10-second refresh)
+- Filter signals by strategy
+- Signal status tracking
+- Manual signal execution/cancellation
+
+### Signal Status
+
+| Status | Description | Actions Available |
+|--------|-------------|------------------|
+| **Pending** | Awaiting execution | Execute, Cancel |
+| **Executed** | Successfully executed | View only |
+| **Cancelled** | Manually cancelled | View only |
+| **Failed** | Execution failed | View error |
+
+### Signal Information
+
+Each signal displays:
+- **Timestamp**: When signal was generated
+- **Strategy**: Source strategy name
+- **Action**: Buy, Sell, or Close
+- **Symbol**: Trading pair
+- **Price**: Signal price
+- **Quantity**: Trade quantity
+- **Confidence**: Signal strength (0-100%)
+- **Reason**: Why signal was generated
+- **Status**: Current status
+
+### Manual Actions
+
+**Execute Signal**:
+1. Locate pending signal
+2. Click "Execute" button
+3. Signal sent to exchange
+4. Status updated to "executed" or "failed"
+
+**Cancel Signal**:
+1. Locate pending signal
+2. Click "Cancel" button
+3. Signal cancelled without execution
+4. Status updated to "cancelled"
+
+---
+
+## API Endpoints Reference
+
+### Authentication Endpoints
+
+```typescript
+POST /api/users/register
+Body: { username, email, password, role }
+Response: User object
+
+POST /api/users/login
+Body: { username, password }
+Response: { token, user, expires_at }
+
+POST /api/users/logout
+Response: { message }
+
+GET /api/users/me
+Response: Current user object
+```
+
+### Strategy Endpoints
+
+```typescript
+POST /api/strategies
+Body: CreateStrategyRequest
+Response: Strategy object
+
+GET /api/strategies
+Query: ?user_id=xxx (optional)
+Response: Strategy[]
+
+GET /api/strategies/:id
+Response: Strategy object
+
+PUT /api/strategies/:id
+Body: UpdateStrategyRequest
+Response: Updated strategy
+
+DELETE /api/strategies/:id
+Response: { message }
+
+POST /api/strategies/:id/start
+Response: Updated strategy (status: active)
+
+POST /api/strategies/:id/pause
+Response: Updated strategy (status: paused)
+
+POST /api/strategies/:id/stop
+Response: Updated strategy (status: stopped)
+
+POST /api/strategies/:id/clone
+Response: Cloned strategy
+```
+
+### Backtest Endpoints
+
+```typescript
+POST /api/backtests
+Body: {
+  strategy_id,
+  start_date,
+  end_date,
+  initial_capital,
+  commission?,
+  slippage?
+}
+Response: BacktestResult
+
+GET /api/backtests
+Query: ?strategy_id=xxx (optional)
+Response: BacktestResult[]
+
+GET /api/backtests/:id
+Response: BacktestResult object
+
+DELETE /api/backtests/:id
+Response: { message }
+```
+
+### Signal Endpoints
+
+```typescript
+GET /api/signals
+Query: ?strategy_id=xxx&limit=100
+Response: Signal[]
+
+GET /api/signals/:id
+Response: Signal object
+
+POST /api/signals/:id/execute
+Response: Updated signal (status: executed)
+
+POST /api/signals/:id/cancel
+Response: Updated signal (status: cancelled)
+```
+
+---
+
+## Complete User Flow Example
+
+### Scenario: Creating and Running a BTCUSDT EMA Crossover Strategy
+
+#### Step 1: Register Account
+1. Go to `/register`
+2. Create account with trader role
+3. Automatically logged in
+
+#### Step 2: Create Strategy
+1. Navigate to `/strategies/new`
+2. Configure:
+   - Name: "BTC 21/89 EMA Strategy"
+   - Type: EMA Crossover
+   - Symbol: BTCUSDT
+   - Timeframe: 15m
+   - Position Size: 100 USDT
+   - Fast EMA: 21
+   - Slow EMA: 89
+   - Stop Loss: 2%
+   - Take Profit: 4%
+3. Click "Create Strategy"
+
+#### Step 3: Backtest Strategy
+1. Go to strategy detail page
+2. Switch to "Backtesting" tab
+3. Configure backtest:
+   - Start: 2024-01-01
+   - End: 2024-12-31
+   - Capital: 10,000 USDT
+4. Click "Run Backtest"
+5. Review results:
+   - Win Rate: 65%
+   - Total PnL: +$1,450 (14.5%)
+   - Sharpe Ratio: 1.85
+
+#### Step 4: Deploy Strategy
+1. From strategy detail page
+2. Click "Start" button
+3. Strategy status changes to "active"
+4. Begins generating signals
+
+#### Step 5: Monitor Signals
+1. Navigate to `/signals`
+2. View real-time signals
+3. Filter by strategy
+4. Execute or cancel pending signals as needed
+
+#### Step 6: Track Performance
+1. Return to strategy detail page
+2. View "Overview" tab
+3. Monitor live performance metrics:
+   - Current PnL
+   - Win rate
+   - Recent trades
+   - Drawdown
+
+---
+
+## Best Practices
+
+### Strategy Creation
+- Start with simple strategies (EMA crossover, RSI)
+- Use reasonable risk parameters (1-2% risk per trade)
+- Test on multiple timeframes
+- Always backtest before live deployment
+
+### Backtesting
+- Use at least 6-12 months of historical data
+- Account for commission and slippage
+- Don't over-optimize (curve fitting)
+- Validate on out-of-sample data
+
+### Risk Management
+- Never risk more than 2% per trade
+- Set maximum daily loss limits
+- Use appropriate position sizing
+- Always use stop losses
+
+### Signal Management
+- Review pending signals before execution
+- Monitor execution success rate
+- Investigate failed signals
+- Adjust strategy parameters based on results
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+**Strategy Not Generating Signals**
+- Check strategy status (must be "active")
+- Verify indicator parameters
+- Ensure market data is being received
+- Review entry conditions
+
+**Backtest Fails to Run**
+- Check date range (must have historical data)
+- Verify symbol availability
+- Ensure sufficient historical data exists
+- Check API connectivity
+
+**Signal Execution Fails**
+- Verify exchange API keys configured
+- Check account balance
+- Review position limits
+- Ensure symbol is tradable
+
+**Authentication Issues**
+- Clear browser cache and localStorage
+- Re-login to refresh token
+- Verify credentials are correct
+- Check token expiration
+
+---
+
+## Additional Resources
+
+- **Main Dashboard**: Comprehensive overview of all features
+- **API Documentation**: Detailed API specifications
+- **Exchange Integration**: Binance and Gate.io setup guides
+- **Performance Monitoring**: Real-time metrics and charts
+
+## Support
+
+For issues or questions:
+- Review strategy parameters
+- Check backtest results
+- Monitor signal execution logs
+- Verify API connectivity
+- Check browser console for errors

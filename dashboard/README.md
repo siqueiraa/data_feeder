@@ -4,10 +4,29 @@ A comprehensive SvelteUI-based dashboard for monitoring and interacting with the
 
 ## Features
 
+### ⚡ Trading Strategies (NEW)
+- **User Authentication**: Secure registration and login system
+- **Strategy Builder**: Visual interface for creating automated trading strategies
+- **9 Strategy Types**: EMA Crossover, RSI Divergence, MACD, Bollinger Bands, Volume Profile, and more
+- **Backtesting Engine**: Test strategies on historical data with comprehensive metrics
+- **Performance Tracking**: Win rate, PnL, Sharpe ratio, max drawdown monitoring
+- **Risk Management**: Configurable stop loss, take profit, position sizing
+- **Multi-Exchange Support**: Binance and Gate.io Futures integration
+- See [STRATEGY_USER_FLOW.md](./STRATEGY_USER_FLOW.md) for complete guide
+
+### 📡 Trading Signals (NEW)
+- Real-time signal generation from active strategies
+- Signal monitoring and execution interface
+- Manual signal execution/cancellation
+- Signal performance tracking
+- Confidence-based signal filtering
+- Auto-refresh every 10 seconds
+
 ### 📊 Dashboard Overview
 - System health status at a glance
 - Exchange connection monitoring
 - Quick access to all features
+- Trading strategy overview
 
 ### ❤️ Health & Status Monitoring
 - Liveness, readiness, and startup probes

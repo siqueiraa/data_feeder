@@ -82,6 +82,30 @@
 		</Grid.Col>
 
 		<Grid.Col span={4}>
+			<a href="/strategies" class="link-card">
+				<div class="link-card-content">
+					<span class="link-icon">⚡</span>
+					<div>
+						<h3>Trading Strategies</h3>
+						<p>Create and manage automated trading strategies</p>
+					</div>
+				</div>
+			</a>
+		</Grid.Col>
+
+		<Grid.Col span={4}>
+			<a href="/signals" class="link-card">
+				<div class="link-card-content">
+					<span class="link-icon">📡</span>
+					<div>
+						<h3>Trading Signals</h3>
+						<p>Monitor real-time trading signals and execution</p>
+					</div>
+				</div>
+			</a>
+		</Grid.Col>
+
+		<Grid.Col span={4}>
 			<a href="/health" class="link-card">
 				<div class="link-card-content">
 					<span class="link-icon">❤️</span>

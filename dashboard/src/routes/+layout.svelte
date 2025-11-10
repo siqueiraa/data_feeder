@@ -7,6 +7,8 @@
 
 	const navItems = [
 		{ href: '/', label: 'Overview', icon: '🏠' },
+		{ href: '/strategies', label: 'Strategies', icon: '⚡' },
+		{ href: '/signals', label: 'Signals', icon: '📡' },
 		{ href: '/health', label: 'Health & Status', icon: '❤️' },
 		{ href: '/performance', label: 'Performance', icon: '📊' },
 		{ href: '/binance', label: 'Binance Data', icon: '🔶' },
