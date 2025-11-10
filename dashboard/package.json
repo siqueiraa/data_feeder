@@ -21,9 +21,6 @@
 		"vite": "^7.1.10"
 	},
 	"dependencies": {
-		"@svelteuidev/composables": "^0.15.7",
-		"@svelteuidev/core": "^0.15.7",
-		"@svelteuidev/dates": "^0.15.7",
 		"date-fns": "^4.1.0"
 	}
 }
