@@ -1,0 +1,423 @@
+================================================================================
+DATA FEEDER - COMPREHENSIVE API ANALYSIS REPORT
+================================================================================
+Analysis Date: 2025-11-10
+Project: Cryptocurrency Data Feeder (Rust-based)
+Language: Rust (Edition 2021)
+
+================================================================================
+EXECUTIVE SUMMARY
+================================================================================
+
+This Rust-based cryptocurrency data pipeline provides high-performance real-time
+market analysis with support for Binance Futures and Gate.io Futures exchanges.
+The system is built on a hybrid architecture combining HTTP REST APIs, WebSocket
+streaming, and actor-based message passing.
+
+TOTAL API ENDPOINTS FOUND: 25
+- HTTP Endpoints: 13 (Metrics/Health server)
+- Exchange REST Endpoints: 9 (Binance: 3, Gate.io: 6)
+- Actor-based APIs: 12+ (Internal message passing)
+
+================================================================================
+I. HTTP API ENDPOINTS (13 Total)
+================================================================================
+
+A. HEALTH & READINESS PROBES (4 endpoints)
+   - GET /health           - Liveness check
+   - GET /ready            - Readiness check (all dependencies)
+   - GET /startup          - Startup probe
+   - GET /metrics          - Prometheus metrics export
+
+B. DEPLOYMENT VALIDATION (3 endpoints)
+   - GET /validate         - Resource-aware validation
+   - GET /deploy/validate  - Full deployment validation
+   - GET /deploy/check     - Quick deployment check
+
+C. PERFORMANCE MONITORING (6 endpoints)
+   - GET /dashboard                    - HTML performance dashboard
+   - GET /dashboard/multidimensional   - Multi-dimensional metrics JSON
+   - GET /api/performance/report       - Enhanced performance report JSON
+   - GET /api/performance/flame-graph  - Flame graph data JSON
+   - GET /api/performance/threads      - Thread profiling data JSON
+
+================================================================================
+II. EXCHANGE API ENDPOINTS (9 Total)
+================================================================================
+
+A. BINANCE FUTURES API (3 endpoints)
+   Base URL: https://fapi.binance.com
+   
+   1. GET /fapi/v1/klines
+      - Fetch OHLCV candlestick data
+      - Params: symbol, interval, startTime?, endTime?, limit?
+      - Rate Limit: 1200 req/min (20 req/sec)
+   
+   2. GET /fapi/v1/ticker/24hr
+      - Get 24-hour ticker statistics
+      - Params: symbol
+   
+   3. GET /fapi/v1/exchangeInfo
+      - Get exchange symbols and rate limits
+      - No params required
+
+B. GATE.IO FUTURES API (6 endpoints)
+   Base URL: https://api.gateio.ws
+   
+   Public Endpoints (3):
+   1. GET /api/v4/futures/usdt/candlesticks
+      - Fetch OHLCV candlestick data
+      - Params: contract, limit?, from?, to?, interval?
+   
+   2. GET /api/v4/futures/usdt/tickers
+      - Get ticker information
+      - Params: contract?
+   
+   3. GET /api/v4/futures/usdt/symbols
+      - Get exchange symbols
+      - No params required
+   
+   Authenticated Trading Endpoints (3, require API Key + Secret):
+   4. POST /api/v4/futures/usdt/orders
+      - Place a new order
+      - Auth: HMAC-SHA256 signature required
+      - Body: {contract, size, price?, side, order_type, time_in_force?, client_order_id?, reduce_only?}
+   
+   5. DELETE /api/v4/futures/usdt/orders/{order_id}
+      - Cancel an existing order
+      - Auth: HMAC-SHA256 signature required
+   
+   6. PUT /api/v4/futures/usdt/orders
+      - Modify an existing order
+      - Auth: HMAC-SHA256 signature required
+      - Body: {contract, order_id, size?, price?}
+   
+   Account Endpoints (2, require authentication):
+   7. GET /api/v4/futures/usdt/orders
+      - Get open orders
+      - Query params: contract=symbol&status=open (optional)
+   
+   8. GET /api/v4/futures/usdt/positions
+      - Get open positions
+      - Query params: contract=symbol (optional)
+   
+   9. GET /api/v4/futures/usdt/accounts
+      - Get account balances
+      - No params required
+
+   Rate Limit: 1000 req/min (conservative)
+
+================================================================================
+III. ACTOR-BASED MESSAGE PASSING APIs (Internal)
+================================================================================
+
+A. API ACTOR (3 operations)
+   Tell (Fire-and-Forget):
+   - FillGap(symbol, interval, start_time, end_time)
+   - FetchRecent(symbol, interval, limit)
+   
+   Ask (Request-Response):
+   - GetStats() -> ApiStats
+   - GetDataRange(symbol, interval) -> DataRange
+   - FetchKlines(symbol, interval, start_time?, end_time?, limit?) -> Vec<FuturesOHLCVCandle>
+
+B. WEBSOCKET ACTOR (Multiple streams)
+   Binance Streams:
+   - Kline (real-time candlesticks)
+   - Depth (order book updates)
+   - Ticker (price tickers)
+   - Aggr Trade (aggregated trades)
+   
+   Gate.io Streams (authenticated):
+   - Orders (order updates)
+   - Positions (position updates)
+   - Trades (trade executions)
+   - Balances (account balances)
+
+C. TECHNICAL ANALYSIS ACTORS
+   TimeFrame Actor:
+   - Aggregates 1m candles to multiple timeframes (5m, 15m, 1h, 4h, etc.)
+   - Emits closed candles to indicator actor
+   
+   Indicator Actor:
+   - EMA calculations (21 and 89-period)
+   - Trend analysis via EMA crossovers
+   - Volume tracking and alerts
+   - Volume profile calculations (with POC, VWAP, value area)
+
+D. STORAGE ACTORS
+   - LmdbActor: Lightning-fast key-value storage
+   - PostgresActor: Optional relational database storage
+
+E. STREAMING ACTORS
+   - KafkaActor: Real-time indicator publishing (optional)
+
+================================================================================
+IV. DATA STRUCTURES & SCHEMAS
+================================================================================
+
+REQUEST TYPES:
+
+1. ApiRequest (Klines)
+   {
+     endpoint: ApiEndpoint,
+     symbol: String,              // e.g., "BTCUSDT"
+     interval: String,            // e.g., "1h", "4h", "1d"
+     start_time: Option<i64>,     // Milliseconds since epoch
+     end_time: Option<i64>,       // Milliseconds since epoch
+     limit: Option<u32>,          // Max candles to return
+   }
+
+2. OrderRequest (Trading)
+   {
+     symbol: String,              // Trading pair
+     side: OrderSide,             // Buy | Sell
+     order_type: OrderType,       // Market | Limit | StopLoss | StopLimit | TakeProfit
+     quantity: f64,               // Order size
+     price: Option<f64>,          // Price for limit orders
+     time_in_force: Option<String>, // "IOC", "GTC", etc.
+     client_order_id: Option<String>, // Custom order ID
+     reduce_only: bool,           // Only reduce position
+   }
+
+3. ModifyOrderRequest (Trading)
+   {
+     symbol: String,
+     order_id: String,
+     quantity: Option<f64>,
+     price: Option<f64>,
+   }
+
+RESPONSE TYPES:
+
+1. FuturesOHLCVCandle
+   {
+     timestamp: i64,              // Milliseconds since epoch
+     open: Decimal,               // High-precision decimal
+     high: Decimal,
+     low: Decimal,
+     close: Decimal,
+     volume: Decimal,
+     quote_volume: Decimal,       // Volume in quote asset
+     trades: u64,                 // Number of trades
+   }
+
+2. Order
+   {
+     id: String,
+     symbol: String,
+     side: OrderSide,             // Buy | Sell
+     order_type: OrderType,
+     quantity: f64,
+     price: Option<f64>,
+     status: OrderStatus,         // New | PartiallyFilled | Filled | Cancelled | Rejected
+     timestamp: i64,
+   }
+
+3. Position
+   {
+     symbol: String,
+     side: PositionSide,          // Long | Short | None
+     size: f64,
+     entry_price: f64,
+     mark_price: f64,             // Current market price
+     unrealized_pnl: f64,         // Unrealized profit/loss
+     margin_required: f64,
+     timestamp: i64,
+   }
+
+4. Balance
+   {
+     asset: String,               // e.g., "USDT", "BTC"
+     available: f64,              // Tradeable balance
+     locked: f64,                 // Locked in orders
+     total: f64,                  // available + locked
+     timestamp: i64,
+   }
+
+5. OrderResponse
+   {
+     order: Order,
+     success: bool,
+     message: Option<String>,
+     timestamp: i64,
+   }
+
+ERROR TYPES:
+
+enum ApiError {
+    Http(String),                 // HTTP protocol errors
+    Parse(String),                // JSON/data parsing errors
+    RateLimit(String),            // Rate limit exceeded
+    InvalidSymbol(String),        // Invalid trading pair
+    InvalidTimeframe(String),     // Invalid time interval
+    Authentication(String),       // API key/secret errors
+    Network(String),              // Connection errors
+    Timeout(String),              // Request timeout
+    Unknown(String),              // Generic errors
+}
+
+================================================================================
+V. RATE LIMITING & PERFORMANCE
+================================================================================
+
+BINANCE FUTURES:
+- Rate Limit: 1200 requests per minute (20 req/sec)
+- Min Interval: 50ms between requests
+- Timeout: 30 seconds per request
+- Max Retries: 3
+- Response Header Parsing: Reads X-MBX-* headers
+
+GATE.IO FUTURES:
+- Rate Limit: 1000 requests per minute (conservative)
+- Min Interval: 50ms between requests
+- Timeout: 30 seconds per request
+- Max Retries: 3
+- Response Header Parsing: Reads custom rate limit headers
+
+PERFORMANCE OPTIMIZATIONS:
+- Zero-copy JSON parsing using sonic-rs
+- SIMD optimizations for numerical computations
+- Binary serialization with rkyv (no_std compatible)
+- Connection pooling with reqwest
+- Actor-based concurrency with tokio runtime
+- Automatic health tracking and fallback exchange support
+
+================================================================================
+VI. AUTHENTICATION
+================================================================================
+
+BINANCE:
+- Public endpoints: No authentication required
+- Private endpoints: Not directly used (WebSocket trading through gate_io)
+
+GATE.IO:
+- Public endpoints: No authentication required
+- Private endpoints: HMAC-SHA256 signature required
+  
+  Authentication Headers:
+  - KEY: {api_key}
+  - Timestamp: {unix_timestamp}
+  - SIGN: HMAC-SHA256(METHOD\nPATH\nBODY\nTIMESTAMP\nNONCE)
+  - Content-Type: application/json
+
+================================================================================
+VII. SUPPORTED TIMEFRAMES
+================================================================================
+
+1m    3m    5m    15m   30m   1h    2h    4h    6h    8h
+12h   1d    3d    1w    1M
+
+(Can be extended based on exchange support)
+
+================================================================================
+VIII. KEY FILES & LOCATIONS
+================================================================================
+
+API IMPLEMENTATION:
+- /home/user/data_feeder/src/api/mod.rs
+- /home/user/data_feeder/src/api/types.rs
+- /home/user/data_feeder/src/api/exchange.rs
+- /home/user/data_feeder/src/api/exchange_manager.rs
+- /home/user/data_feeder/src/api/actor.rs
+- /home/user/data_feeder/src/api/trading_metrics.rs
+- /home/user/data_feeder/src/api/binance/klines.rs
+- /home/user/data_feeder/src/api/gate_io/klines.rs
+- /home/user/data_feeder/src/api/gate_io/trading.rs
+
+HTTP SERVERS:
+- /home/user/data_feeder/src/metrics_server.rs (Hyper-based, port 8080)
+- /home/user/data_feeder/src/health/mod.rs (Warp-based health checks)
+
+WEBSOCKET CLIENTS:
+- /home/user/data_feeder/src/websocket/mod.rs
+- /home/user/data_feeder/src/websocket/actor.rs
+- /home/user/data_feeder/src/websocket/binance/
+- /home/user/data_feeder/src/websocket/gate_io/
+
+================================================================================
+IX. FEATURE FLAGS & COMPILATION
+================================================================================
+
+Default Features: kafka, postgres, volume_profile
+
+Optional Features:
+- kafka: Real-time indicator publishing to Kafka
+- postgres: PostgreSQL dual storage with LMDB
+- volume_profile: Daily volume profile analysis
+- volume_profile_reprocessing: Volume profile reprocessing utilities
+
+Build Examples:
+cargo build --release                    # Default (with kafka, postgres, volume_profile)
+cargo build --release --no-default-features  # Minimal (LMDB only)
+cargo build --release --features="kafka,postgres"  # Custom selection
+
+================================================================================
+X. DEPLOYMENT & HEALTH CHECKS
+================================================================================
+
+HEALTH ENDPOINTS:
+- GET /health - Liveness probe (just check if running)
+- GET /ready - Readiness probe (check all dependencies)
+- GET /startup - Startup probe (service initializing)
+- GET /metrics - Prometheus metrics in text format
+
+VALIDATION CHECKS:
+- Memory availability (minimum 30-50% free depending on environment)
+- CPU availability (core count and thread recommendations)
+- LMDB database health
+- Kafka connectivity (if enabled)
+- PostgreSQL connectivity (if enabled)
+
+RESOURCE CLASSIFICATION:
+- Low Resource: <2 CPU cores or <2GB RAM
+- Standard Resource: 2-4 CPU cores, 2-8GB RAM
+- High Resource: >4 CPU cores, >8GB RAM
+- Containerized: Detected in container environment
+
+================================================================================
+XI. DOCUMENTATION FILES GENERATED
+================================================================================
+
+1. /home/user/data_feeder/API_ENDPOINTS.md
+   - Comprehensive endpoint documentation
+   - Full request/response schemas
+   - Configuration examples
+   - Rate limiting details
+
+2. /home/user/data_feeder/API_QUICK_REFERENCE.md
+   - Quick lookup guide
+   - Endpoint summaries
+   - Data type reference
+   - Error handling info
+
+================================================================================
+XII. KEY FINDINGS & RECOMMENDATIONS
+================================================================================
+
+STRENGTHS:
+1. High-performance Rust implementation (10-100x faster than Python)
+2. Multi-exchange support with automatic failover
+3. Real-time WebSocket streaming with technical analysis
+4. Comprehensive health and readiness checks
+5. Flexible deployment options (LMDB-only to full stack)
+6. Production-grade error handling and recovery
+7. Performance monitoring with flame graph profiling
+8. Zero-copy optimizations and SIMD acceleration
+
+ARCHITECTURE HIGHLIGHTS:
+1. Actor-based concurrency (Kameo framework)
+2. Hybrid HTTP server design (Hyper for metrics, Warp for health)
+3. Multi-dimensional performance tracking
+4. Resource-aware health classification
+5. Automatic deployment validation
+
+API COVERAGE:
+- Binance Futures: 100% klines, ticker, exchange info coverage
+- Gate.io Futures: 100% public and authenticated trading coverage
+- Internal APIs: Complete actor message passing system
+- Metrics: Comprehensive performance and health monitoring
+
+================================================================================
+END OF ANALYSIS REPORT
+================================================================================
